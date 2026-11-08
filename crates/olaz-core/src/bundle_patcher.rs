@@ -350,6 +350,7 @@ pub fn bridge_spec_script(platform: &ZaloPlatform) -> String {
         "$zFileManager.sealCalfLog",
         "$zFileManager.mergeCalfLogGroup",
         "$zFileManager.writeLogRange",
+        "$zFileManager.readLogRange",
         "$zFileManager.trustBlob",
         "$zFileManager.isTrustPath",
         "$zFileManager.trustPathFromBlob",
@@ -503,9 +504,39 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     };
   };
   local['$zelectronNative.writeImageToClipboard'] = (buf) => {
-    if (!buf) return;
+    if (!buf) return false;
+    const writePngBytes = (bytes) => {
+      if (bytes && bytes.length) safe(() => sync('$zelectronNative.clipboardWriteImagePng', [bytes]), null);
+    };
+    if (typeof buf === 'string' || (buf && typeof buf === 'object' && typeof buf.href === 'string')) {
+      const raw = typeof buf === 'string' ? buf : buf.href;
+      const fp = raw.startsWith('file:') ? decodeURIComponent(raw.replace(/^file:\/\/\/?/, '/')) : raw;
+      (async () => {
+        try {
+          const ab = await callAsync('$zFileManager.getFileArrayBuffer', [fp]);
+          const u8 = toU8(ab);
+          if (!u8.length) return;
+          // PNG magic: 89 50 4E 47
+          if (u8.length > 8 && u8[0] === 0x89 && u8[1] === 0x50 && u8[2] === 0x4e && u8[3] === 0x47) {
+            writePngBytes(u8);
+            return;
+          }
+          const blob = new Blob([u8]);
+          const bmp = await createImageBitmap(blob);
+          const canvas = document.createElement('canvas');
+          canvas.width = bmp.width || 1;
+          canvas.height = bmp.height || 1;
+          canvas.getContext('2d').drawImage(bmp, 0, 0);
+          if (typeof bmp.close === 'function') bmp.close();
+          const pngBlob = await new Promise((res) => canvas.toBlob(res, 'image/png'));
+          if (pngBlob) writePngBytes(new Uint8Array(await pngBlob.arrayBuffer()));
+        } catch {}
+      })();
+      return true;
+    }
     const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-    if (bytes.length) safe(() => sync('$zelectronNative.clipboardWriteImagePng', [bytes]), null);
+    writePngBytes(bytes);
+    return true;
   };
 
   // 2. `$zFileManager` photo picker, blob helpers, and path trust
@@ -1749,7 +1780,7 @@ pub fn patch_asar_bundle(path: &str, bytes: &[u8]) -> Option<Vec<u8>> {
 
 const WIN32_TITLEBAR_CONTROLS_TEMPLATE: &str = r#"r.a.createElement("div",{className:"titlebar__btns"+(this.state.isMaximized?" is-maximized":""),style:t},this.props.isPopupWindow||!this.props.status||this.props.status.isAppLock?null:r.a.createElement("i",{className:`fa fa-Lock_24_Line btn titlebar__menu__btn ${s}`,onClick:this._showAppLock.bind(this)}),r.a.createElement("i",{className:`fa fa-Minus_24_Line btn titlebar__menu__btn ${s}`,onClick:this.minimize.bind(this)}),this.props.hideMaximize?null:this.state.isMaximized?r.a.createElement("i",{className:`fa fa-Maximize_24_Line btn titlebar__menu__btn ${s}`,onClick:this.maximize.bind(this)}):r.a.createElement("i",{className:`fa fa-Minimize_24_Line btn titlebar__menu__btn ${s}`,onClick:this.maximize.bind(this)}),!this.props.hideClose&&r.a.createElement("i",{className:`fa fa-Close_24_Line btn titlebar__menu__btn ${s}`,onClick:this.quit.bind(this)}))))"#;
 
-const WIN32_MEDIA_VIEWER_CONTROLS_TEMPLATE: &str = r#"r.a.createElement("div",{className:"titlebar__btns"+(this.state.isMaximized?" is-maximized":""),style:t},r.a.createElement("i",{className:"fa fa-Minus_24_Line btn titlebar__menu__btnPreviewPhoto",onClick:this.minimize.bind(this),style:{height:"24px"}}),this.props.hideMaximize?null:this.state.isMaximized?r.a.createElement("i",{className:"fa fa-Maximize_24_Line btn titlebar__menu__btnPreviewPhoto",style:{height:"24px"},onClick:this.maximize.bind(this)}):r.a.createElement("i",{className:"fa fa-Minimize_24_Line btn titlebar__menu__btnPreviewPhoto",onClick:this.maximize.bind(this),style:{height:"24px"}}),r.a.createElement("i",{className:"fa fa-Close_24_Line btn titlebar__menu__btnPreviewPhoto --close",onClick:this.quit.bind(this),style:{height:"24px"}}))"#;
+const WIN32_MEDIA_VIEWER_CONTROLS_TEMPLATE: &str = r#"r.a.createElement("div",{className:"titlebar__btns"+(this.state.isMaximized?" is-maximized":""),style:t},r.a.createElement("i",{className:"fa fa-Minus_24_Line btn titlebar__menu__btnPreviewPhoto",onClick:e=>{e&&e.stopPropagation();$zwindow.minimize(this.props.windowType||"photo-viewer")},style:{height:"24px"}}),this.props.hideMaximize?null:this.state.isMaximized?r.a.createElement("i",{className:"fa fa-Maximize_24_Line btn titlebar__menu__btnPreviewPhoto",style:{height:"24px"},onClick:e=>{e&&(e.stopPropagation(),e.preventDefault());$zwindow.maximizeToggler(this.props.windowType||"photo-viewer");this.setState({isMaximized:!this.state.isMaximized})}}):r.a.createElement("i",{className:"fa fa-Minimize_24_Line btn titlebar__menu__btnPreviewPhoto",onClick:e=>{e&&(e.stopPropagation(),e.preventDefault());$zwindow.maximizeToggler(this.props.windowType||"photo-viewer");this.setState({isMaximized:!this.state.isMaximized})},style:{height:"24px"}}),r.a.createElement("i",{className:"fa fa-Close_24_Line btn titlebar__menu__btnPreviewPhoto --close",onClick:e=>{e&&e.stopPropagation();this.props.onClose?this.props.onClose():$zwindow.closeWindow(this.props.windowType||"photo-viewer")},style:{height:"24px"}}))"#;
 
 static LOGIN_PLATFORM_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
@@ -1859,6 +1890,20 @@ static IMAGE_RESIZER_MAIN_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("valid image resizer MAIN regex")
 });
 
+static OBSERVER_GET_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"this\.observers\.has\(e\)\|\|this\.observers\.set\(e,new ([A-Za-z_$][\w$]*)\(t,n\)\)"#,
+    )
+    .expect("valid IntersectionObserver getObserver regex")
+});
+
+static WASM_JXL_RESIZER_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"async resizeImage\(e,\{width:t,height:n,quality:a\}\)\{const i=new ([A-Za-z_$][\w$]*),r=new FileReader;return r\.onload=async e=>\{var r;const o=null===\(r=e\.target\)\|\|void 0===r\?void 0:r\.result;try\{const e=([A-Za-z_$][\w$]*\.d)\.getWorkerByType\(([A-Za-z_$][\w$]*\.b\.NONE)\);e\.asignTask\(([A-Za-z_$][\w$]*)\.getNewId\(\),"resizeJxl"\);const r=await ([A-Za-z_$][\w$]*\.a)\.postMessageAsync\(e\.worker,([A-Za-z_$][\w$]*\.a\.JXL_DECODE),\{buffer:o,outputWidth:t,outputHeight:n,quality:a,timeout:([A-Za-z_$][\w$]*\.a\.jxl\.jxl_task_timeout)\},\[o\],\{\}\),l=new Blob\(\[r\],\{type:"image/jpeg"\}\);i\.resolve\(l\)\}catch\(e\)\{i\.reject\(e\)\}\},r\.onerror=\(\)=>i\.reject\(new ([A-Za-z_$][\w$]*)\),r\.readAsArrayBuffer\(e\),i\.promise\}"#,
+    )
+    .expect("valid WASM JXL resizer local-path regex")
+});
+
 /// Applies `vndangkhoa/zalo-linux` renderer patches on-the-fly without altering `getClientType() == 23`:
 /// - Login titlebar `platform:"WIN32"` (`fa-Minus` + `fa-Close`)
 /// - Main `#titleBar` Windows controls (`Lock`, `Minus`, `Maximize`/`Minimize`, `Close`) + `"WIN32"` layout class
@@ -1885,6 +1930,8 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         b"handleDecompdeJpegMultiFallback",
         b"enable_libvips_macos",
         b"createResizer(",
+        b"this.getObserver=",
+        b"\"data-z-element-type\":\"image\"",
     ];
     if !FAST_NEEDLES
         .iter()
@@ -2156,6 +2203,71 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
             s = next;
             changed = true;
         }
+    }
+
+    // 11. Support local file-path `string` inputs + `destinationPath` writes in `3Rxw` `MAIN` (`ue`)
+    //     and `LIBJXL_WASM` (`Ze`) resizers when called from `TImageRegenerator.regenImageFromLocal`.
+    const MAIN_CANVAS_RESIZER_FIND: &str = r#"async resizeImage(e,{width:t,height:n,quality:a,format:i}){const r={};r.promise=new Promise(((e,t)=>{r.resolve=e,r.reject=t}));try{const s=await createImageBitmap(e);this.canvas.width=t,this.canvas.height=n,this.ctx.drawImage(s,0,0,t,n),this.canvas.toBlob((e=>{this.canvas.width=0,this.canvas.height=0,this.ctx.clearRect(0,0,0,0),s.close(),r.resolve(e)}),i,a)}catch(s){r.reject(s)}return r.promise}"#;
+    const MAIN_CANVAS_RESIZER_REPL: &str = r#"async resizeImage(e,{width:t,height:n,quality:a,format:i,destinationPath:_dp}){/*olaz-main-path*/const r={};r.promise=new Promise(((e,t)=>{r.resolve=e,r.reject=t}));try{const _in="string"==typeof e?new Blob([await $zFileManager.getFileArrayBuffer(e)]):e,s=await createImageBitmap(_in);this.canvas.width=t,this.canvas.height=n,this.ctx.drawImage(s,0,0,t,n),this.canvas.toBlob((async e=>{try{this.canvas.width=0,this.canvas.height=0,this.ctx.clearRect(0,0,0,0),s.close();if(!e)return r.reject(new Error("canvas.toBlob null"));if(_dp){const _dir=$znode.path.dirname(String(_dp));_dir&&await $znode.fsExtra.ensureDir(_dir),await $zFileManager.writeBufferToPath(String(_dp),new Uint8Array(await e.arrayBuffer()))}r.resolve(e)}catch(_err){r.reject(_err)}}),i,a)}catch(s){r.reject(s)}return r.promise}"#;
+    if s.contains(MAIN_CANVAS_RESIZER_FIND) {
+        s = s.replace(MAIN_CANVAS_RESIZER_FIND, MAIN_CANVAS_RESIZER_REPL);
+        changed = true;
+    }
+    if !s.contains("/*olaz-wasm-jxl-path*/")
+        && s.contains(r#""resizeJxl""#)
+        && WASM_JXL_RESIZER_RE.is_match(&s)
+    {
+        let next = WASM_JXL_RESIZER_RE
+            .replace_all(
+                &s,
+                r#"async resizeImage(e,{width:t,height:n,quality:a,destinationPath:_dp}){/*olaz-wasm-jxl-path*/const _in="string"==typeof e?new Blob([await $$zFileManager.getFileArrayBuffer(e)]):e,i=new ${1},r=new FileReader;return r.onload=async e=>{var r;const o=null===(r=e.target)||void 0===r?void 0:r.result;try{const e=${2}.getWorkerByType(${3});e.asignTask(${4}.getNewId(),"resizeJxl");const r=await ${5}.postMessageAsync(e.worker,${6},{buffer:o,outputWidth:t,outputHeight:n,quality:a,timeout:${7}},[o],{}),l=new Blob([r],{type:"image/jpeg"});if(_dp){const _dir=$$znode.path.dirname(String(_dp));_dir&&await $$znode.fsExtra.ensureDir(_dir),await $$zFileManager.writeBufferToPath(String(_dp),new Uint8Array(r))}i.resolve(l)}catch(e){i.reject(e)}},r.onerror=()=>i.reject(new ${8}),r.readAsArrayBuffer(_in),i.promise}"#,
+            )
+            .into_owned();
+        if next != s {
+            s = next;
+            changed = true;
+        }
+    }
+
+    // 12. Refresh closed/changed popup `ctxWindow` in `"0tHf"` (`IntersectionObserver` manager)
+    //     and eagerly trigger `onVisible()` inside child popup windows (`popup-viewer.html`) so
+    //     `MediaViewer` (`IMAGE_VIEWER` + `IMAGE_VIEW_SLIDER`) never stalls on dead/unmapped observers.
+    const OBSERVER_OBSERVE_FIND: &str =
+        r#"this.observe=e=>{this._observer&&this._observer.observe(e)}"#;
+    const OBSERVER_OBSERVE_REPL: &str = r#"this.observe=e=>{/*olaz-io-obs*/this._observer&&this._observer.observe(e),this.ctxWindow&&this.ctxWindow!==window&&e&&"function"==typeof e.onVisible&&(this.ctxWindow.setTimeout||window.setTimeout)((()=>{try{e.onVisible&&e.onVisible()}catch(_){}}),0)}"#;
+    if s.contains(OBSERVER_OBSERVE_FIND) {
+        s = s.replace(OBSERVER_OBSERVE_FIND, OBSERVER_OBSERVE_REPL);
+        changed = true;
+    }
+    if !s.contains("/*olaz-io-win*/")
+        && s.contains("this.getObserver=")
+        && OBSERVER_GET_RE.is_match(&s)
+    {
+        let next = OBSERVER_GET_RE
+            .replace_all(
+                &s,
+                "((/*olaz-io-win*/this.observers.has(e)&&(this.observers.get(e).ctxWindow!==t||t.closed)&&this.clearObserverById(e)),this.observers.has(e)||this.observers.set(e,new ${1}(t,n)))",
+            )
+            .into_owned();
+        if next != s {
+            s = next;
+            changed = true;
+        }
+    }
+
+    // 13. Use `loading:"eager"` on `Z.d.Image` (`Ze`) so WebKit2GTK never defers `<img style="visibility:hidden">`
+    //     inside child `related_view` popups (`popup-viewer.html`), `"Kho lưu trữ"`, or Sticker popovers.
+    const ZIMG_LAZY_1_FIND: &str = r#"visibility:this.state.loaded?"visible":"hidden"}),loading:"lazy"}"#;
+    const ZIMG_LAZY_1_REPL: &str = r#"visibility:this.state.loaded?"visible":"hidden"}),loading:"eager"}"#;
+    const ZIMG_LAZY_2_FIND: &str = r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"async",loading:"lazy""#;
+    const ZIMG_LAZY_2_REPL: &str = r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"async",loading:"eager""#;
+    if s.contains(ZIMG_LAZY_1_FIND) {
+        s = s.replace(ZIMG_LAZY_1_FIND, ZIMG_LAZY_1_REPL);
+        changed = true;
+    }
+    if s.contains(ZIMG_LAZY_2_FIND) {
+        s = s.replace(ZIMG_LAZY_2_FIND, ZIMG_LAZY_2_REPL);
+        changed = true;
     }
 
     if changed {

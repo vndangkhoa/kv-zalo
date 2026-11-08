@@ -1694,7 +1694,7 @@ fn fs_bridge_upload_slice_checksum_svc_read_and_file_noise_roundtrip() {
         .unwrap();
     assert_eq!(wire::decode_bytes(&ranged_ab).unwrap(), &payload[10..=49]);
 
-    // 2. `readFileSlice` (offset + length + clamped EOF)
+    // 2. `readFileSlice` (offset + length + clamped EOF) & `readLogRange`
     let slice_ab = fs_bridge
         .dispatch_sync(
             "$zFileManager.readFileSlice",
@@ -1702,6 +1702,13 @@ fn fs_bridge_upload_slice_checksum_svc_read_and_file_noise_roundtrip() {
         )
         .unwrap();
     assert_eq!(wire::decode_bytes(&slice_ab).unwrap(), &payload[200..256]);
+    let log_range = fs_bridge
+        .dispatch_sync(
+            "$zFileManager.readLogRange",
+            &[json!("calf.bin"), json!(0), json!(32)],
+        )
+        .unwrap();
+    assert_eq!(wire::decode_bytes(&log_range).unwrap(), vec![0u8; 32]);
 
     // 3. `getMd5LargeFileObject` & `testChecksum` parity against CryptoBridge MD5
     let cb = CryptoBridge::new();
@@ -1816,6 +1823,11 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
     let mut hit_jxl_lazy_fallback = false;
     let mut hit_jxl_noresize_fallback = false;
     let mut hit_main_resizer = false;
+    let mut hit_main_resizer_path = false;
+    let mut hit_wasm_jxl_resizer_path = false;
+    let mut hit_io_obs = false;
+    let mut hit_io_win = false;
+    let mut hit_zimg_eager = false;
     let mut preserved_client_type_23 = false;
     let mut patched_files = 0usize;
 
@@ -1872,6 +1884,27 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
         if s.contains("(!0/*olaz-main-resizer*/") {
             hit_main_resizer = true;
         }
+        if s.contains("/*olaz-main-path*/") {
+            hit_main_resizer_path = true;
+        }
+        if s.contains("/*olaz-wasm-jxl-path*/") {
+            hit_wasm_jxl_resizer_path = true;
+        }
+        if s.contains("/*olaz-io-obs*/") {
+            hit_io_obs = true;
+        }
+        if s.contains("/*olaz-io-win*/") {
+            hit_io_win = true;
+        }
+        if s.contains(r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"async",loading:"eager""#) {
+            hit_zimg_eager = true;
+        }
+        if !path.contains("dal-worker.") && !path.contains("sync-v2-sub-worker.") {
+            assert!(
+                patch_zalo_linux_renderer_bundle(&patched).is_none(),
+                "patch_zalo_linux_renderer_bundle must be idempotent on {path}"
+            );
+        }
         if raw
             .windows("getClientType(){return 23}".len())
             .any(|w| w == b"getClientType(){return 23}")
@@ -1897,6 +1930,11 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
     assert!(hit_jxl_lazy_fallback, "Expected JXL _lazyDecoderFallbackInit=!0 patch to match live app.asar");
     assert!(hit_jxl_noresize_fallback, "Expected JXL Original no-resize fallback patch to match live app.asar");
     assert!(hit_main_resizer, "Expected ee.resizeImage JPEG/PNG MAIN canvas patch to match live app.asar");
+    assert!(hit_main_resizer_path, "Expected 3Rxw MAIN canvas local-path/destinationPath patch to match live app.asar");
+    assert!(hit_wasm_jxl_resizer_path, "Expected 3Rxw LIBJXL_WASM local-path/destinationPath patch to match live app.asar");
+    assert!(hit_io_obs, "Expected 0tHf IntersectionObserver popup observe patch to match live app.asar");
+    assert!(hit_io_win, "Expected 0tHf IntersectionObserver getObserver closed-window refresh patch to match live app.asar");
+    assert!(hit_zimg_eager, "Expected Z.d.Image loading:\"eager\" patch to match live app.asar");
 }
 
 #[test]

@@ -25,12 +25,13 @@ use soup::{MessageHeaders, MessageHeadersType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use url::Url;
 use webkit2gtk::{
-    DownloadExt, FileChooserRequest, FileChooserRequestExt, HardwareAccelerationPolicy, LoadEvent,
-    NavigationAction, NavigationPolicyDecision, NavigationPolicyDecisionExt, PolicyDecisionExt,
-    PolicyDecisionType, SecurityManagerExt, Settings, SettingsExt, URIRequestExt,
-    URISchemeRequest, URISchemeRequestExt, URISchemeResponse, URISchemeResponseExt,
-    UserContentInjectedFrames, UserContentManager, UserContentManagerExt, UserScript,
-    UserScriptInjectionTime, WebContext, WebContextExt, WebView, WebViewExt, WebsiteDataManager,
+    AutoplayPolicy, DownloadExt, FileChooserRequest, FileChooserRequestExt,
+    HardwareAccelerationPolicy, LoadEvent, NavigationAction, NavigationPolicyDecision,
+    NavigationPolicyDecisionExt, PolicyDecisionExt, PolicyDecisionType, SecurityManagerExt,
+    Settings, SettingsExt, URIRequestExt, URISchemeRequest, URISchemeRequestExt,
+    URISchemeResponse, URISchemeResponseExt, UserContentInjectedFrames, UserContentManager,
+    UserContentManagerExt, UserScript, UserScriptInjectionTime, WebContext, WebContextExt, WebView,
+    WebViewExt, WebsiteDataManager, WebsitePolicies,
 };
 
 /// Custom URI scheme serving `pc-dist/` from `app.asar` and `/__olaz/bridge-sync`.
@@ -1792,11 +1793,13 @@ impl OfficialClientHost {
 
         let ua = platform.identity.user_agent();
         let settings = build_zalo_webkit_settings(&ua, direct_ui);
+        let policies = build_zalo_website_policies(direct_ui);
 
         let webview = WebView::builder()
             .web_context(runtime.context())
             .user_content_manager(&ucm)
             .settings(&settings)
+            .website_policies(&policies)
             .build();
         webview.set_hexpand(true);
         webview.set_vexpand(true);
@@ -2031,10 +2034,12 @@ impl OfficialClientHost {
 
                 let child_settings =
                     build_zalo_webkit_settings(&platform_popup.identity.user_agent(), true);
+                let child_policies = build_zalo_website_policies(true);
                 let child_wv = WebView::builder()
                     .related_view(parent_wv)
                     .user_content_manager(&child_ucm)
                     .settings(&child_settings)
+                    .website_policies(&child_policies)
                     .build();
                 child_wv.set_hexpand(true);
                 child_wv.set_vexpand(true);
@@ -2503,6 +2508,17 @@ fn build_zalo_webkit_settings(user_agent: &str, direct_ui: bool) -> Settings {
     settings.set_enable_back_forward_navigation_gestures(false);
     settings.set_enable_write_console_messages_to_stdout(false);
     settings
+}
+
+fn build_zalo_website_policies(direct_ui: bool) -> WebsitePolicies {
+    let autoplay = if direct_ui {
+        AutoplayPolicy::Allow
+    } else {
+        AutoplayPolicy::AllowWithoutSound
+    };
+    glib::Object::builder::<WebsitePolicies>()
+        .property("autoplay", autoplay)
+        .build()
 }
 
 fn inject_common_preamble_and_meta(ucm: &UserContentManager, platform: &ZaloPlatform) {

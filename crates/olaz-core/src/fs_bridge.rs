@@ -704,6 +704,14 @@ impl FsBridge {
             | "$zFileManager.mergeCalfLogGroup"
             | "$zFileManager.writeLogRange"
             | "$zFileManager.trustBlob" => Ok(wire::undefined()),
+            "$zFileManager.readLogRange" => {
+                let len = args
+                    .get(2)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    .min(1024 * 1024) as usize;
+                Ok(wire::encode_bytes(&vec![0u8; len]))
+            }
             "$zFileManager.isTrustPath" | "$zFileManager.trustPathFromBlob" => {
                 Ok(Value::Bool(true))
             }

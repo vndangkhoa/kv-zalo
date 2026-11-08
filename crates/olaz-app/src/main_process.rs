@@ -2290,6 +2290,7 @@ impl ZaloMainProcess {
             "$zFileManager.sealCalfLog",
             "$zFileManager.mergeCalfLogGroup",
             "$zFileManager.writeLogRange",
+            "$zFileManager.readLogRange",
             "$zFileManager.trustBlob",
             "$zFileManager.isTrustPath",
             "$zFileManager.trustPathFromBlob",
