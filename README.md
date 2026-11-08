@@ -1,16 +1,22 @@
 # zalo-swift-re — Olaz
 
-**A reverse-engineered, native macOS client for [Zalo](https://zalo.me), written in Swift.**
+**A reverse-engineered, native desktop client for [Zalo](https://zalo.me) — written in Swift for macOS and in Rust for Linux (Omarchy & Ubuntu).**
 
-Olaz puts a native SwiftUI interface (Liquid Glass, sidebar + labels, native media viewer) on top of Zalo's
-own client code. It does **not** re-implement Zalo's protocol. Instead it runs the **official Zalo PC renderer**
-(`app.asar`) headless inside a `WKWebView` and supplies in Swift everything that Electron's preload and main
-process used to provide. The UI is native SwiftUI driven by the official client's state.
+Olaz runs the **official Zalo PC renderer** (`app.asar`) inside the OS native WebKit engine (`WKWebView` on macOS,
+`WebKit2GTK 4.1` on Linux) and supplies in native Swift / Rust everything that Electron's preload and main process
+used to provide. It does **not** re-implement Zalo's wire protocol:
+- **macOS (`Sources/`)**: puts a native SwiftUI interface (Liquid Glass, sidebar + labels, native media viewer) on top
+  of a headless `WKWebView` hosting Zalo's official client state.
+- **Linux (`crates/`)**: mounts the official Zalo PC interface directly in a frameless GTK3 + `webkit2gtk-4.1` window
+  with on-the-fly Linux UI/window/clipboard/call bundle patches, embedded GStreamer/FFmpeg inline voice-note & video
+  playback (`libgstolazauto.so`), Secret Service (`org.freedesktop.secrets`) vault, StatusNotifierItem tray, and XDG
+  Desktop Portals across **Omarchy** (Arch Linux + Hyprland/Wayland) and **Ubuntu 22.04 LTS / 24.04 LTS+**.
 
-Zalo PC does not need to be installed. On first launch Olaz downloads the official Zalo PC installer from VNG
-(or copies an installed Zalo.app of the same version), checks VNG's code signature and keeps only `app.asar`
-and `ZaloHelper.app` (calls, screenshots) in `~/Library/Application Support/Olaz/ZaloRuntime/` (~270 MB).
-See [`ZaloRuntime/ZaloRuntimeInstaller.swift`](Sources/Olaz/ZaloRuntime/ZaloRuntimeInstaller.swift).
+Zalo PC does not need to be installed. On first launch Olaz downloads the official Zalo PC installer from VNG,
+verifies its integrity (Apple code signature on macOS; pinned SHA-256 on Linux), and stores `app.asar` locally
+(`~/Library/Application Support/Olaz/ZaloRuntime/` on macOS; `~/.local/share/olaz/ZaloRuntime/` on Linux).
+See [`ZaloRuntime/ZaloRuntimeInstaller.swift`](Sources/Olaz/ZaloRuntime/ZaloRuntimeInstaller.swift) and
+[`crates/olaz-core/src/installer.rs`](crates/olaz-core/src/installer.rs).
 
 > [!IMPORTANT]
 > **Unofficial project, not affiliated with or endorsed by VNG Corporation.** "Zalo" is a trademark of VNG.
@@ -31,14 +37,15 @@ See [`ZaloRuntime/ZaloRuntimeInstaller.swift`](Sources/Olaz/ZaloRuntime/ZaloRunt
 
 ## Requirements
 
-- macOS 26 or later, Xcode 27 (Swift 6 toolchain)
+- **macOS**: macOS 26 or later, Xcode 27 (Swift 6 toolchain)
+- **Linux**: Omarchy (Arch Linux + Hyprland/Wayland) or Ubuntu 22.04 LTS / 24.04 LTS+ (Wayland or X11), Rust 1.80+
 - A Zalo account and the Zalo app on your phone (for QR login)
 - About 340 MB of download on first launch (Zalo PC's code, fetched from VNG)
 
 Zalo allows **one desktop (PC) session per account**. If the official Zalo PC is also running, quit it while
 using Olaz.
 
-## Build & run
+## Build & run (macOS — Swift)
 
 ```bash
 git clone https://github.com/qnguyen3/zalo-swift-re.git
@@ -51,6 +58,59 @@ open build/Olaz.app            # real QR login — scan with Zalo on your phone
 
 A new PC session has no message history except My Cloud, because Zalo keeps history on the phone. Use
 **Đồng bộ tin nhắn từ điện thoại** (confirm on the phone) to import it.
+
+## Build & install (Linux — Rust: Omarchy & Ubuntu)
+
+### Omarchy / Arch Linux
+
+1. **Install build & runtime packages** (already present on most Omarchy setups; `libgstolazauto.so` also embeds
+   fallback audio/video sinks and FFmpeg MP4/AAC/MP3/H.264 demuxing when `gst-plugins-good` / `gst-libav` are absent):
+   ```bash
+   sudo pacman -S --needed rust pkgconf webkit2gtk-4.1 gtk3 gstreamer gst-plugins-base ffmpeg xdg-desktop-portal 7zip
+   ```
+
+2. **Option A — Build & install to `~/.local` (no `sudo` needed for install)**:
+   ```bash
+   ./bin/build
+   ./bin/install --user        # installs ~/.local/bin/olaz + desktop launcher + hicolor icons
+   ~/.local/bin/olaz
+   ```
+
+3. **Option B — Build & install a native Arch `pacman` package (`pkgbuild/PKGBUILD`)**:
+   ```bash
+   ./bin/install               # runs `makepkg -fsi` inside pkgbuild/
+   ```
+
+### Ubuntu 22.04 LTS / 24.04 LTS+ (and Debian / Pop!\_OS / Linux Mint)
+
+1. **Install system dependencies**:
+   ```bash
+   ./packaging/ubuntu-deps.sh
+   ```
+   *(If Rust is not installed yet, install `rustup` via <https://rustup.rs>.)*
+
+2. **Option A — Build & install to `~/.local`**:
+   ```bash
+   ./bin/build
+   ./bin/install --user
+   ~/.local/bin/olaz
+   ```
+
+3. **Option B — Build & install a native `.deb` package**:
+   ```bash
+   cargo install cargo-deb
+   cargo deb -p olaz-app
+   sudo apt install ./target/debian/olaz_*.deb
+   ```
+
+### Linux tests & developer harness
+
+```bash
+./bin/test                                 # workspace unit + Node crypto parity + ASAR + DoH + portal tests
+./target/release/olaz --demo               # offline Setup / Liquid Glass preview mode
+./target/release/olaz --engine-probe [login|main] [seconds]
+RUST_LOG=olaz=debug,olaz_app=debug OLAZ_TRACE_WORKERS=1 ./target/release/olaz
+```
 
 ### Release (maintainers)
 
@@ -112,6 +172,26 @@ ZaloMainProcess  ── Swift stand-in for Electron main.js: IPC channel handler
   `canIUseSQLite→false`, `isMigrateFullDone→false`, as the spec prescribes.
 * **JSBridge/**: standalone JavaScriptCore runtime + WebCrypto shim + libsignal E2EE
   module, for JS-only pieces that run outside the renderer.
+
+### Linux Rust Workspace (`crates/`)
+
+```
+OlazAppWindow (GTK3 frameless + webkit2gtk-4.1)            crates/olaz-app/
+  ├─ OfficialClientHost  ── mounts official Zalo PC UI directly (`login.html` → `index.html`)
+  │    ├─ zalo-app:// & zfile:// schemes with HTTP 206 byte-range slicing
+  │    ├─ Loopback HTTP 206 GStreamer media proxy + WebKit bubblewrap sandbox paths
+  │    ├─ Secondary frameless `popup-viewer.html` (MediaViewer) & `child.html` windows
+  │    └─ On-the-fly Linux renderer bundle patches (`WIN32` controls, `Ctrl+V` PNG paste, call logs)
+  └─ ZaloMainProcess     ── Rust Electron main-process & IPC implementation (`$zwindow`, `$znode`, `$znoti`, …)
+        │
+  ├─ crates/olaz-core/   ── Zero-copy `mmap` AsarArchive, pinned DMG installer (`7zz`/`7z` + SHA-256),
+  │                         Node-parity `$znode.crypto`, `zsafe-storage`, `org.freedesktop.secrets` vault
+  ├─ crates/olaz-net/    ── `reqwest` + `tokio-tungstenite` proxy, `0600` cookie jar (`zpw_sek`),
+  │                         DoH (`1.1.1.1` / `8.8.8.8`) for `*.zadn.vn`, streaming AES-GCM / AES-CTR media
+  └─ crates/olaz-linux/  ── Embedded `libgstolazauto.so` (PipeWire/Pulse/ALSA auto sinks + FFmpeg MP4/AAC/H.264
+                            demuxer + `olazmediasrc`), `ksni` tray, `xdg-desktop-portal` dialogs & screenshots,
+                            Omarchy theme watcher & GNOME `gsettings` fallback
+```
 
 ## Status
 
