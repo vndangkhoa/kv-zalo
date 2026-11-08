@@ -728,8 +728,11 @@ impl ZaloWebRuntime {
 
         let context = WebContext::with_website_data_manager(&data_manager);
 
-        // Expose staged GStreamer plugin & confined user/media directories to WebKit's bubblewrap sandbox!
+        // Expose staged GStreamer plugin, confined app directories, and read-only user/mount roots
+        // (`$HOME`, `/mnt`, `/media`, `/run/media`) to WebKit's bubblewrap sandbox so disk-backed
+        // `File` objects dropped or picked from file managers are readable inside `WebKitWebProcess`.
         let gst_dir = olaz_linux::olaz_gst_plugin_dir();
+        let home_dir = platform.electron_path("home");
         for sandbox_dir in [
             gst_dir.as_path(),
             platform.user_data(),
@@ -737,6 +740,10 @@ impl ZaloWebRuntime {
             platform.temp_dir(),
             platform.cache_dir(),
             Path::new(olaz_linux::SCREENSHOT_STAGING_DIR),
+            home_dir.as_path(),
+            Path::new("/mnt"),
+            Path::new("/media"),
+            Path::new("/run/media"),
         ] {
             if sandbox_dir.exists() {
                 context.add_path_to_sandbox(sandbox_dir, true);

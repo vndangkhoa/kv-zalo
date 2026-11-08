@@ -4,11 +4,13 @@
 //! Port of `Sources/Olaz/ZaloRuntime/FileSystemBridge.swift` and
 //! `FileManagerBridge` (`Sources/Olaz/ZaloRuntime/BridgeImplementation.swift:84-175`).
 
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use digest::Digest;
+use md5::Md5;
 use serde_json::{json, Map, Value};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -16,6 +18,10 @@ use thiserror::Error;
 use crate::crypto::CryptoBridge;
 use crate::platform::ZaloPlatform;
 use crate::wire;
+
+const ZALO_NOISE_SIGN: [u8; 6] = [0x07, 0x7a, 0x41, 0x6c, 0x4f, 0x07];
+const ZALO_NOISE_XOR_KEY: u8 = 0x93;
+const ZALO_NOISE_XOR_LEN: u64 = 100;
 
 /// Node-shaped filesystem error formatted as `"<CODE>: <detail>"` so `bridge.js`
 /// populates `err.code` (`ENOENT`, `EACCES`, `EEXIST`, `EISDIR`, etc.).
@@ -698,6 +704,9 @@ impl FsBridge {
             | "$zFileManager.mergeCalfLogGroup"
             | "$zFileManager.writeLogRange"
             | "$zFileManager.trustBlob" => Ok(wire::undefined()),
+            "$zFileManager.isTrustPath" | "$zFileManager.trustPathFromBlob" => {
+                Ok(Value::Bool(true))
+            }
             "$zFileManager.getInstallSource" => Err("ENOENT: install source".to_string()),
             "$zFileManager.getFileArrayBuffer" => {
                 let bytes = self
@@ -714,8 +723,71 @@ impl FsBridge {
             }
             "$zFileManager.svcStatAsync" => {
                 let p = arg_path(args, 0);
-                let meta = std::fs::metadata(&p).map_err(|e| FsError::from_io(e, &p).to_string())?;
-                Ok(json!({ "size": meta.len() }))
+                let (logical_len, _) = inspect_file_noise(&p, is_noise_candidate_path(&p))
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({ "size": logical_len }))
+            }
+            "$zFileManager.svcReadPath" => {
+                let p = arg_path(args, 0);
+                let opts = args.get(1);
+                let start = opts
+                    .and_then(|v| v.get("start"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let end_inclusive = opts
+                    .and_then(|v| v.get("end"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(u64::MAX);
+                let buf = read_file_range_sync(&p, start, end_inclusive, is_noise_candidate_path(&p))
+                    .map_err(|e| e.to_string())?;
+                Ok(wire::encode_array_buffer(&buf))
+            }
+            "$zFileManager.readFileSlice" => {
+                let p = arg_path(args, 0);
+                let offset = args.get(1).and_then(Value::as_u64).unwrap_or(0);
+                let length = args.get(2).and_then(Value::as_u64).unwrap_or(0);
+                let check_noise = args
+                    .get(3)
+                    .and_then(Value::as_bool)
+                    .unwrap_or_else(|| is_noise_candidate_path(&p));
+                if length == 0 {
+                    return Ok(wire::encode_array_buffer(&[]));
+                }
+                let end_inclusive = offset.saturating_add(length.saturating_sub(1));
+                let buf = read_file_range_sync(&p, offset, end_inclusive, check_noise)
+                    .map_err(|e| e.to_string())?;
+                Ok(wire::encode_array_buffer(&buf))
+            }
+            "$zFileManager.zfileFindNoiseSignature" => {
+                let p = arg_path(args, 0);
+                let (_, sig) = inspect_file_noise(&p, true).map_err(|e| e.to_string())?;
+                Ok(match sig {
+                    Some(off) => json!(off),
+                    None => wire::undefined(),
+                })
+            }
+            "$zFileManager.getMd5LargeFileObject" => {
+                let p = arg_path(args, 0);
+                let hex = compute_file_md5_sync(&p, false).map_err(|e| e.to_string())?;
+                Ok(Value::String(hex))
+            }
+            "$zFileManager.zfileGetChecksum" => {
+                let p = arg_path(args, 0);
+                let hex = compute_file_md5_sync(&p, is_noise_candidate_path(&p))
+                    .map_err(|e| e.to_string())?;
+                Ok(Value::String(hex))
+            }
+            "$zFileManager.testChecksum" => {
+                let p = arg_path(args, 0);
+                let expected = arg_str(args, 1).unwrap_or("").trim();
+                let check_noise = args.get(2).and_then(Value::as_bool).unwrap_or(false);
+                if expected.is_empty() {
+                    return Ok(Value::Bool(false));
+                }
+                match compute_file_md5_sync(&p, check_noise) {
+                    Ok(actual) => Ok(Value::Bool(actual.eq_ignore_ascii_case(expected))),
+                    Err(_) => Ok(Value::Bool(false)),
+                }
             }
             "$zFileManager.writeBufferToPath" => {
                 let p = arg_path(args, 0);
@@ -725,6 +797,92 @@ impl FsBridge {
                     .unwrap_or_default();
                 self.write_file_sync(&p, &data).map_err(|e| e.to_string())?;
                 Ok(Value::Bool(true))
+            }
+            "$zFileManager.appendBufferToPath" => {
+                let p = arg_path(args, 0);
+                let data = args
+                    .get(1)
+                    .and_then(wire::decode_bytes_or_utf8)
+                    .unwrap_or_default();
+                self.require_writable(&p).map_err(|e| e.to_string())?;
+                if let Some(parent) = p.parent() {
+                    self.require_writable(parent).map_err(|e| e.to_string())?;
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| FsError::from_io(e, parent).to_string())?;
+                }
+                let mut f = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&p)
+                    .map_err(|e| FsError::from_io(e, &p).to_string())?;
+                f.write_all(&data)
+                    .map_err(|e| FsError::from_io(e, &p).to_string())?;
+                Ok(wire::undefined())
+            }
+            "$zFileManager.zcloudCloneAndMatchChecksum" => {
+                let expected = arg_str(args, 0).unwrap_or("").trim();
+                let src = arg_path(args, 1);
+                if expected.len() != 32 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Ok(Value::String(String::new()));
+                }
+                if !src.is_file() {
+                    return Ok(Value::String(String::new()));
+                }
+                let stem = src
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("zcloud");
+                let ext = src
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|e| format!(".{e}"))
+                    .unwrap_or_default();
+                let tmp_name = format!(".{stem}_tmp{ext}");
+                let dest_dir = src
+                    .parent()
+                    .filter(|d| self.platform.is_writable(d))
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.platform.temp_dir().to_path_buf());
+                let _ = std::fs::create_dir_all(&dest_dir);
+                let dest = dest_dir.join(tmp_name);
+                if std::fs::copy(&src, &dest).is_err() {
+                    return Ok(Value::String(String::new()));
+                }
+                match compute_file_md5_sync(&dest, false) {
+                    Ok(actual) if actual.eq_ignore_ascii_case(expected) => {
+                        self.platform.grant_writable_path(&dest);
+                        Ok(Value::String(dest.to_string_lossy().into_owned()))
+                    }
+                    _ => {
+                        let _ = std::fs::remove_file(&dest);
+                        Ok(Value::String(String::new()))
+                    }
+                }
+            }
+            "$zFileManager.zcloudDenoiseFile" => {
+                let src = arg_path(args, 0);
+                let dest = arg_path(args, 1);
+                let checksum = arg_str(args, 2).unwrap_or("").trim();
+                self.require_writable(&dest).map_err(|e| e.to_string())?;
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| FsError::from_io(e, parent).to_string())?;
+                }
+                denoise_file_sync(&src, &dest, checksum).map_err(|e| e.to_string())?;
+                Ok(wire::undefined())
+            }
+            "$zFileManager.zcloudNoiseFile" => {
+                let src = arg_path(args, 0);
+                let dest = arg_path(args, 1);
+                let checksum = arg_str(args, 2).unwrap_or("").trim();
+                self.require_writable(&dest).map_err(|e| e.to_string())?;
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| FsError::from_io(e, parent).to_string())?;
+                }
+                noise_file_sync(&src, &dest, checksum).map_err(|e| e.to_string())?;
+                Ok(json!({ "savePath": dest.to_string_lossy() }))
             }
             other => Err(format!("Unsupported filesystem bridge call: {other}")),
         }
@@ -780,4 +938,171 @@ fn parse_encoding_opt(val: Option<&Value>) -> Option<&str> {
             .filter(|s| !s.is_empty()),
         _ => None,
     }
+}
+
+fn is_noise_candidate_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.contains("fileNoise")
+}
+
+/// Inspects `path`, returning `(logical_len, noise_signature_offset)`.
+/// When `check_noise` is true and the file ends with `077a416c4f07` (`ZALO_NOISE_SIGN`),
+/// the 6-byte trailer is excluded from `logical_len` and `Some(raw_len - 6)` is returned.
+fn inspect_file_noise(path: &Path, check_noise: bool) -> Result<(u64, Option<u64>), FsError> {
+    if path.as_os_str().is_empty() {
+        return Err(FsError::enoent(path));
+    }
+    let mut f = File::open(path).map_err(|e| FsError::from_io(e, path))?;
+    let meta = f.metadata().map_err(|e| FsError::from_io(e, path))?;
+    if !meta.is_file() {
+        return Err(FsError {
+            code: "EISDIR",
+            detail: path.display().to_string(),
+        });
+    }
+    let raw_len = meta.len();
+    if check_noise && raw_len > ZALO_NOISE_SIGN.len() as u64 {
+        let sig_off = raw_len - ZALO_NOISE_SIGN.len() as u64;
+        if f.seek(SeekFrom::Start(sig_off)).is_ok() {
+            let mut tail = [0u8; 6];
+            if f.read_exact(&mut tail).is_ok() && tail == ZALO_NOISE_SIGN {
+                return Ok((sig_off, Some(sig_off)));
+            }
+        }
+    }
+    Ok((raw_len, None))
+}
+
+fn apply_noise_xor_at_offset(file_offset: u64, buf: &mut [u8]) {
+    if file_offset >= ZALO_NOISE_XOR_LEN || buf.is_empty() {
+        return;
+    }
+    let xor_end = ((ZALO_NOISE_XOR_LEN - file_offset) as usize).min(buf.len());
+    for b in &mut buf[..xor_end] {
+        *b ^= ZALO_NOISE_XOR_KEY;
+    }
+}
+
+fn read_file_range_sync(
+    path: &Path,
+    start: u64,
+    end_inclusive: u64,
+    check_noise: bool,
+) -> Result<Vec<u8>, FsError> {
+    let (logical_len, noise_sig) = inspect_file_noise(path, check_noise)?;
+    if logical_len == 0 || start >= logical_len || end_inclusive < start {
+        return Ok(Vec::new());
+    }
+    let clamped_end = end_inclusive.min(logical_len - 1);
+    let to_read = (clamped_end - start + 1) as usize;
+    let mut f = File::open(path).map_err(|e| FsError::from_io(e, path))?;
+    f.seek(SeekFrom::Start(start))
+        .map_err(|e| FsError::from_io(e, path))?;
+    let mut buf = Vec::with_capacity(to_read.min(8 * 1024 * 1024));
+    f.take(to_read as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| FsError::from_io(e, path))?;
+    if noise_sig.is_some() {
+        apply_noise_xor_at_offset(start, &mut buf);
+    }
+    Ok(buf)
+}
+
+fn compute_file_md5_sync(path: &Path, check_noise: bool) -> Result<String, FsError> {
+    let (logical_len, noise_sig) = inspect_file_noise(path, check_noise)?;
+    let mut f = File::open(path).map_err(|e| FsError::from_io(e, path))?;
+    let mut hasher = Md5::new();
+    let mut remaining = logical_len;
+    let mut offset = 0u64;
+    let mut chunk = vec![0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = (remaining as usize).min(chunk.len());
+        let n = f
+            .read(&mut chunk[..want])
+            .map_err(|e| FsError::from_io(e, path))?;
+        if n == 0 {
+            break;
+        }
+        if noise_sig.is_some() {
+            apply_noise_xor_at_offset(offset, &mut chunk[..n]);
+        }
+        hasher.update(&chunk[..n]);
+        offset += n as u64;
+        remaining -= n as u64;
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn denoise_file_sync(src: &Path, dest: &Path, expected_checksum: &str) -> Result<(), FsError> {
+    let (logical_len, _) = inspect_file_noise(src, true)?;
+    let mut fin = File::open(src).map_err(|e| FsError::from_io(e, src))?;
+    let mut fout = File::create(dest).map_err(|e| FsError::from_io(e, dest))?;
+    let mut hasher = (!expected_checksum.is_empty()).then(Md5::new);
+    let mut remaining = logical_len;
+    let mut offset = 0u64;
+    let mut chunk = vec![0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = (remaining as usize).min(chunk.len());
+        let n = fin
+            .read(&mut chunk[..want])
+            .map_err(|e| FsError::from_io(e, src))?;
+        if n == 0 {
+            break;
+        }
+        apply_noise_xor_at_offset(offset, &mut chunk[..n]);
+        if let Some(h) = hasher.as_mut() {
+            h.update(&chunk[..n]);
+        }
+        fout.write_all(&chunk[..n])
+            .map_err(|e| FsError::from_io(e, dest))?;
+        offset += n as u64;
+        remaining -= n as u64;
+    }
+    fout.flush().map_err(|e| FsError::from_io(e, dest))?;
+    if let Some(h) = hasher {
+        let actual = hex::encode(h.finalize());
+        if !actual.eq_ignore_ascii_case(expected_checksum) {
+            let _ = std::fs::remove_file(dest);
+            return Err(FsError {
+                code: "EIO",
+                detail: format!("COPY_SERVICE_CHECKSUM_MISMATCH: expected {expected_checksum}, got {actual}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn noise_file_sync(src: &Path, dest: &Path, expected_checksum: &str) -> Result<(), FsError> {
+    let mut fin = File::open(src).map_err(|e| FsError::from_io(e, src))?;
+    let mut fout = File::create(dest).map_err(|e| FsError::from_io(e, dest))?;
+    let mut hasher = (!expected_checksum.is_empty()).then(Md5::new);
+    let mut offset = 0u64;
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let n = fin.read(&mut chunk).map_err(|e| FsError::from_io(e, src))?;
+        if n == 0 {
+            break;
+        }
+        if let Some(h) = hasher.as_mut() {
+            h.update(&chunk[..n]);
+        }
+        apply_noise_xor_at_offset(offset, &mut chunk[..n]);
+        fout.write_all(&chunk[..n])
+            .map_err(|e| FsError::from_io(e, dest))?;
+        offset += n as u64;
+    }
+    if let Some(h) = hasher {
+        let actual = hex::encode(h.finalize());
+        if !actual.eq_ignore_ascii_case(expected_checksum) {
+            let _ = std::fs::remove_file(dest);
+            return Err(FsError {
+                code: "EIO",
+                detail: format!("COPY_SERVICE_CHECKSUM_MISMATCH: expected {expected_checksum}, got {actual}"),
+            });
+        }
+    }
+    fout.write_all(&ZALO_NOISE_SIGN)
+        .map_err(|e| FsError::from_io(e, dest))?;
+    fout.flush().map_err(|e| FsError::from_io(e, dest))?;
+    Ok(())
 }

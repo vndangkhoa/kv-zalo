@@ -1626,6 +1626,10 @@ fn zalo_linux_renderer_patches_rewrite_ui_controls_clipboard_and_calls_idempoten
         function logBubble(n,t){ if(cfg.call.sync_call_message.ui)return; const e={caller:n.role,duration:1e3*n.duration,userId:n.partnerId}; return { action: r?"recommened.calling":"recommened.receivecall", params:'{"isEnableCallback":1}', e }; }
         class UrlUtil { static transformLocalUrl(e){return UrlUtil.checkNeedTransformLocalUrl(e)?"zfile://"+e:e} }
         function an(e){ return Boolean(!1)?"zfile://"+e:e; }
+        function resizeJxl(){ Object(F.jxlNativeSupported)()?(d=this.resizerFactory.createResizer(c.e.LIBJXL),u=this.resizerFactory.createResizer(c.e.LIBJXL_WASM)):d=this.resizerFactory.createResizer(c.e.LIBJXL_WASM); }
+        function decJxl(){ Object(fe.jxlNativeSupported)()?t._decoder||(fe.ImageLoaderConfig.nestedKey("offload_config.enable_offload_decode_jxl")?t._decoder=new ve:t._decoder=new ue,t._lazyDecoderFallbackInit=!0):t._decoder=new Me; }
+        function encJxl(){ Object(fe.jxlNativeSupported)()?(t._encoder||(fe.ImageLoaderConfig.nestedKey("offload_config.enable_offload_encode_jxl")?t._encoder=new St:t._encoder=new Tt),t._lazyDecoderFallbackInit=!0):t._encoder||(t._encoder=new yt); }
+        function pickResizer(){ d=!J.default.image_resizer.enable_libvips_macos||"image/jpeg"!==o&&"image/png"!==o?this.compatibilityValidation.isOffscreenCanvasSupported()?this.resizerFactory.createResizer(c.e.WEB_WORKER):this.compatibilityValidation.isAutoRotationSupported()?this.resizerFactory.createResizer(c.e.MAIN):this.resizerFactory.createResizer(c.e.PRIMITIVE):this.resizerFactory.createResizer(c.e.LIBVIPS); }
     "#;
     let ui_patched = patch_asar_bundle(
         "/pc-dist/lazy/default-login-main-startup-shared-worker-znotification.abc.js",
@@ -1647,8 +1651,130 @@ fn zalo_linux_renderer_patches_rewrite_ui_controls_clipboard_and_calls_idempoten
     assert!(ui_str.contains(r#""recommened.misscall":t.caller?"#));
     assert!(ui_str.contains("isCaller:t.caller?1:0"));
     assert!(ui_str.contains(r#""zfile://local/"+e.replace(/^file:\/+/,""):e"#));
+    assert_eq!(ui_str.matches("(!1/*olaz-wasm-jxl*/)").count(), 3);
+    assert!(ui_str.contains("(!0/*olaz-main-resizer*/?this.resizerFactory.createResizer(c.e.MAIN):null)"));
     // Second pass is strictly idempotent (`None`)
     assert!(patch_zalo_linux_renderer_bundle(&ui_patched).is_none());
+}
+
+#[test]
+fn fs_bridge_upload_slice_checksum_svc_read_and_file_noise_roundtrip() {
+    let tmp = TempDir::new().unwrap();
+    let platform = Arc::new(ZaloPlatform::with_root(tmp.path(), "26.10.20"));
+    let fs_bridge = FsBridge::new(Arc::clone(&platform));
+
+    // Create a 256-byte binary payload outside ZaloData (simulating `/mnt/data/.../subscriptions-proof.png`).
+    let external_dir = tmp.path().join("mnt-data/kv-tube");
+    std::fs::create_dir_all(&external_dir).unwrap();
+    let external_img = external_dir.join("subscriptions-proof.png");
+    let mut payload = Vec::with_capacity(256);
+    for i in 0u16..256 {
+        payload.push(((i * 37 + 13) & 0xff) as u8);
+    }
+    std::fs::write(&external_img, &payload).unwrap();
+    let img_path_str = external_img.to_string_lossy().to_string();
+
+    // 1. `svcStatAsync` & `svcReadPath` (full + inclusive `[start..=end]`) on read-only external path
+    let stat = fs_bridge
+        .dispatch_sync("$zFileManager.svcStatAsync", &[json!(img_path_str)])
+        .unwrap();
+    assert_eq!(stat["size"].as_u64(), Some(256));
+
+    let full_ab = fs_bridge
+        .dispatch_sync("$zFileManager.svcReadPath", &[json!(img_path_str), json!({})])
+        .unwrap();
+    assert_eq!(wire::decode_bytes(&full_ab).unwrap(), payload);
+
+    let ranged_ab = fs_bridge
+        .dispatch_sync(
+            "$zFileManager.svcReadPath",
+            &[json!(img_path_str), json!({ "start": 10, "end": 49 })],
+        )
+        .unwrap();
+    assert_eq!(wire::decode_bytes(&ranged_ab).unwrap(), &payload[10..=49]);
+
+    // 2. `readFileSlice` (offset + length + clamped EOF)
+    let slice_ab = fs_bridge
+        .dispatch_sync(
+            "$zFileManager.readFileSlice",
+            &[json!(img_path_str), json!(200), json!(100), json!(false)],
+        )
+        .unwrap();
+    assert_eq!(wire::decode_bytes(&slice_ab).unwrap(), &payload[200..256]);
+
+    // 3. `getMd5LargeFileObject` & `testChecksum` parity against CryptoBridge MD5
+    let cb = CryptoBridge::new();
+    let h_md5 = cb.hash_create("md5").unwrap();
+    cb.hash_update(h_md5, &payload).unwrap();
+    let expected_md5 = hex::encode(cb.hash_digest(h_md5).unwrap());
+    let actual_md5 = fs_bridge
+        .dispatch_sync("$zFileManager.getMd5LargeFileObject", &[json!(img_path_str)])
+        .unwrap();
+    assert_eq!(actual_md5.as_str(), Some(expected_md5.as_str()));
+
+    let ok_chk = fs_bridge
+        .dispatch_sync(
+            "$zFileManager.testChecksum",
+            &[json!(img_path_str), json!(expected_md5.to_uppercase())],
+        )
+        .unwrap();
+    assert_eq!(ok_chk, json!(true));
+
+    // 4. `zcloudNoiseFile` -> `svcStatAsync` / `svcReadPath` / `zfileGetChecksum` -> `zcloudDenoiseFile` -> `zcloudCloneAndMatchChecksum`
+    let noised_path = platform
+        .user_data()
+        .join("ZaloDownloads/12345/fileNoise")
+        .join(&expected_md5);
+    let noised_str = noised_path.to_string_lossy().to_string();
+    fs_bridge
+        .dispatch_sync(
+            "$zFileManager.zcloudNoiseFile",
+            &[json!(img_path_str), json!(noised_str), json!(expected_md5)],
+        )
+        .unwrap();
+    // Raw on-disk file has 6-byte `077a416c4f07` trailer (`256 + 6 = 262`)
+    assert_eq!(std::fs::metadata(&noised_path).unwrap().len(), 262);
+
+    // Logical stat & read automatically strip the 6-byte trailer and un-XOR the first 100 bytes
+    let noise_stat = fs_bridge
+        .dispatch_sync("$zFileManager.svcStatAsync", &[json!(noised_str)])
+        .unwrap();
+    assert_eq!(noise_stat["size"].as_u64(), Some(256));
+
+    let noise_slice = fs_bridge
+        .dispatch_sync(
+            "$zFileManager.svcReadPath",
+            &[json!(noised_str), json!({ "start": 80, "end": 120 })],
+        )
+        .unwrap();
+    assert_eq!(wire::decode_bytes(&noise_slice).unwrap(), &payload[80..=120]);
+
+    let noise_md5 = fs_bridge
+        .dispatch_sync("$zFileManager.zfileGetChecksum", &[json!(noised_str)])
+        .unwrap();
+    assert_eq!(noise_md5.as_str(), Some(expected_md5.as_str()));
+
+    let denoised_path = platform.downloads_dir().join("restored-proof.png");
+    let denoised_str = denoised_path.to_string_lossy().to_string();
+    fs_bridge
+        .dispatch_sync(
+            "$zFileManager.zcloudDenoiseFile",
+            &[json!(noised_str), json!(denoised_str), json!(expected_md5)],
+        )
+        .unwrap();
+    assert_eq!(std::fs::read(&denoised_path).unwrap(), payload);
+
+    let cloned = fs_bridge
+        .dispatch_sync(
+            "$zFileManager.zcloudCloneAndMatchChecksum",
+            &[json!(expected_md5), json!(img_path_str)],
+        )
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!cloned.is_empty());
+    assert_eq!(std::fs::read(&cloned).unwrap(), payload);
 }
 
 #[test]
@@ -1685,6 +1811,8 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
     let mut hit_call_enrich = false;
     let mut hit_call_log = false;
     let mut hit_zfile_url = false;
+    let mut hit_wasm_jxl = 0usize;
+    let mut hit_main_resizer = false;
     let mut preserved_client_type_23 = false;
     let mut patched_files = 0usize;
 
@@ -1731,6 +1859,10 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
         if s.contains("zfile://local/") {
             hit_zfile_url = true;
         }
+        hit_wasm_jxl += s.matches("(!1/*olaz-wasm-jxl*/)").count();
+        if s.contains("(!0/*olaz-main-resizer*/") {
+            hit_main_resizer = true;
+        }
         if raw
             .windows("getClientType(){return 23}".len())
             .any(|w| w == b"getClientType(){return 23}")
@@ -1752,4 +1884,6 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
     assert!(hit_call_enrich, "__zcallEnrich caller info patch did not match live app.asar");
     assert!(hit_call_log, "Call outcome log bubble patch did not match live app.asar");
     assert!(hit_zfile_url, "zfile://local/ transformLocalUrl patch did not match live app.asar");
+    assert!(hit_wasm_jxl >= 3, "Expected JXL codec sites (resize/decode/encode) to route to WASM in live app.asar (got {hit_wasm_jxl})");
+    assert!(hit_main_resizer, "Expected ee.resizeImage JPEG/PNG MAIN canvas patch to match live app.asar");
 }

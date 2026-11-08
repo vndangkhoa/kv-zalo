@@ -351,11 +351,23 @@ pub fn bridge_spec_script(platform: &ZaloPlatform) -> String {
         "$zFileManager.mergeCalfLogGroup",
         "$zFileManager.writeLogRange",
         "$zFileManager.trustBlob",
+        "$zFileManager.isTrustPath",
+        "$zFileManager.trustPathFromBlob",
         "$zFileManager.getInstallSource",
         "$zFileManager.getFileArrayBuffer",
         "$zFileManager.readFileAsync",
         "$zFileManager.svcStatAsync",
+        "$zFileManager.svcReadPath",
+        "$zFileManager.readFileSlice",
+        "$zFileManager.zfileFindNoiseSignature",
+        "$zFileManager.getMd5LargeFileObject",
+        "$zFileManager.zfileGetChecksum",
+        "$zFileManager.testChecksum",
         "$zFileManager.writeBufferToPath",
+        "$zFileManager.appendBufferToPath",
+        "$zFileManager.zcloudCloneAndMatchChecksum",
+        "$zFileManager.zcloudDenoiseFile",
+        "$zFileManager.zcloudNoiseFile",
     ] {
         members.insert(path.to_string(), "async");
     }
@@ -523,7 +535,10 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
         }
         if (!opts || !opts.maxSizePhoto || st.size <= opts.maxSizePhoto) {
           const ab = await window.$zFileManager.getFileArrayBuffer(p);
-          return { isSuccess: true, data: { name, path: p, size: st.size, content: new Uint8Array(ab), needReadBlob: false } };
+          // Leave `data.path` empty when `content` bytes are already loaded so `onUploadPhotoClicked`
+          // keeps the `Blob`/`File` in Zalo's native browser upload fast-path (`photoPaths` still
+          // carries `r` for `setLastFileUploadPath`).
+          return { isSuccess: true, data: { name, path: '', size: st.size, content: new Uint8Array(ab), needReadBlob: false } };
         }
         return { isSuccess: true, data: { name, path: p, size: st.size, needReadBlob: true } };
       } catch (e) {
@@ -546,6 +561,288 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     }
     return true;
   };
+  local['$zFileManager.writeBlobToPath'] = async (destPath, blob) => {
+    if (!destPath || !blob) return;
+    const ab = typeof blob.arrayBuffer === 'function'
+      ? await blob.arrayBuffer()
+      : await new Response(blob).arrayBuffer();
+    await callAsync('$zFileManager.writeBufferToPath', [String(destPath), new Uint8Array(ab)]);
+  };
+
+  // 2b. `$zFileManager` / `$zpc.zfile` / `$zpc.zprocess` / `$zcloud` streaming chunk upload,
+  //     checksum, E2EE/pcloud cipher transforms, and file-noise helpers.
+  const toU8 = (v) => {
+    if (!v) return new Uint8Array(0);
+    if (v instanceof Uint8Array) return v;
+    if (v instanceof ArrayBuffer) return new Uint8Array(v);
+    if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+    return new Uint8Array(0);
+  };
+  const toExactArrayBuffer = (u8) => (
+    u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength
+      ? u8.buffer
+      : u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength)
+  );
+  const concatManyU8 = (parts) => {
+    if (!parts.length) return new Uint8Array(0);
+    if (parts.length === 1) return parts[0];
+    let total = 0;
+    for (let i = 0; i < parts.length; i++) total += parts[i].byteLength;
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (let i = 0; i < parts.length; i++) {
+      out.set(parts[i], off);
+      off += parts[i].byteLength;
+    }
+    return out;
+  };
+  const u8ToB64 = (u8) => {
+    let s = '';
+    for (let i = 0; i < u8.byteLength; i++) s += String.fromCharCode(u8[i]);
+    return window.btoa(s);
+  };
+  const uploadCipherCache = new Map();
+  const uploadEncHashCache = new Map();
+  const transformUploadSlice = (sessionId, rawU8, secure, isLastPart) => {
+    if (!secure || !secure.cryptography || (secure.type !== 'e2ee' && secure.type !== 'pcloud')) {
+      return { bytes: rawU8, hasSecure: false, tag: null, checksumEncr: undefined };
+    }
+    const cfg = secure.cryptography;
+    const keyU8 = toU8(cfg.key);
+    const ivU8 = toU8(cfg.iv);
+    const cacheKey = `${sessionId || ''}:${cfg.alg || ''}:${u8ToB64(keyU8)}:${u8ToB64(ivU8)}`;
+    let state = uploadCipherCache.get(cacheKey);
+    if (!state) {
+      state = { cipher: null, pending: new Uint8Array(0) };
+      uploadCipherCache.set(cacheKey, state);
+    }
+    let encBytes;
+    let tag = null;
+    if (cfg.type === 'block') {
+      const blockSize = Number(cfg.blockSize) || 4096;
+      const work = state.pending.byteLength ? concatManyU8([state.pending, rawU8]) : rawU8;
+      const fullBlocks = Math.floor(work.byteLength / blockSize);
+      const outParts = [];
+      for (let b = 0; b < fullBlocks; b++) {
+        const blk = work.subarray(b * blockSize, (b + 1) * blockSize);
+        const c = window.$znode.crypto.createCipheriv(cfg.alg, keyU8, ivU8);
+        const u = toU8(c.update(blk));
+        const f = toU8(c.final());
+        outParts.push(f.byteLength ? concatManyU8([u, f]) : u);
+      }
+      const rem = work.subarray(fullBlocks * blockSize);
+      if (isLastPart) {
+        if (rem.byteLength) outParts.push(rem.slice());
+        state.pending = new Uint8Array(0);
+        uploadCipherCache.delete(cacheKey);
+        tag = new Uint8Array(0);
+      } else {
+        state.pending = rem.slice();
+      }
+      encBytes = concatManyU8(outParts);
+    } else {
+      if (!state.cipher) {
+        state.cipher = window.$znode.crypto.createCipheriv(cfg.alg, keyU8, ivU8, { authTagLength: 16 });
+      }
+      const u = toU8(state.cipher.update(rawU8));
+      if (isLastPart) {
+        const f = toU8(state.cipher.final());
+        encBytes = f.byteLength ? concatManyU8([u, f]) : u;
+        tag = safe(() => toU8(state.cipher.getAuthTag()), null) || new Uint8Array(0);
+        cfg.tag = tag;
+        uploadCipherCache.delete(cacheKey);
+      } else {
+        encBytes = u;
+      }
+    }
+    let checksumEncr;
+    if (secure.type === 'pcloud') {
+      const hk = String(sessionId || cacheKey);
+      let h = uploadEncHashCache.get(hk);
+      if (!h) {
+        h = window.$znode.crypto.createHash('md5');
+        uploadEncHashCache.set(hk, h);
+      }
+      if (encBytes.byteLength) h.update(encBytes);
+      if (isLastPart) {
+        checksumEncr = h.digest('hex');
+        uploadEncHashCache.delete(hk);
+      }
+    }
+    return { bytes: encBytes, hasSecure: true, tag, checksumEncr };
+  };
+  const readChunksFromPath = async (sessionId, fileObj, chunkSize, partCfg, hashSink, secure, isLastPart, checkNoise) => {
+    const srcPath = (fileObj && (fileObj.path || fileObj.filePath || fileObj.folderPath)) ? String(fileObj.path || fileObj.filePath || fileObj.folderPath) : '';
+    if (!srcPath) throw new Error('Invalid upload file path');
+    const fileSize = Number(fileObj.size) || 0;
+    const cs = Math.max(1, Number(chunkSize) || (2 * 1024 * 1024));
+    const totalChunks = Math.max(1, Math.ceil(fileSize / cs));
+    const startChunkId = (partCfg && Number(partCfg.startChunkId)) || 1;
+    const endChunkId = (partCfg && Number(partCfg.endChunkId)) || totalChunks;
+    const byteStart = (startChunkId - 1) * cs;
+    const byteEnd = Math.min(fileSize, endChunkId * cs);
+    const expectedLen = Math.max(0, byteEnd - byteStart);
+    const sliceAb = expectedLen > 0
+      ? await callAsync('$zFileManager.readFileSlice', [srcPath, byteStart, expectedLen, !!checkNoise])
+      : new ArrayBuffer(0);
+    let rawU8 = toU8(sliceAb);
+    if (rawU8.byteLength < expectedLen) {
+      const padded = new Uint8Array(expectedLen);
+      padded.set(rawU8, 0);
+      rawU8 = padded;
+    }
+    if (hashSink && rawU8.byteLength) {
+      const plainAb = toExactArrayBuffer(rawU8);
+      if (hashSink.ref && typeof hashSink.ref.append === 'function') {
+        hashSink.ref.append(plainAb);
+        hashSink.size = (Number(hashSink.size) || 0) + rawU8.byteLength;
+      } else if (hashSink.hash && typeof hashSink.hash.append === 'function') {
+        hashSink.hash.append(plainAb);
+        hashSink.size = (Number(hashSink.size) || 0) + rawU8.byteLength;
+      }
+    }
+    const { bytes: outU8, hasSecure, tag, checksumEncr } = transformUploadSlice(
+      sessionId,
+      rawU8,
+      secure,
+      !!isLastPart
+    );
+    const outAb = toExactArrayBuffer(outU8);
+    const chunks = [];
+    for (let cid = startChunkId; cid <= endChunkId; cid++) {
+      const off = (cid - startChunkId) * cs;
+      const rem = Math.max(0, outAb.byteLength - off);
+      const len = cid === endChunkId ? rem : Math.min(cs, rem);
+      chunks.push(new DataView(outAb, Math.min(off, outAb.byteLength), len));
+    }
+    if (isLastPart && hasSecure) {
+      const res = { chunks, noChunk: totalChunks, tag: new Uint8Array(tag || 0) };
+      if (checksumEncr !== undefined) res.checksumEncr = checksumEncr;
+      return res;
+    }
+    return { chunks, noChunk: totalChunks };
+  };
+
+  local['$zFileManager.readChunksArrayObject'] = (sessionId, fileObj, chunkSize, range, secureOptions, isLastPart) =>
+    readChunksFromPath(
+      sessionId,
+      fileObj,
+      chunkSize,
+      range || {},
+      range && range.refHash ? range.refHash : null,
+      secureOptions,
+      !!isLastPart,
+      false
+    );
+  local['$zpc.zprocess.getActiveResourcesInfo'] = () => [];
+  local['$zpc.zfile.isTrustPath'] = async () => true;
+  local['$zpc.zfile.findNoiseSignature'] = (p) => callAsync('$zFileManager.zfileFindNoiseSignature', [String(p || '')]);
+  local['$zpc.zfile.getChecksum'] = async (p) => {
+    try { return await callAsync('$zFileManager.zfileGetChecksum', [String(p || '')]); }
+    catch { return undefined; }
+  };
+  local['$zpc.zfile.compareChecksum'] = async (p, expected) => {
+    if (!p || !expected) return false;
+    return !!(await callAsync('$zFileManager.testChecksum', [String(p), String(expected), true]));
+  };
+  local['$zpc.zfile.readFileByChunksForUpload'] = (sessionId, fileObj, opts = {}) => {
+    const part = (opts && opts.part) || {};
+    const cs = Number(part.chunkSize) || (2 * 1024 * 1024);
+    const totalChunks = Math.max(1, Math.ceil((Number(fileObj && fileObj.size) || 0) / cs));
+    const endChunkId = Number(part.endChunkId) || totalChunks;
+    const isLastPart = part.isLastPart !== undefined ? !!part.isLastPart : (endChunkId >= totalChunks);
+    const p = String((fileObj && fileObj.path) || '');
+    const checkNoise = p.includes('ZaloDownloads') && p.includes('fileNoise');
+    return readChunksFromPath(
+      sessionId,
+      fileObj,
+      cs,
+      part,
+      opts ? opts.hash : null,
+      opts ? opts.secure : null,
+      isLastPart,
+      checkNoise
+    );
+  };
+
+  // 2c. `$zcloud` main-process file/cache helpers
+  local['$zcloud.getHeap'] = async () => (typeof performance !== 'undefined' && performance.memory && performance.memory.usedJSHeapSize) || 0;
+  local['$zcloud.writeHeap'] = () => {};
+  local['$zcloud.AppendLog'] = async () => {};
+  local['$zcloud.writeBufferToFile'] = async (arg) => {
+    if (!arg || !arg.outputPath) return;
+    await callAsync('$zFileManager.writeBufferToPath', [String(arg.outputPath), toU8(arg.buffer)]);
+  };
+  local['$zcloud.removeFile'] = async (p) => {
+    if (!p) return;
+    try { await callAsync('$znode.fs.rm', [String(p), { force: true, recursive: true }]); } catch {}
+  };
+  local['$zcloud.matchChecksum'] = async (arg) => {
+    if (!arg || !arg.filePath || !arg.checksum) return false;
+    return !!(await callAsync('$zFileManager.testChecksum', [String(arg.filePath), String(arg.checksum), false]));
+  };
+  local['$zcloud.cloneAndMatchChecksum'] = async (arg) => {
+    if (!arg || !arg.filePath || !arg.checksum) return '';
+    return await callAsync('$zFileManager.zcloudCloneAndMatchChecksum', [String(arg.checksum), String(arg.filePath)]);
+  };
+  local['$zcloud.denoiseFile'] = async (arg) => {
+    if (!arg || !arg.src || !arg.dest) return;
+    await callAsync('$zFileManager.zcloudDenoiseFile', [String(arg.src), String(arg.dest), String(arg.checksum || '')]);
+  };
+  local['$zcloud.noiseFile'] = async (arg) => {
+    if (!arg || !arg.src || !arg.userId || !arg.checksum) return { savePath: '' };
+    const base = safe(() => sync('$zelectron.appGetPath', ['userData']), '') || '';
+    const sub = arg.isGroup ? 'group/' : '';
+    const dest = `${base}/ZaloDownloads/${arg.userId}/fileNoise/${sub}${arg.checksum}`;
+    return await callAsync('$zFileManager.zcloudNoiseFile', [String(arg.src), dest, String(arg.checksum)]);
+  };
+
+  // 2d. Emit `XMLHttpRequest.upload` progress/load events on `ProxiedXHR`
+  if (typeof window.XMLHttpRequest === 'function'
+      && window.XMLHttpRequest.prototype
+      && !window.XMLHttpRequest.prototype.__olazUploadEvents) {
+    const origSend = window.XMLHttpRequest.prototype.send;
+    const bodyByteLen = (b) => {
+      if (b == null) return 0;
+      if (typeof b === 'string') return new TextEncoder().encode(b).byteLength;
+      if (b instanceof Blob) return b.size;
+      if (b instanceof ArrayBuffer) return b.byteLength;
+      if (ArrayBuffer.isView(b)) return b.byteLength;
+      return 0;
+    };
+    const emitUpload = (up, type, loaded, total) => {
+      if (!up) return;
+      let ev;
+      try {
+        ev = new ProgressEvent(type, { lengthComputable: total > 0, loaded, total });
+      } catch {
+        ev = new Event(type);
+      }
+      safe(() => up.dispatchEvent(ev), null);
+      const handler = up['on' + type];
+      if (typeof handler === 'function') safe(() => handler.call(up, ev), null);
+    };
+    window.XMLHttpRequest.prototype.send = function (body) {
+      const up = this && this.upload;
+      const total = bodyByteLen(body);
+      if (up && total > 0 && typeof this.addEventListener === 'function') {
+        emitUpload(up, 'loadstart', 0, total);
+        let settled = false;
+        const finish = (terminalType, loadedBytes) => {
+          if (settled) return;
+          settled = true;
+          if (terminalType === 'load') emitUpload(up, 'progress', loadedBytes, total);
+          emitUpload(up, terminalType, loadedBytes, total);
+          emitUpload(up, 'loadend', loadedBytes, total);
+        };
+        this.addEventListener('load', () => finish('load', total), { once: true });
+        this.addEventListener('error', () => finish('error', 0), { once: true });
+        this.addEventListener('abort', () => finish('abort', 0), { once: true });
+      }
+      return origSend.apply(this, arguments);
+    };
+    window.XMLHttpRequest.prototype.__olazUploadEvents = true;
+  }
 
   // 3. `$znode.nativelibs.zfile` (Settings -> Data Management disk info + folder copy)
   local['$znode.nativelibs.zfile'] = () => ({
@@ -647,10 +944,12 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     window.Audio = WrappedAudio;
   }
 
-  // 6. Capture-phase `drop` listener attaching POSIX `.path` to dropped `File`s
+  // 6. Capture-phase `drop` listener: leave regular dropped files/images as pure disk-backed
+  //    browser `File` objects (without `.path`) so Zalo uses its native `FileReader` / WebKit
+  //    upload pipeline; only attach POSIX `.path` when a dropped entry is a directory (`isDirectory`).
   window.addEventListener('drop', (ev) => {
     const dt = ev.dataTransfer;
-    if (!dt) return;
+    if (!dt || !dt.items) return;
     const uriText = safe(() => dt.getData('text/uri-list'), '') || '';
     const uriPaths = uriText.split(/\r?\n/)
       .filter((l) => l.startsWith('file://'))
@@ -658,30 +957,28 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
       .filter(Boolean);
     const pool = uriPaths.length ? uriPaths : (Array.isArray(window.__olazLastDragPaths) ? window.__olazLastDragPaths : []);
     if (!pool.length) return;
-    const attachPath = (f, fallback) => {
+    const attachDirPath = (f, fallback) => {
       if (f && !f.path) {
-        const matched = pool.find((p) => p.endsWith('/' + f.name)) || fallback;
+        const matched = pool.find((p) => p.endsWith('/' + f.name) || p === fallback) || fallback;
         if (matched) {
           try { Object.defineProperty(f, 'path', { value: matched, configurable: true }); } catch {}
         }
       }
       return f;
     };
-    if (dt.items) {
-      let idx = 0;
-      for (let i = 0; i < dt.items.length; i++) {
-        const it = dt.items[i];
-        if (it && it.kind === 'file' && typeof it.getAsFile === 'function' && !it.getAsFile.__olazPath) {
-          const origGet = it.getAsFile.bind(it);
-          const fallback = pool[idx++] || '';
-          const wrapped = function () { return attachPath(origGet(), fallback); };
-          wrapped.__olazPath = true;
-          try { it.getAsFile = wrapped; } catch {}
-        }
+    let idx = 0;
+    for (let i = 0; i < dt.items.length; i++) {
+      const it = dt.items[i];
+      if (!it || it.kind !== 'file') continue;
+      const fallback = pool[idx++] || '';
+      const entry = safe(() => (typeof it.webkitGetAsEntry === 'function' ? it.webkitGetAsEntry() : null), null);
+      if (entry && entry.isDirectory && typeof it.getAsFile === 'function' && !it.getAsFile.__olazPath) {
+        const origGet = it.getAsFile.bind(it);
+        const wrapped = function () { return attachDirPath(origGet(), fallback); };
+        wrapped.__olazPath = true;
+        try { it.getAsFile = wrapped; } catch {}
+        if (dt.files && dt.files[i]) attachDirPath(dt.files[i], fallback);
       }
-    }
-    if (dt.files) {
-      for (let i = 0; i < dt.files.length; i++) attachPath(dt.files[i], pool[i] || '');
     }
   }, true);
 
@@ -1172,6 +1469,34 @@ static TRANSFORM_LOCAL_URL_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("valid transformLocalUrl regex")
 });
 
+static JXL_RESIZE_CODEC_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"Object\([A-Za-z_$][\w$]*\.jxlNativeSupported\)\(\)\?\(([A-Za-z_$][\w$]*=this\.resizerFactory\.createResizer\([A-Za-z_$][\w$]*\.e\.LIBJXL\))"#,
+    )
+    .expect("valid JXL resize codec regex")
+});
+
+static JXL_DECODE_CODEC_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"Object\([A-Za-z_$][\w$]*\.jxlNativeSupported\)\(\)\?([A-Za-z_$][\w$]*\._decoder\|\|\([A-Za-z_$][\w$]*\.ImageLoaderConfig\.nestedKey\("offload_config\.enable_offload_decode_jxl"\))"#,
+    )
+    .expect("valid JXL decode codec regex")
+});
+
+static JXL_ENCODE_CODEC_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"Object\([A-Za-z_$][\w$]*\.jxlNativeSupported\)\(\)\?\(([A-Za-z_$][\w$]*\._encoder\|\|\([A-Za-z_$][\w$]*\.ImageLoaderConfig\.nestedKey\("offload_config\.enable_offload_encode_jxl"\))"#,
+    )
+    .expect("valid JXL encode codec regex")
+});
+
+static IMAGE_RESIZER_MAIN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"![A-Za-z_$][\w$]*\.default\.image_resizer\.enable_libvips_macos\|\|"image/jpeg"!==[A-Za-z_$][\w$]*&&"image/png"!==[A-Za-z_$][\w$]*\?this\.compatibilityValidation\.isOffscreenCanvasSupported\(\)\?this\.resizerFactory\.createResizer\(([A-Za-z_$][\w$]*\.e)\.WEB_WORKER\):this\.compatibilityValidation\.isAutoRotationSupported\(\)\?this\.resizerFactory\.createResizer\([A-Za-z_$][\w$]*\.e\.MAIN\):this\.resizerFactory\.createResizer\([A-Za-z_$][\w$]*\.e\.PRIMITIVE\):this\.resizerFactory\.createResizer\([A-Za-z_$][\w$]*\.e\.LIBVIPS\)"#,
+    )
+    .expect("valid image resizer MAIN regex")
+});
+
 /// Applies `vndangkhoa/zalo-linux` renderer patches on-the-fly without altering `getClientType() == 23`:
 /// - Login titlebar `platform:"WIN32"` (`fa-Minus` + `fa-Close`)
 /// - Main `#titleBar` Windows controls (`Lock`, `Minus`, `Maximize`/`Minimize`, `Close`) + `"WIN32"` layout class
@@ -1179,6 +1504,7 @@ static TRANSFORM_LOCAL_URL_RE: Lazy<Regex> = Lazy::new(|| {
 /// - `Ctrl+V` clipboard image paste (`$zelectronNative.getClipboardImage()` + `File` items fast-path)
 /// - Linux call support gate (`Number(e.split(".")[0])<17` + `isSupport()`)
 /// - Incoming call caller name/avatar enrichment (`e._caller`) & chat call-log outcome bubbles
+/// - WASM JXL encode/decode/resize routing + HTML `<canvas>` (`MAIN`) JPEG/PNG resizer routing
 pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
     const FAST_NEEDLES: &[&[u8]] = &[
         b"handlerMinimiseAppWindowOS",
@@ -1192,6 +1518,10 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         b"{\"isEnableCallback\":1}",
         b"checkNeedTransformLocalUrl",
         b"Boolean(!1)?\"zfile://\"+e:e",
+        b"enable_offload_encode_jxl",
+        b"enable_offload_decode_jxl",
+        b"enable_libvips_macos",
+        b"createResizer(",
     ];
     if !FAST_NEEDLES
         .iter()
@@ -1411,6 +1741,41 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
     if s.contains(ZFILE_INLINE_FIND) {
         s = s.replace(ZFILE_INLINE_FIND, ZFILE_INLINE_REPL);
         changed = true;
+    }
+
+    // 9. Route JXL encode/decode/resize codecs to Zalo's built-in WASM JXL worker (`yt`, `Me`,
+    //    `LIBJXL_WASM`) instead of Electron native `$zFeatures.libjxl` or 60s offload BrowserWindow
+    //    tasks (`St`, `Tt`, `ve`, `ue`) while preserving `jxlNativeSupported() === true` for native
+    //    desktop file download UI actions.
+    if s.contains("jxlNativeSupported") {
+        for (re, repl) in [
+            (&*JXL_RESIZE_CODEC_RE, "(!1/*olaz-wasm-jxl*/)?(${1}"),
+            (&*JXL_DECODE_CODEC_RE, "(!1/*olaz-wasm-jxl*/)?${1}"),
+            (&*JXL_ENCODE_CODEC_RE, "(!1/*olaz-wasm-jxl*/)?(${1}"),
+        ] {
+            if re.is_match(&s) {
+                let next = re.replace_all(&s, repl).into_owned();
+                if next != s {
+                    s = next;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // 10. Route JPEG/PNG resizing in `ee.resizeImage` to main-thread HTML `<canvas>` (`MAIN`)
+    //     so photo uploads never hit Electron `LIBVIPS` or software-rendered Worker `OffscreenCanvas`.
+    if s.contains("enable_libvips_macos") && IMAGE_RESIZER_MAIN_RE.is_match(&s) {
+        let next = IMAGE_RESIZER_MAIN_RE
+            .replace_all(
+                &s,
+                "(!0/*olaz-main-resizer*/?this.resizerFactory.createResizer(${1}.MAIN):null)",
+            )
+            .into_owned();
+        if next != s {
+            s = next;
+            changed = true;
+        }
     }
 
     if changed {
