@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Olaz</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="app" class="app-viewport" aria-live="off"></div>
+
+  <!-- Incoming Call Banner (non-blocking top-layer surface) -->
+  <aside id="incoming-call-banner" class="call-banner" hidden aria-label="Cuộc gọi đến"></aside>
+
+  <!-- Toast Notification Region -->
+  <div id="toast-region" class="toast-region" role="status" aria-live="polite"></div>
+
+  <!-- Floating Context Menu (escapes scroller clipping) -->
+  <div id="context-menu" class="floating-menu" hidden role="menu"></div>
+
+  <!-- Sticker Picker Floating Panel -->
+  <div id="sticker-popover" class="sticker-popover" hidden aria-label="Bảng chọn Sticker"></div>
+
+  <!-- 1. Quick Switcher Dialog (Ctrl+K) -->
+  <dialog id="quick-switcher-dialog" class="modal-dialog modal-switcher" closedby="any" aria-labelledby="qs-dialog-title">
+    <div class="dialog-header">
+      <h2 id="qs-dialog-title" class="dialog-title">Chuyển nhanh hội thoại</h2>
+      <form method="dialog">
+        <button type="submit" class="icon-btn" value="cancel" aria-label="Đóng bảng chuyển nhanh" data-icon="close"></button>
+      </form>
+    </div>
+    <div class="switcher-search-wrap">
+      <span class="field-leading-icon" data-icon="search" aria-hidden="true"></span>
+      <input
+        id="qs-search-input"
+        type="search"
+        class="text-input switcher-input"
+        placeholder="Nhập tên bạn bè, nhóm không dấu hoặc có dấu…"
+        autocomplete="off"
+        spellcheck="false"
+        autofocus
+      >
+      <kbd class="kbd-hint">Esc</kbd>
+    </div>
+    <ul id="qs-results-list" class="switcher-list scroller" role="listbox" aria-label="Kết quả tìm kiếm"></ul>
+  </dialog>
+
+  <!-- 2. Media Lightbox Dialog -->
+  <dialog id="media-lightbox-dialog" class="modal-dialog modal-lightbox" closedby="any" aria-labelledby="lightbox-dialog-title">
+    <div class="dialog-header lightbox-header">
+      <div class="lightbox-meta">
+        <h2 id="lightbox-dialog-title" class="dialog-title">Xem phương tiện</h2>
+        <p id="lightbox-subtitle" class="dialog-subtitle"></p>
+      </div>
+      <div class="dialog-header-actions">
+        <button type="button" id="lightbox-download-btn" class="btn btn-secondary">
+          <span data-icon="download" aria-hidden="true"></span>
+          <span>Mở tệp gốc</span>
+        </button>
+        <form method="dialog">
+          <button type="submit" class="icon-btn" value="cancel" aria-label="Đóng trình xem ảnh" data-icon="close" autofocus></button>
+        </form>
+      </div>
+    </div>
+    <div id="lightbox-stage" class="lightbox-stage"></div>
+  </dialog>
+
+  <!-- 3. Clipboard Image Paste Preview Dialog (Ctrl+V) -->
+  <dialog id="clipboard-paste-dialog" class="modal-dialog modal-compact" closedby="any" aria-labelledby="paste-dialog-title">
+    <div class="dialog-header">
+      <h2 id="paste-dialog-title" class="dialog-title">Gửi ảnh từ bộ nhớ tạm</h2>
+      <form method="dialog">
+        <button type="submit" class="icon-btn" value="cancel" aria-label="Hủy gửi ảnh" data-icon="close"></button>
+      </form>
+    </div>
+    <div class="dialog-body">
+      <div id="paste-preview-frame" class="paste-preview-frame"></div>
+      <p id="paste-target-label" class="dialog-note"></p>
+    </div>
+    <div class="dialog-footer">
+      <form method="dialog">
+        <button type="submit" class="btn btn-ghost" value="cancel">Hủy</button>
+      </form>
+      <button type="button" id="paste-confirm-send-btn" class="btn btn-primary" autofocus>
+        <span data-icon="send" aria-hidden="true"></span>
+        <span>Gửi ảnh ngay</span>
+      </button>
+    </div>
+  </dialog>
+
+  <!-- 4. Create Group Dialog -->
+  <dialog id="create-group-dialog" class="modal-dialog" closedby="any" aria-labelledby="create-group-title">
+    <div class="dialog-header">
+      <h2 id="create-group-title" class="dialog-title">Tạo nhóm trò chuyện mới</h2>
+      <form method="dialog">
+        <button type="submit" class="icon-btn" value="cancel" aria-label="Đóng cửa sổ tạo nhóm" data-icon="close"></button>
+      </form>
+    </div>
+    <form id="create-group-form" class="dialog-body form-stack">
+      <label class="field-stack" for="group-name-input">
+        <span class="field-label">Tên nhóm</span>
+        <input id="group-name-input" type="text" class="text-input" placeholder="Ví dụ: Nhóm Phát triển Sản phẩm" required maxlength="80" autofocus>
+      </label>
+      <div class="field-stack">
+        <div class="field-row-between">
+          <label class="field-label" for="group-member-filter">Chọn thành viên</label>
+          <span id="group-selected-count" class="numeric-meta">Đã chọn 0</span>
+        </div>
+        <input id="group-member-filter" type="search" class="text-input" placeholder="Lọc danh bạ theo tên…" autocomplete="off">
+        <div id="group-member-list" class="picker-list scroller"></div>
+      </div>
+      <div class="dialog-footer">
+        <button type="button" class="btn btn-ghost" data-close-dialog="create-group-dialog">Hủy</button>
+        <button type="submit" class="btn btn-primary">Tạo nhóm</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 5. Forward Message Dialog -->
+  <dialog id="forward-dialog" class="modal-dialog" closedby="any" aria-labelledby="forward-dialog-title">
+    <div class="dialog-header">
+      <h2 id="forward-dialog-title" class="dialog-title">Chuyển tiếp tin nhắn</h2>
+      <form method="dialog">
+        <button type="submit" class="icon-btn" value="cancel" aria-label="Đóng cửa sổ chuyển tiếp" data-icon="close"></button>
+      </form>
+    </div>
+    <form id="forward-form" class="dialog-body form-stack">
+      <div id="forward-preview-box" class="quote-callout"></div>
+      <div class="field-stack">
+        <div class="field-row-between">
+          <label class="field-label" for="forward-filter-input">Gửi đến hội thoại</label>
+          <span id="forward-selected-count" class="numeric-meta">Đã chọn 0</span>
+        </div>
+        <input id="forward-filter-input" type="search" class="text-input" placeholder="Tìm cuộc trò chuyện nhận…" autocomplete="off" autofocus>
+        <div id="forward-target-list" class="picker-list scroller"></div>
+      </div>
+      <div class="dialog-footer">
+        <button type="button" class="btn btn-ghost" data-close-dialog="forward-dialog">Hủy</button>
+        <button type="submit" class="btn btn-primary">Chuyển tiếp</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 6. Poll Create Dialog -->
+  <dialog id="poll-create-dialog" class="modal-dialog" closedby="any" aria-labelledby="poll-create-title">
+    <div class="dialog-header">
+      <h2 id="poll-create-title" class="dialog-title">Tạo bình chọn nhóm</h2>
+      <form method="dialog">
+        <button type="submit" class="icon-btn" value="cancel" aria-label="Đóng tạo bình chọn" data-icon="close"></button>
+      </form>
+    </div>
+    <form id="poll-create-form" class="dialog-body form-stack">
+      <label class="field-stack" for="poll-question-input">
+        <span class="field-label">Câu hỏi bình chọn</span>
+        <input id="poll-question-input" type="text" class="text-input" placeholder="Đặt câu hỏi cho các thành viên…" required maxlength="200" autofocus>
+      </label>
+      <div class="field-stack">
+        <div class="field-row-between">
+          <span class="field-label">Các phương án</span>
+          <button type="button" id="poll-add-option-btn" class="btn btn-inline">
+            <span data-icon="plus" aria-hidden="true"></span>
+            <span>Thêm phương án</span>
+          </button>
+        </div>
+        <div id="poll-options-inputs" class="form-stack-tight"></div>
+      </div>
+      <div class="check-group">
+        <label class="check-field" for="poll-multi-check">
+          <input type="checkbox" id="poll-multi-check" class="visually-hidden-fallback" checked>
+          <span>Cho phép chọn nhiều phương án</span>
+        </label>
+        <label class="check-field" for="poll-allow-add-check">
+          <input type="checkbox" id="poll-allow-add-check" class="visually-hidden-fallback" checked>
+          <span>Thành viên có thể thêm phương án mới</span>
+        </label>
+        <label class="check-field" for="poll-anon-check">
+          <input type="checkbox" id="poll-anon-check" class="visually-hidden-fallback">
+          <span>Bình chọn ẩn danh</span>
+        </label>
+      </div>
+      <div class="dialog-footer">
+        <button type="button" class="btn btn-ghost" data-close-dialog="poll-create-dialog">Hủy</button>
+        <button type="submit" class="btn btn-primary">Đăng bình chọn</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 7. Poll Detail & Vote Dialog -->
+  <dialog id="poll-detail-dialog" class="modal-dialog" closedby="any" aria-labelledby="poll-detail-title">
+    <div class="dialog-header">
+      <h2 id="poll-detail-title" class="dialog-title">Chi tiết bình chọn</h2>
+      <form method="dialog">
+        <button type="submit" class="icon-btn" value="cancel" aria-label="Đóng chi tiết bình chọn" data-icon="close"></button>
+      </form>
+    </div>
+    <form id="poll-vote-form" class="dialog-body form-stack">
+      <p id="poll-detail-meta" class="dialog-subtitle"></p>
+      <div id="poll-detail-options" class="poll-detail-list scroller"></div>
+      <div id="poll-new-option-wrap" class="field-row">
+        <input id="poll-new-option-input" type="text" class="text-input" placeholder="Thêm phương án khác…" maxlength="120">
+      </div>
+      <div class="dialog-footer">
+        <button type="button" class="btn btn-ghost" data-close-dialog="poll-detail-dialog">Đóng</button>
+        <button type="submit" id="poll-submit-vote-btn" class="btn btn-primary" autofocus>Xác nhận bình chọn</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 8. Hidden Chat PIN Dialog -->
+  <dialog id="hidden-pin-dialog" class="modal-dialog modal-compact" closedby="any" aria-labelledby="hidden-pin-title">
+    <div class="dialog-header">
+      <h2 id="hidden-pin-title" class="dialog-title">Mã PIN trò chuyện ẩn</h2>
+      <form method="dialog">
+        <button type="submit" class="icon-btn" value="cancel" aria-label="Đóng nhập mã PIN" data-icon="close"></button>
+      </form>
+    </div>
+    <form id="hidden-pin-form" class="dialog-body form-stack">
+      <p id="hidden-pin-desc" class="dialog-note">Nhập mã PIN 4 chữ số để mở khóa danh sách trò chuyện ẩn.</p>
+      <label class="field-stack" for="hidden-pin-input">
+        <span id="hidden-pin-label" class="field-label">Mã PIN hiện tại</span>
+        <input
+          id="hidden-pin-input"
+          type="password"
+          inputmode="numeric"
+          pattern="[0-9]{4}"
+          maxlength="4"
+          class="text-input pin-code-input"
+          placeholder="0000"
+          autocomplete="off"
+          required
+          autofocus
+        >
+      </label>
+      <label id="hidden-new-pin-wrap" class="field-stack" for="hidden-new-pin-input" hidden>
+        <span class="field-label">Mã PIN mới (4 chữ số)</span>
+        <input
+          id="hidden-new-pin-input"
+          type="password"
+          inputmode="numeric"
+          pattern="[0-9]{4}"
+          maxlength="4"
+          class="text-input pin-code-input"
+          placeholder="0000"
+          autocomplete="off"
+        >
+      </label>
+      <p id="hidden-pin-error" class="form-error-text" hidden></p>
+      <div class="dialog-footer">
+        <button type="button" class="btn btn-ghost" data-close-dialog="hidden-pin-dialog">Hủy</button>
+        <button type="submit" id="hidden-pin-submit-btn" class="btn btn-primary">Xác nhận</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 9. Settings Dialog -->
+  <dialog id="settings-dialog" class="modal-dialog modal-settings" closedby="any" aria-labelledby="settings-dialog-title">
+    <div class="dialog-header">
+      <h2 id="settings-dialog-title" class="dialog-title">Thiết lập Olaz</h2>
+      <form method="dialog">
+        <button type="submit" class="icon-btn" value="cancel" aria-label="Đóng thiết lập" data-icon="close" autofocus></button>
+      </form>
+    </div>
+    <div id="settings-dialog-body" class="dialog-body settings-layout scroller"></div>
+  </dialog>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

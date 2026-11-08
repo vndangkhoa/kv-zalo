@@ -1,0 +1,108 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/olaz-core",
+    "crates/olaz-net",
+    "crates/olaz-linux",
+    "crates/olaz-app",
+]
+default-members = ["crates/olaz-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+authors = ["Olaz Contributors"]
+repository = "https://github.com/qnguyen3/zalo-swift-re"
+
+[workspace.dependencies]
+# Internal crates
+olaz-core = { path = "crates/olaz-core" }
+olaz-net = { path = "crates/olaz-net" }
+olaz-linux = { path = "crates/olaz-linux" }
+
+# Async & concurrency
+tokio = { version = "1.43", features = ["full"] }
+futures-util = "0.3"
+parking_lot = "0.12"
+dashmap = "6.1"
+once_cell = "1.20"
+async-trait = "0.1"
+
+# Serialization & formats
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+plist = "1.7"
+url = { version = "2.5", features = ["serde"] }
+percent-encoding = "2.3"
+mime_guess = "2.0"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+regex = "1.11"
+unicode-normalization = "0.1"
+bytes = "1.9"
+
+# Error handling & logging
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Crypto, hashing & encoding
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+ecb = { version = "0.1", features = ["alloc"] }
+ctr = "0.9"
+aes-gcm = "0.10"
+ghash = "0.5"
+cipher = { version = "0.4", features = ["block-padding", "alloc"] }
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+digest = "0.10"
+subtle = "2.6"
+base64 = "0.22"
+hex = "0.4"
+rand = "0.8"
+
+# Filesystem, archive & assets
+memmap2 = "0.9"
+directories = "5.0"
+tempfile = "3.14"
+
+# Networking, cookies, WebSockets & DoH
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "cookies",
+    "multipart",
+    "stream",
+    "json",
+    "http2",
+] }
+reqwest_cookie_store = "0.8"
+cookie_store = "0.21"
+cookie = "0.18"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+hickory-resolver = { version = "0.24", features = ["dns-over-https-rustls", "tokio-runtime"] }
+
+# Linux Desktop, Secret Service, Portals, Tray, Audio & File Watcher
+oo7 = { version = "0.4", default-features = false, features = ["tokio", "native_crypto"] }
+ashpd = { version = "0.10", default-features = false, features = ["tokio"] }
+ksni = "0.3"
+notify-rust = "4.11"
+zbus = { version = "5.3", default-features = false, features = ["tokio"] }
+rodio = { version = "0.20", default-features = false, features = ["symphonia-mp3"] }
+notify = "7.0"
+
+# GTK3 + WebKit2GTK 4.1
+webkit2gtk = { version = "2.0", features = ["v2_40"] }
+javascriptcore-rs = "1.1"
+gtk = "0.18"
+gdk = "0.18"
+glib = "0.18"
+gio = "0.18"
+soup = { package = "soup3", version = "0.5" }

@@ -1,0 +1,56 @@
+[package]
+name = "olaz-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Olaz — Native Linux client for Zalo (Omarchy & Ubuntu)"
+default-run = "olaz"
+
+[[bin]]
+name = "olaz"
+path = "src/main.rs"
+
+[dependencies]
+olaz-core.workspace = true
+olaz-net.workspace = true
+olaz-linux.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+mime_guess.workspace = true
+uuid.workspace = true
+bytes.workspace = true
+base64.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+directories.workspace = true
+webkit2gtk.workspace = true
+javascriptcore-rs.workspace = true
+gtk.workspace = true
+gdk.workspace = true
+glib.workspace = true
+gio.workspace = true
+soup.workspace = true
+
+[package.metadata.deb]
+name = "olaz"
+maintainer = "Olaz Contributors <noreply@olaz.app>"
+copyright = "2026, Quan Nguyen & Olaz Contributors"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+Olaz is a native Linux desktop client for Zalo built in Rust on WebKit2GTK. \
+It mounts the official Zalo PC interface with Linux desktop integration, inline GStreamer media playback, \
+full E2EE, message sync, system tray, and XDG Desktop Portal support."""
+depends = "$auto, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-pulseaudio | gstreamer1.0-pipewire | gstreamer1.0-alsa, xdg-desktop-portal, 7zip | p7zip-full"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/olaz", "usr/bin/", "755"],
+    ["../../pkgbuild/olaz.desktop", "usr/share/applications/", "644"],
+    ["../../pkgbuild/olaz.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+]

@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Olaz
+Name[vi]=Olaz — Zalo cho Linux
+GenericName=Instant Messenger
+GenericName[vi]=Ứng dụng nhắn tin Zalo
+Comment=Native Zalo client for Linux (Omarchy & Ubuntu)
+Comment[vi]=Ứng dụng Zalo gốc dành cho Linux (Omarchy & Ubuntu)
+Exec=olaz %u
+Icon=olaz
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=Zalo;Chat;Messenger;Olaz;Vietnam;
+StartupWMClass=olaz
+StartupNotify=true
+MimeType=x-scheme-handler/zalo;

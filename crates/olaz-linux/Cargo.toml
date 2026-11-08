@@ -1,0 +1,35 @@
+[package]
+name = "olaz-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+uuid.workspace = true
+regex.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+unicode-normalization.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ashpd.workspace = true
+ksni.workspace = true
+notify-rust.workspace = true
+zbus.workspace = true
+rodio.workspace = true
+notify.workspace = true
+directories.workspace = true
+aes.workspace = true
+cbc.workspace = true
+cipher.workspace = true
+base64.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

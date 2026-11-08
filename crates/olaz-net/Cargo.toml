@@ -1,0 +1,39 @@
+[package]
+name = "olaz-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+olaz-core.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+mime_guess.workspace = true
+uuid.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+reqwest_cookie_store.workspace = true
+cookie_store.workspace = true
+cookie.workspace = true
+tokio-tungstenite.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+hickory-resolver.workspace = true
+aes.workspace = true
+ctr.workspace = true
+aes-gcm.workspace = true
+ghash.workspace = true
+cipher.workspace = true
+subtle.workspace = true
+base64.workspace = true
+hex.workspace = true
+directories.workspace = true
+tempfile.workspace = true

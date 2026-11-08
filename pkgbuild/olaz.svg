@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="olaz-bg" x1="16" y1="8" x2="112" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1A7CFF"/>
+      <stop offset="52%" stop-color="#0068FF"/>
+      <stop offset="100%" stop-color="#0050CC"/>
+    </linearGradient>
+    <linearGradient id="olaz-prism-top" x1="36" y1="30" x2="92" y2="74" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#EBF3FF"/>
+    </linearGradient>
+    <linearGradient id="olaz-prism-facet" x1="56" y1="48" x2="98" y2="90" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#DCEBFF"/>
+      <stop offset="100%" stop-color="#B9D7FF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Squircle app tile (#0068FF brand core) -->
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#olaz-bg)"/>
+  <rect x="7" y="7" width="114" height="114" rx="27" fill="none" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="2"/>
+
+  <!-- Rounded speech-bubble prism mark -->
+  <path
+    d="M64 28C42.46 28 26 42.1 26 59.5C26 68.77 30.84 77.1 38.62 82.88L33.8 97.25C33.12 99.28 35.18 101.08 37.09 100.12L53.88 91.72C57.15 92.56 60.53 93 64 93C85.54 93 102 78.9 102 61.5C102 42.99 85.54 28 64 28Z"
+    fill="url(#olaz-prism-top)"
+  />
+
+  <!-- Subtle geometric prism facet inside the speech bubble -->
+  <path
+    d="M64 28C85.54 28 102 42.99 102 61.5C102 78.9 85.54 93 64 93C59.6 93 55.38 92.37 51.45 91.2L73.5 57.5L56.5 42.5L64 28Z"
+    fill="url(#olaz-prism-facet)"
+    opacity="0.68"
+  />
+  <path
+    d="M46 60.5L64 43L82 60.5L64 78Z"
+    fill="#0068FF"
+    opacity="0.16"
+  />
+</svg>

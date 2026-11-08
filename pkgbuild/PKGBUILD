@@ -1,0 +1,52 @@
+# Maintainer: Olaz Contributors <noreply@olaz.app>
+pkgname=olaz
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Native Zalo desktop client for Linux (Omarchy & Ubuntu) built in Rust on WebKit2GTK'
+arch=('x86_64' 'aarch64')
+url='https://github.com/qnguyen3/zalo-swift-re'
+license=('GPL-3.0-only')
+depends=(
+  'webkit2gtk-4.1'
+  'gtk3'
+  'gst-plugins-base'
+  'gst-plugins-good'
+  'xdg-desktop-portal'
+  '7zip'
+  'hicolor-icon-theme'
+)
+optdepends=(
+  'gst-plugins-bad: WebRTC, WebP, and AVIF media codecs'
+  'gst-libav: FFmpeg H.264/AAC video playback in chats and calls'
+)
+makedepends=('cargo' 'pkgconf')
+options=('!lto' '!debug')
+source=()
+sha256sums=()
+
+build() {
+  cd "$startdir/.."
+  export CARGO_TARGET_DIR="$startdir/../target"
+  cargo build --release --locked -p olaz-app || cargo build --release -p olaz-app
+}
+
+check() {
+  cd "$startdir/.."
+  export CARGO_TARGET_DIR="$startdir/../target"
+  cargo test --release -p olaz-linux
+}
+
+package() {
+  cd "$startdir/.."
+  install -Dm755 "target/release/olaz" "$pkgdir/usr/bin/olaz"
+  install -Dm644 "$startdir/olaz.desktop" "$pkgdir/usr/share/applications/olaz.desktop"
+  install -Dm644 "$startdir/olaz.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/olaz.svg"
+  if command -v rsvg-convert >/dev/null 2>&1; then
+    for size in 32 48 64 128 256 512; do
+      install -dm755 "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps"
+      rsvg-convert -w "$size" -h "$size" "$startdir/olaz.svg" \
+        -o "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/olaz.png"
+    done
+  fi
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/olaz/LICENSE"
+}

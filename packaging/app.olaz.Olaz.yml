@@ -1,0 +1,51 @@
+app-id: app.olaz.Olaz
+runtime: org.gnome.Platform
+runtime-version: '47'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: olaz
+
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --socket=pulseaudio
+  - --device=dri
+  # StatusNotifierItem tray (Quickshell / GNOME AppIndicators / KDE) & Ubuntu Dock unread badge
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=com.canonical.Unity
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/olaz/cargo
+
+modules:
+  - name: 7zip
+    buildsystem: simple
+    build-commands:
+      - make -C CPP/7zip/Bundles/Alone2 -f ../../cmpl_gcc.mak -j${FLATPAK_BUILDER_N_JOBS}
+      - install -Dm755 CPP/7zip/Bundles/Alone2/b/g/7zz /app/bin/7z
+    sources:
+      - type: archive
+        url: https://github.com/ip7z/7zip/archive/refs/tags/24.09.tar.gz
+        sha256: 0688f9ab9a9ca8fb4eb2ff7bd0aa64bd49bd28ad7b35bd98effb1c0bfbb2d18c
+
+  - name: olaz
+    buildsystem: simple
+    build-options:
+      build-args:
+        - --share=network
+    build-commands:
+      - cargo build --release -p olaz-app
+      - install -Dm755 target/release/olaz /app/bin/olaz
+      - install -Dm644 pkgbuild/olaz.desktop /app/share/applications/app.olaz.Olaz.desktop
+      - desktop-file-edit --set-icon=app.olaz.Olaz /app/share/applications/app.olaz.Olaz.desktop
+      - install -Dm644 pkgbuild/olaz.svg /app/share/icons/hicolor/scalable/apps/app.olaz.Olaz.svg
+      - install -Dm644 LICENSE /app/share/licenses/app.olaz.Olaz/LICENSE
+    sources:
+      - type: dir
+        path: ..

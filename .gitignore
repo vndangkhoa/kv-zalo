@@ -9,6 +9,12 @@ DerivedData/
 *.xcworkspace/xcuserdata/
 .swiftpm/
 
+# Rust / Cargo build output
+/target/
+/pkgbuild/pkg/
+/pkgbuild/src/
+/pkgbuild/*.pkg.tar.*
+
 # Editor / local tool config (may contain secrets)
 .claude/
 .vscode/

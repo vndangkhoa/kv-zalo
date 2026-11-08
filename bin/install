@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+
+USER_INSTALL=0
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --user)
+      USER_INSTALL=1
+      ;;
+    *)
+      ARGS+=("$arg")
+      ;;
+  esac
+done
+
+if [ "$USER_INSTALL" -eq 0 ] && [ -z "${PREFIX:-}" ] && command -v makepkg >/dev/null 2>&1; then
+  cd "$ROOT/pkgbuild"
+  exec makepkg -fsi "${ARGS[@]}"
+fi
+
+if [ ! -x "$ROOT/target/release/olaz" ]; then
+  "$ROOT/bin/build"
+fi
+
+if [ "$USER_INSTALL" -eq 1 ]; then
+  PREFIX="${PREFIX:-$HOME/.local}"
+else
+  PREFIX="${PREFIX:-/usr/local}"
+fi
+DESTDIR="${DESTDIR:-}"
+
+TARGET_ROOT="${DESTDIR}${PREFIX}"
+SUDO=""
+if [ ! -w "$(dirname -- "$TARGET_ROOT")" ] && [ ! -w "$TARGET_ROOT" ] && [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+  SUDO="sudo"
+fi
+
+$SUDO install -Dm755 "$ROOT/target/release/olaz" "${TARGET_ROOT}/bin/olaz"
+
+TMP_DESKTOP="$(mktemp)"
+trap 'rm -f "$TMP_DESKTOP"' EXIT
+if [ "$PREFIX" != "/usr" ]; then
+  sed "s|^Exec=olaz %u$|Exec=${PREFIX}/bin/olaz %u\nTryExec=${PREFIX}/bin/olaz|" \
+    "$ROOT/pkgbuild/olaz.desktop" > "$TMP_DESKTOP"
+else
+  cp "$ROOT/pkgbuild/olaz.desktop" "$TMP_DESKTOP"
+fi
+$SUDO install -Dm644 "$TMP_DESKTOP" "${TARGET_ROOT}/share/applications/olaz.desktop"
+
+$SUDO install -Dm644 "$ROOT/pkgbuild/olaz.svg" "${TARGET_ROOT}/share/icons/hicolor/scalable/apps/olaz.svg"
+if command -v rsvg-convert >/dev/null 2>&1; then
+  for size in 32 48 64 128 256 512; do
+    $SUDO install -dm755 "${TARGET_ROOT}/share/icons/hicolor/${size}x${size}/apps"
+    TMP_PNG="$(mktemp --suffix=.png)"
+    rsvg-convert -w "$size" -h "$size" "$ROOT/pkgbuild/olaz.svg" -o "$TMP_PNG"
+    $SUDO install -Dm644 "$TMP_PNG" "${TARGET_ROOT}/share/icons/hicolor/${size}x${size}/apps/olaz.png"
+    rm -f "$TMP_PNG"
+  done
+fi
+
+$SUDO install -Dm644 "$ROOT/LICENSE" "${TARGET_ROOT}/share/licenses/olaz/LICENSE"
+
+if [ -z "$DESTDIR" ]; then
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    $SUDO update-desktop-database -q "${PREFIX}/share/applications" || true
+  fi
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    $SUDO gtk-update-icon-cache -q -f -t "${PREFIX}/share/icons/hicolor" || true
+  fi
+fi
+
+echo "Installed Olaz into ${TARGET_ROOT}"
