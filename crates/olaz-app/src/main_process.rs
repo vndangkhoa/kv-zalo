@@ -554,13 +554,30 @@ pub enum MainProcessEvent {
 /// Window control commands emitted by `$zwindow.*` IPC channels and executed on the GTK main thread.
 #[derive(Debug, Clone)]
 pub enum WindowCommand {
-    Minimize,
-    ToggleMaximize { target: Option<bool> },
-    ToggleFullscreen { target: Option<bool> },
-    CloseOrHide { window_id: Option<String> },
-    Hide { window_id: Option<String> },
-    Show { focus: bool },
-    Focus,
+    Minimize {
+        window_id: Option<String>,
+    },
+    ToggleMaximize {
+        window_id: Option<String>,
+        target: Option<bool>,
+    },
+    ToggleFullscreen {
+        window_id: Option<String>,
+        target: Option<bool>,
+    },
+    CloseOrHide {
+        window_id: Option<String>,
+    },
+    Hide {
+        window_id: Option<String>,
+    },
+    Show {
+        window_id: Option<String>,
+        focus: bool,
+    },
+    Focus {
+        window_id: Option<String>,
+    },
     Quit,
     FlashFrame(bool),
     SetLoginSize,
@@ -573,6 +590,7 @@ pub enum WindowCommand {
 pub struct MainWindowState {
     pub is_maximized: AtomicBool,
     pub is_fullscreen: AtomicBool,
+    pub child_maximized: RwLock<HashMap<String, bool>>,
     cmd_tx: RwLock<Option<tokio::sync::mpsc::UnboundedSender<WindowCommand>>>,
 }
 
@@ -640,6 +658,7 @@ impl ZaloMainProcess {
             platform.user_data().to_path_buf(),
             platform.temp_dir().to_path_buf(),
             platform.electron_path("downloads"),
+            platform.electron_path("documents").join("Zalo Received Files"),
             platform.cache_dir().to_path_buf(),
         ];
         let downloads = DownloadManager::new(
@@ -1629,44 +1648,75 @@ impl ZaloMainProcess {
 
         {
             let ws = Arc::clone(&self.window_state);
-            bridge.handle_channel_sync("minimize", move |_| {
-                ws.send(WindowCommand::Minimize);
+            bridge.handle_channel_sync("minimize", move |args| {
+                let window_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                ws.send(WindowCommand::Minimize { window_id });
                 Ok(wire::undefined())
             });
         }
         {
             let ws = Arc::clone(&self.window_state);
-            bridge.handle_channel_sync("window-minimize", move |_| {
-                ws.send(WindowCommand::Minimize);
+            bridge.handle_channel_sync("window-minimize", move |args| {
+                let window_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                ws.send(WindowCommand::Minimize { window_id });
                 Ok(wire::undefined())
             });
         }
         {
             let ws = Arc::clone(&self.window_state);
             bridge.handle_channel_sync("toggle-maximize", move |args| {
+                let window_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let target = args.get(1).and_then(Value::as_bool);
-                ws.send(WindowCommand::ToggleMaximize { target });
+                ws.send(WindowCommand::ToggleMaximize { window_id, target });
                 Ok(wire::undefined())
             });
         }
         {
             let ws = Arc::clone(&self.window_state);
-            bridge.handle_channel_sync("window-maximize", move |_| {
-                ws.send(WindowCommand::ToggleMaximize { target: None });
+            bridge.handle_channel_sync("window-maximize", move |args| {
+                let window_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                ws.send(WindowCommand::ToggleMaximize {
+                    window_id,
+                    target: None,
+                });
                 Ok(wire::undefined())
             });
         }
         {
             let ws = Arc::clone(&self.window_state);
-            bridge.handle_channel_sync("check-maximize", move |_| {
+            bridge.handle_channel_sync("check-maximize", move |args| {
+                if let Some(wid) = args.first().and_then(Value::as_str) {
+                    if let Some(&m) = ws.child_maximized.read().get(wid) {
+                        return Ok(json!(m));
+                    }
+                    if matches!(wid, "photo-viewer" | "file-viewer") {
+                        return Ok(json!(false));
+                    }
+                }
                 Ok(json!(ws.is_maximized.load(Ordering::Relaxed)))
             });
         }
         {
             let ws = Arc::clone(&self.window_state);
             bridge.handle_channel_sync("toggle-fullscreen", move |args| {
+                let window_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let target = args.get(1).and_then(Value::as_bool);
-                ws.send(WindowCommand::ToggleFullscreen { target });
+                ws.send(WindowCommand::ToggleFullscreen { window_id, target });
                 Ok(wire::undefined())
             });
         }
@@ -1731,15 +1781,23 @@ impl ZaloMainProcess {
             ("show-inactive", false),
         ] {
             let ws = Arc::clone(&self.window_state);
-            bridge.handle_channel_sync(ch, move |_| {
-                ws.send(WindowCommand::Show { focus });
+            bridge.handle_channel_sync(ch, move |args| {
+                let window_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                ws.send(WindowCommand::Show { window_id, focus });
                 Ok(wire::undefined())
             });
         }
         for ch in ["focus-window", "window-focus"] {
             let ws = Arc::clone(&self.window_state);
-            bridge.handle_channel_sync(ch, move |_| {
-                ws.send(WindowCommand::Focus);
+            bridge.handle_channel_sync(ch, move |args| {
+                let window_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                ws.send(WindowCommand::Focus { window_id });
                 Ok(wire::undefined())
             });
         }
@@ -2233,11 +2291,23 @@ impl ZaloMainProcess {
             "$zFileManager.mergeCalfLogGroup",
             "$zFileManager.writeLogRange",
             "$zFileManager.trustBlob",
+            "$zFileManager.isTrustPath",
+            "$zFileManager.trustPathFromBlob",
             "$zFileManager.getInstallSource",
             "$zFileManager.getFileArrayBuffer",
             "$zFileManager.readFileAsync",
             "$zFileManager.svcStatAsync",
+            "$zFileManager.svcReadPath",
+            "$zFileManager.readFileSlice",
+            "$zFileManager.zfileFindNoiseSignature",
+            "$zFileManager.getMd5LargeFileObject",
+            "$zFileManager.zfileGetChecksum",
+            "$zFileManager.testChecksum",
             "$zFileManager.writeBufferToPath",
+            "$zFileManager.appendBufferToPath",
+            "$zFileManager.zcloudCloneAndMatchChecksum",
+            "$zFileManager.zcloudDenoiseFile",
+            "$zFileManager.zcloudNoiseFile",
         ] {
             let fsb = self.fs_bridge.clone();
             let rt_handle = self.tokio_handle.clone();
@@ -2309,15 +2379,26 @@ impl ZaloMainProcess {
         popup_state.set_command_sender(tx);
 
         let ps_for_event = Arc::clone(&popup_state);
+        let main_ws_for_event = Arc::clone(&self.window_state);
         popup_win.connect_window_state_event(move |_, ev| {
             let ns = ev.new_window_state();
-            ps_for_event
-                .is_maximized
-                .store(ns.contains(gdk::WindowState::MAXIMIZED), Ordering::Relaxed);
+            let is_max = ns.contains(gdk::WindowState::MAXIMIZED);
+            ps_for_event.is_maximized.store(is_max, Ordering::Relaxed);
             ps_for_event
                 .is_fullscreen
                 .store(ns.contains(gdk::WindowState::FULLSCREEN), Ordering::Relaxed);
+            main_ws_for_event
+                .child_maximized
+                .write()
+                .insert("photo-viewer".to_owned(), is_max);
             glib::Propagation::Proceed
+        });
+        let main_ws_for_destroy = Arc::clone(&self.window_state);
+        popup_win.connect_destroy(move |_| {
+            main_ws_for_destroy
+                .child_maximized
+                .write()
+                .remove("photo-viewer");
         });
 
         let win_weak = {
@@ -2331,8 +2412,8 @@ impl ZaloMainProcess {
                     break;
                 };
                 match cmd {
-                    WindowCommand::Minimize => win.iconify(),
-                    WindowCommand::ToggleMaximize { target } => {
+                    WindowCommand::Minimize { .. } => win.iconify(),
+                    WindowCommand::ToggleMaximize { target, .. } => {
                         let should_max = target.unwrap_or_else(|| !win.is_maximized());
                         if should_max {
                             win.maximize();
@@ -2340,7 +2421,7 @@ impl ZaloMainProcess {
                             win.unmaximize();
                         }
                     }
-                    WindowCommand::ToggleFullscreen { target } => {
+                    WindowCommand::ToggleFullscreen { target, .. } => {
                         let cur = win
                             .window()
                             .is_some_and(|w| w.state().contains(gdk::WindowState::FULLSCREEN));
@@ -2356,13 +2437,13 @@ impl ZaloMainProcess {
                     | WindowCommand::Quit => {
                         win.close();
                     }
-                    WindowCommand::Show { focus } => {
+                    WindowCommand::Show { focus, .. } => {
                         win.show_all();
                         if focus {
                             win.present();
                         }
                     }
-                    WindowCommand::Focus => {
+                    WindowCommand::Focus { .. } => {
                         win.present();
                     }
                     WindowCommand::FlashFrame(flag) => {
@@ -2378,7 +2459,7 @@ impl ZaloMainProcess {
         for ch in ["minimize", "window-minimize"] {
             let ps = Arc::clone(&popup_state);
             child_bridge.override_channel_sync(ch, move |_| {
-                ps.send(WindowCommand::Minimize);
+                ps.send(WindowCommand::Minimize { window_id: None });
                 Ok(wire::undefined())
             });
         }
@@ -2386,7 +2467,10 @@ impl ZaloMainProcess {
             let ps = Arc::clone(&popup_state);
             child_bridge.override_channel_sync(ch, move |args| {
                 let target = args.get(1).and_then(Value::as_bool);
-                ps.send(WindowCommand::ToggleMaximize { target });
+                ps.send(WindowCommand::ToggleMaximize {
+                    window_id: None,
+                    target,
+                });
                 Ok(wire::undefined())
             });
         }
@@ -2400,7 +2484,10 @@ impl ZaloMainProcess {
             let ps = Arc::clone(&popup_state);
             child_bridge.override_channel_sync("toggle-fullscreen", move |args| {
                 let target = args.get(1).and_then(Value::as_bool);
-                ps.send(WindowCommand::ToggleFullscreen { target });
+                ps.send(WindowCommand::ToggleFullscreen {
+                    window_id: None,
+                    target,
+                });
                 Ok(wire::undefined())
             });
         }
@@ -2432,14 +2519,17 @@ impl ZaloMainProcess {
         ] {
             let ps = Arc::clone(&popup_state);
             child_bridge.override_channel_sync(ch, move |_| {
-                ps.send(WindowCommand::Show { focus });
+                ps.send(WindowCommand::Show {
+                    window_id: None,
+                    focus,
+                });
                 Ok(wire::undefined())
             });
         }
         for ch in ["focus-window", "window-focus"] {
             let ps = Arc::clone(&popup_state);
             child_bridge.override_channel_sync(ch, move |_| {
-                ps.send(WindowCommand::Focus);
+                ps.send(WindowCommand::Focus { window_id: None });
                 Ok(wire::undefined())
             });
         }

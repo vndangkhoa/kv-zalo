@@ -1627,8 +1627,9 @@ fn zalo_linux_renderer_patches_rewrite_ui_controls_clipboard_and_calls_idempoten
         class UrlUtil { static transformLocalUrl(e){return UrlUtil.checkNeedTransformLocalUrl(e)?"zfile://"+e:e} }
         function an(e){ return Boolean(!1)?"zfile://"+e:e; }
         function resizeJxl(){ Object(F.jxlNativeSupported)()?(d=this.resizerFactory.createResizer(c.e.LIBJXL),u=this.resizerFactory.createResizer(c.e.LIBJXL_WASM)):d=this.resizerFactory.createResizer(c.e.LIBJXL_WASM); }
-        function decJxl(){ Object(fe.jxlNativeSupported)()?t._decoder||(fe.ImageLoaderConfig.nestedKey("offload_config.enable_offload_decode_jxl")?t._decoder=new ve:t._decoder=new ue,t._lazyDecoderFallbackInit=!0):t._decoder=new Me; }
-        function encJxl(){ Object(fe.jxlNativeSupported)()?(t._encoder||(fe.ImageLoaderConfig.nestedKey("offload_config.enable_offload_encode_jxl")?t._encoder=new St:t._encoder=new Tt),t._lazyDecoderFallbackInit=!0):t._encoder||(t._encoder=new yt); }
+        function decJxl(){ Object(fe.jxlNativeSupported)()?t._decoder||(fe.ImageLoaderConfig.nestedKey("offload_config.enable_offload_decode_jxl")?t._decoder=new ve:t._decoder=new ue,t._lazyDecoderFallbackInit=!1):t._decoder=new Me; }
+        function encJxl(){ Object(fe.jxlNativeSupported)()?(t._encoder||(fe.ImageLoaderConfig.nestedKey("offload_config.enable_offload_encode_jxl")?t._encoder=new St:t._encoder=new Tt),t._lazyDecoderFallbackInit=!1):t._encoder||(t._encoder=new yt); }
+        async function handleDecompdeJpegMultiFallback(e,t){ const l=await Object(Be.b)(t,{sizes:r,priority:0,outputFormat:"image/jpeg",quality:e.options.quality,timeout:1e4*r.length}); return l; }
         function pickResizer(){ d=!J.default.image_resizer.enable_libvips_macos||"image/jpeg"!==o&&"image/png"!==o?this.compatibilityValidation.isOffscreenCanvasSupported()?this.resizerFactory.createResizer(c.e.WEB_WORKER):this.compatibilityValidation.isAutoRotationSupported()?this.resizerFactory.createResizer(c.e.MAIN):this.resizerFactory.createResizer(c.e.PRIMITIVE):this.resizerFactory.createResizer(c.e.LIBVIPS); }
     "#;
     let ui_patched = patch_asar_bundle(
@@ -1650,7 +1651,7 @@ fn zalo_linux_renderer_patches_rewrite_ui_controls_clipboard_and_calls_idempoten
     assert!(ui_str.contains("sync_call_message.ui&&0)return;"));
     assert!(ui_str.contains(r#""recommened.misscall":t.caller?"#));
     assert!(ui_str.contains("isCaller:t.caller?1:0"));
-    assert!(ui_str.contains(r#""zfile://local/"+e.replace(/^file:\/+/,""):e"#));
+    assert!(ui_str.contains(r#""zfile://local/"+s.replace(/^file:\/+/,"")"#));
     assert_eq!(ui_str.matches("(!1/*olaz-wasm-jxl*/)").count(), 3);
     assert!(ui_str.contains("(!0/*olaz-main-resizer*/?this.resizerFactory.createResizer(c.e.MAIN):null)"));
     // Second pass is strictly idempotent (`None`)
@@ -1812,6 +1813,8 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
     let mut hit_call_log = false;
     let mut hit_zfile_url = false;
     let mut hit_wasm_jxl = 0usize;
+    let mut hit_jxl_lazy_fallback = false;
+    let mut hit_jxl_noresize_fallback = false;
     let mut hit_main_resizer = false;
     let mut preserved_client_type_23 = false;
     let mut patched_files = 0usize;
@@ -1860,6 +1863,12 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
             hit_zfile_url = true;
         }
         hit_wasm_jxl += s.matches("(!1/*olaz-wasm-jxl*/)").count();
+        if s.contains("._lazyDecoderFallbackInit=!0") {
+            hit_jxl_lazy_fallback = true;
+        }
+        if s.contains("/*olaz-jxl-noresize*/") {
+            hit_jxl_noresize_fallback = true;
+        }
         if s.contains("(!0/*olaz-main-resizer*/") {
             hit_main_resizer = true;
         }
@@ -1885,5 +1894,50 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
     assert!(hit_call_log, "Call outcome log bubble patch did not match live app.asar");
     assert!(hit_zfile_url, "zfile://local/ transformLocalUrl patch did not match live app.asar");
     assert!(hit_wasm_jxl >= 3, "Expected JXL codec sites (resize/decode/encode) to route to WASM in live app.asar (got {hit_wasm_jxl})");
+    assert!(hit_jxl_lazy_fallback, "Expected JXL _lazyDecoderFallbackInit=!0 patch to match live app.asar");
+    assert!(hit_jxl_noresize_fallback, "Expected JXL Original no-resize fallback patch to match live app.asar");
     assert!(hit_main_resizer, "Expected ee.resizeImage JPEG/PNG MAIN canvas patch to match live app.asar");
+}
+
+#[test]
+fn transform_local_url_unwraps_whatwg_url_objects_and_platform_permits_cache_and_zalo_received() {
+    let tmp = TempDir::new().unwrap();
+    let platform = ZaloPlatform::with_root(tmp.path(), "26.10.20");
+    let cache_sticker = platform.cache_dir().join("stickers/12345/ami.png");
+    let received_doc = platform
+        .electron_path("documents")
+        .join("Zalo Received Files/photo_original.jpg");
+    assert!(platform.is_writable(&cache_sticker));
+    assert!(platform.is_writable(&received_doc));
+
+    let synthetic = br#"class R{static checkNeedTransformLocalUrl(e){return!0}static transformLocalUrl(e){return R.checkNeedTransformLocalUrl(e)?"zfile://"+e:e}}"#;
+    let patched = patch_asar_bundle("pc-dist/compact-app-pc.1234.js", synthetic)
+        .expect("transformLocalUrl patch must match");
+    let patched_js = std::str::from_utf8(&patched).unwrap();
+
+    let script = format!(
+        "{patched_js}\n\
+         const uObj = new URL('file:///home/khoavo/.local/share/olaz/ZaloData/sticker/ami%201.png');\n\
+         const out = [\n\
+           R.transformLocalUrl(uObj),\n\
+           R.transformLocalUrl('file:///tmp/photo.jpg'),\n\
+           R.transformLocalUrl('//stc-zalo.zadn.vn/sticker/ami.png'),\n\
+         ];\n\
+         console.log(JSON.stringify(out));"
+    );
+    let output = Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .expect("node must execute");
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        parsed,
+        json!([
+            "zfile://local/home/khoavo/.local/share/olaz/ZaloData/sticker/ami%201.png",
+            "zfile://local/tmp/photo.jpg",
+            "https://stc-zalo.zadn.vn/sticker/ami.png"
+        ])
+    );
 }

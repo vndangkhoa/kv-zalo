@@ -1736,7 +1736,7 @@ pub struct OfficialClientHost {
     file_pick_lock: tokio::sync::Mutex<()>,
     debug_window: RefCell<Option<gtk::Window>>,
     popup_bridge_factory: Rc<RefCell<Option<PopupBridgeFactory>>>,
-    child_windows: Rc<RefCell<Vec<gtk::Window>>>,
+    child_windows: Rc<RefCell<Vec<(String, gtk::Window)>>>,
     crash_timestamps: RefCell<Vec<Instant>>,
     shut_down: Cell<bool>,
     on_state: Rc<RefCell<Option<Rc<dyn Fn(Value)>>>>,
@@ -1819,7 +1819,8 @@ impl OfficialClientHost {
         let pending_files: Rc<RefCell<Option<Vec<String>>>> = Rc::new(RefCell::new(None));
         let popup_bridge_factory: Rc<RefCell<Option<PopupBridgeFactory>>> =
             Rc::new(RefCell::new(None));
-        let child_windows: Rc<RefCell<Vec<gtk::Window>>> = Rc::new(RefCell::new(Vec::new()));
+        let child_windows: Rc<RefCell<Vec<(String, gtk::Window)>>> =
+            Rc::new(RefCell::new(Vec::new()));
 
         let host = Rc::new(Self {
             platform: Arc::clone(platform),
@@ -1983,10 +1984,40 @@ impl OfficialClientHost {
                     return None;
                 }
 
+                let mut nav_clone = nav_action.clone();
+                let frame_name = nav_clone
+                    .frame_name()
+                    .map(|g| g.to_string())
+                    .unwrap_or_default();
+                let parse_param = |raw: &str, key: &str| -> Option<String> {
+                    let q = raw.split_once('?').map(|(_, q)| q).unwrap_or(raw);
+                    url::form_urlencoded::parse(q.as_bytes())
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.into_owned())
+                };
+                let viewer_window_id = parse_param(&frame_name, "zpopupWindowId")
+                    .or_else(|| parse_param(&target_uri, "zpopupWindowId"))
+                    .unwrap_or_else(|| {
+                        if target_uri.contains("file-viewer") || frame_name.contains("file-viewer")
+                        {
+                            "file-viewer".to_owned()
+                        } else {
+                            "photo-viewer".to_owned()
+                        }
+                    });
+                let default_w = parse_param(&frame_name, "width")
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .map(|v| v.clamp(520, 3840))
+                    .unwrap_or(1040);
+                let default_h = parse_param(&frame_name, "height")
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .map(|v| v.clamp(400, 2160))
+                    .unwrap_or(720);
+
                 let popup_win = gtk::Window::new(gtk::WindowType::Toplevel);
                 popup_win.set_title("Zalo — Media Viewer");
                 popup_win.set_decorated(false);
-                popup_win.set_default_size(1040, 720);
+                popup_win.set_default_size(default_w, default_h);
                 popup_win.set_size_request(520, 400);
                 popup_win.set_position(gtk::WindowPosition::Center);
 
@@ -2028,7 +2059,11 @@ impl OfficialClientHost {
                 configure_zalo_policy(&child_wv, false);
 
                 popup_win.add(&child_wv);
-                children_slot.borrow_mut().push(popup_win.clone());
+                popup_win.show_all();
+                popup_win.present();
+                children_slot
+                    .borrow_mut()
+                    .push((viewer_window_id.clone(), popup_win.clone()));
 
                 let win_for_ready = popup_win.clone();
                 child_wv.connect_ready_to_show(move |_| {
@@ -2087,8 +2122,9 @@ impl OfficialClientHost {
                     rt_cleanup.unregister_webview(&child_wv_cleanup);
                     children_cleanup
                         .borrow_mut()
-                        .retain(|w| w.as_ptr() != destroyed_win.as_ptr());
-                    parent_bridge_cleanup.send("close-media-viewer", vec![]);
+                        .retain(|(_, w)| w.as_ptr() != destroyed_win.as_ptr());
+                    parent_bridge_cleanup
+                        .send("close-media-viewer", vec![json!(viewer_window_id)]);
                 });
 
                 Some(child_wv.upcast::<gtk::Widget>())
@@ -2330,13 +2366,106 @@ impl OfficialClientHost {
         }
     }
 
+    fn find_child_windows(&self, window_id: &str) -> Vec<gtk::Window> {
+        self.child_windows
+            .borrow()
+            .iter()
+            .filter(|(id, _)| id == window_id)
+            .map(|(_, w)| w.clone())
+            .collect()
+    }
+
+    pub fn close_child_window(&self, window_id: &str) -> bool {
+        let wins = self.find_child_windows(window_id);
+        if wins.is_empty() {
+            return false;
+        }
+        for w in wins {
+            w.close();
+        }
+        true
+    }
+
+    pub fn focus_child_window(&self, window_id: &str) -> bool {
+        let wins = self.find_child_windows(window_id);
+        if wins.is_empty() {
+            return false;
+        }
+        for w in wins {
+            w.deiconify();
+            w.present();
+        }
+        true
+    }
+
+    pub fn minimize_child_window(&self, window_id: &str) -> bool {
+        let wins = self.find_child_windows(window_id);
+        if wins.is_empty() {
+            return false;
+        }
+        for w in wins {
+            w.iconify();
+        }
+        true
+    }
+
+    pub fn toggle_maximize_child_window(&self, window_id: &str, target: Option<bool>) -> bool {
+        let wins = self.find_child_windows(window_id);
+        if wins.is_empty() {
+            return false;
+        }
+        for w in wins {
+            let should_max = target.unwrap_or_else(|| !w.is_maximized());
+            if should_max {
+                w.maximize();
+            } else {
+                w.unmaximize();
+            }
+        }
+        true
+    }
+
+    pub fn toggle_fullscreen_child_window(&self, window_id: &str, target: Option<bool>) -> bool {
+        let wins = self.find_child_windows(window_id);
+        if wins.is_empty() {
+            return false;
+        }
+        for w in wins {
+            let cur = w
+                .window()
+                .is_some_and(|gw| gw.state().contains(gdk::WindowState::FULLSCREEN));
+            let should_fs = target.unwrap_or(!cur);
+            if should_fs {
+                w.fullscreen();
+            } else {
+                w.unfullscreen();
+            }
+        }
+        true
+    }
+
+    pub fn show_child_window(&self, window_id: &str, focus: bool) -> bool {
+        let wins = self.find_child_windows(window_id);
+        if wins.is_empty() {
+            return false;
+        }
+        for w in wins {
+            w.show_all();
+            w.deiconify();
+            if focus {
+                w.present();
+            }
+        }
+        true
+    }
+
     /// Tears down active sockets, closes popup windows, unregisters the WebView, and destroys containers.
     pub fn shutdown(&self) {
         if self.shut_down.replace(true) {
             return;
         }
-        let popups: Vec<gtk::Window> = self.child_windows.borrow_mut().drain(..).collect();
-        for p in popups {
+        let popups: Vec<(String, gtk::Window)> = self.child_windows.borrow_mut().drain(..).collect();
+        for (_, p) in popups {
             unsafe {
                 p.destroy();
             }

@@ -1646,3 +1646,45 @@ async fn download_manager_end_to_end_encrypted_http_and_redirect_limit() {
     assert_eq!(loop_err, MediaLoadError::TooManyRedirects);
     assert_eq!(DownloadFailure::from_media_error(&loop_err).code, 30310);
 }
+
+#[test]
+fn serve_local_media_range_denoises_zalo_file_noise_and_sniffs_mime() {
+    let tmp = TempDir::new().expect("tempdir");
+    let noised_path = tmp.path().join("ab12cd34ef56"); // extensionless `fileNoise` hash name
+
+    // Construct a 256-byte MP4-headed payload (`00 00 00 18 66 74 79 70 69 73 6f 6d ...`).
+    let mut plain = vec![0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm'];
+    while plain.len() < 256 {
+        plain.push(((plain.len() * 29 + 7) & 0xff) as u8);
+    }
+
+    // Apply Zalo's `fileNoise` obfuscation: XOR first 100 bytes with `0x93` + append `07 7a 41 6c 4f 07`.
+    let mut on_disk = plain.clone();
+    for b in on_disk.iter_mut().take(100) {
+        *b ^= 0x93;
+    }
+    on_disk.extend_from_slice(&[0x07, 0x7a, 0x41, 0x6c, 0x4f, 0x07]);
+    fs::write(&noised_path, &on_disk).expect("write noised media");
+
+    let allowed_roots = vec![tmp.path().to_path_buf()];
+
+    // 1. Full request (`None` Range) -> `200 OK`, `video/mp4`, logical length `256` (trailer stripped), un-noised bytes.
+    let full =
+        serve_local_media_range(&noised_path, None, &allowed_roots).expect("serve full noised mp4");
+    assert_eq!(full.status, 200);
+    assert_eq!(full.mime_type, "video/mp4");
+    assert_eq!(full.total_length, 256);
+    assert_eq!(full.body, plain);
+
+    // 2. Partial request straddling the 100-byte XOR boundary (`bytes=80-140`) -> `206 Partial Content`.
+    let part = serve_local_media_range(&noised_path, Some("bytes=80-140"), &allowed_roots)
+        .expect("serve partial noised mp4");
+    assert_eq!(part.status, 206);
+    assert_eq!(part.mime_type, "video/mp4");
+    assert_eq!(part.total_length, 256);
+    assert_eq!(
+        part.content_range.as_deref(),
+        Some("bytes 80-140/256")
+    );
+    assert_eq!(part.body.as_slice(), &plain[80..=140]);
+}

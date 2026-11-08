@@ -408,7 +408,14 @@ impl ZaloPlatform {
         let Some(resolved) = resolve_path_preserving_tail(path) else {
             return false;
         };
-        let allowed = [&self.user_data, &self.temp_dir, &self.downloads_dir];
+        let zalo_received = self.documents_dir.join("Zalo Received Files");
+        let allowed = [
+            &self.user_data,
+            &self.temp_dir,
+            &self.downloads_dir,
+            &self.cache_dir,
+            &zalo_received,
+        ];
         if allowed.iter().any(|root| {
             resolve_path_preserving_tail(root)
                 .map(|canon_root| resolved.starts_with(&canon_root))

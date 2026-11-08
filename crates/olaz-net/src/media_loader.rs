@@ -926,18 +926,55 @@ pub fn serve_local_media_range(
         bail!("media path is not a regular file: {}", canonical_target.display());
     }
 
-    let total_len = meta.len();
+    let raw_len = meta.len();
 
-    // Sniff magic bytes from first 64 bytes without reading the entire file into memory.
+    // Detect Zalo's 6-byte `fileNoise` trailer (`07 7a 41 6c 4f 07`) at EOF; when present,
+    // logical length excludes the trailer and bytes at offsets `0..100` are XORed with `0x93`.
+    const ZALO_NOISE_SIGN: [u8; 6] = [0x07, 0x7a, 0x41, 0x6c, 0x4f, 0x07];
+    const ZALO_NOISE_XOR_LEN: u64 = 100;
+    const ZALO_NOISE_XOR_KEY: u8 = 0x93;
+
+    let has_noise = if raw_len > ZALO_NOISE_SIGN.len() as u64 {
+        let sig_off = raw_len - ZALO_NOISE_SIGN.len() as u64;
+        let mut tail = [0u8; 6];
+        file.seek(SeekFrom::Start(sig_off)).is_ok()
+            && file.read_exact(&mut tail).is_ok()
+            && tail == ZALO_NOISE_SIGN
+    } else {
+        false
+    };
+    let total_len = if has_noise {
+        raw_len - ZALO_NOISE_SIGN.len() as u64
+    } else {
+        raw_len
+    };
+    let denoise_slice = |offset: u64, buf: &mut [u8]| {
+        if has_noise && offset < ZALO_NOISE_XOR_LEN && !buf.is_empty() {
+            let xor_end = ((ZALO_NOISE_XOR_LEN - offset) as usize).min(buf.len());
+            for b in &mut buf[..xor_end] {
+                *b ^= ZALO_NOISE_XOR_KEY;
+            }
+        }
+    };
+
+    // Sniff magic bytes from first 64 logical bytes without reading the entire file into memory.
+    file.seek(SeekFrom::Start(0))?;
     let mut magic_buf = [0u8; 64];
-    let magic_read = file.read(&mut magic_buf)?;
+    let max_magic = (total_len as usize).min(magic_buf.len());
+    let magic_read = if max_magic > 0 {
+        file.read(&mut magic_buf[..max_magic])?
+    } else {
+        0
+    };
+    denoise_slice(0, &mut magic_buf[..magic_read]);
     let mime_type = sniff_media_mime(&magic_buf[..magic_read], &canonical_target);
 
     let trimmed_range = range_header.map(str::trim).filter(|s| !s.is_empty());
     let Some(range_raw) = trimmed_range else {
         file.seek(SeekFrom::Start(0))?;
         let mut body = Vec::with_capacity(total_len as usize);
-        file.read_to_end(&mut body)?;
+        (&mut file).take(total_len).read_to_end(&mut body)?;
+        denoise_slice(0, &mut body);
 
         let mut headers = HashMap::new();
         headers.insert("Content-Type".to_owned(), mime_type.to_owned());
@@ -964,7 +1001,8 @@ pub fn serve_local_media_range(
     else {
         file.seek(SeekFrom::Start(0))?;
         let mut body = Vec::with_capacity(total_len as usize);
-        file.read_to_end(&mut body)?;
+        (&mut file).take(total_len).read_to_end(&mut body)?;
+        denoise_slice(0, &mut body);
 
         let mut headers = HashMap::new();
         headers.insert("Content-Type".to_owned(), mime_type.to_owned());
@@ -1010,6 +1048,7 @@ pub fn serve_local_media_range(
     file.seek(SeekFrom::Start(start))?;
     let mut body = vec![0u8; slice_len as usize];
     file.read_exact(&mut body)?;
+    denoise_slice(start, &mut body);
 
     let content_range = format!("bytes {start}-{end}/{total_len}");
     let mut headers = HashMap::new();

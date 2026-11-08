@@ -906,11 +906,157 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     sendIPC('call-init', packCallMsg(message));
   };
   local['$znode.nativelibs.zcallAddon'] = { getListDevices: () => '[]' };
+  local['$zFeatures.genThumb'] = async (filePath) => {
+    if (!filePath) return '';
+    return new Promise((resolve) => {
+      const video = document.createElement('video');
+      let settled = false;
+      const done = (v) => {
+        if (settled) return;
+        settled = true;
+        try { video.pause(); video.removeAttribute('src'); video.load(); } catch {}
+        resolve(v || '');
+      };
+      const timer = setTimeout(() => done(''), 5000);
+      video.muted = true;
+      video.playsInline = true;
+      video.preload = 'metadata';
+      video.onerror = () => { clearTimeout(timer); done(''); };
+      video.onloadeddata = () => {
+        try { video.currentTime = Math.min(0.1, Math.max(0, (video.duration || 0) * 0.05)); } catch { video.onseeked(); }
+      };
+      video.onseeked = () => {
+        clearTimeout(timer);
+        try {
+          const w = video.videoWidth || 320, h = video.videoHeight || 240;
+          const scale = Math.min(1, 480 / Math.max(w, h, 1));
+          const cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
+          const c = document.createElement('canvas');
+          c.width = cw; c.height = ch;
+          c.getContext('2d').drawImage(video, 0, 0, cw, ch);
+          done(c.toDataURL('image/jpeg', 0.8));
+        } catch { done(''); }
+      };
+      const raw = String(filePath);
+      video.src = raw.startsWith('zfile:') ? raw : ('zfile://local/' + raw.replace(/^file:\/+/, '').replace(/^\/+/, ''));
+    });
+  };
 
-  // 5. Rewrite raw `file:///...` media/image subresources to `zfile://local/...`
-  const rewriteFileUrl = (u) => (typeof u === 'string' && u.startsWith('file:'))
-    ? ('zfile://local/' + u.replace(/^file:\/+/, ''))
-    : u;
+  // 5. Rewrite raw `file:///...` media/image/CSS subresources to `zfile://local/...`
+  //    and normalize protocol-relative `//...` CDN URLs to `https://...` on `zalo-app://` pages.
+  const rewriteFileUrl = (u) => {
+    const s = (u && typeof u === 'object' && typeof u.href === 'string') ? u.href : u;
+    if (typeof s !== 'string') return u;
+    if (s.startsWith('file:')) return 'zfile://local/' + s.replace(/^file:\/+/, '');
+    if (s.startsWith('//')) return 'https:' + s;
+    return u;
+  };
+  const rewriteCssUrls = (val) => {
+    if (typeof val !== 'string' || (!val.includes('file:') && !val.includes('//'))) return val;
+    return val.replace(/url\(\s*(['"]?)(file:\/+[^'")\s]+|\/\/[^'")\s]+)\1\s*\)/gi, (_m, _q, raw) => {
+      return 'url("' + rewriteFileUrl(raw) + '")';
+    });
+  };
+  if (window.XMLHttpRequest && window.XMLHttpRequest.prototype && !window.XMLHttpRequest.prototype.open.__olazProtoRel) {
+    const origOpen = window.XMLHttpRequest.prototype.open;
+    const wrappedOpen = function (method, url, ...rest) {
+      const nextUrl = (typeof url === 'string' && url.startsWith('//')) ? ('https:' + url) : url;
+      return origOpen.call(this, method, nextUrl, ...rest);
+    };
+    wrappedOpen.__olazProtoRel = true;
+    window.XMLHttpRequest.prototype.open = wrappedOpen;
+  }
+  if (typeof window.fetch === 'function' && !window.fetch.__olazProtoRel) {
+    const origFetch = window.fetch;
+    const wrappedFetch = function (input, init) {
+      if (typeof input === 'string' && input.startsWith('//')) input = 'https:' + input;
+      return origFetch.call(this, input, init);
+    };
+    wrappedFetch.__olazProtoRel = true;
+    window.fetch = wrappedFetch;
+  }
+  if (typeof window.open === 'function' && !window.open.__olazPopupReady) {
+    const origWinOpen = window.open;
+    const wrappedWinOpen = function (url, target, features) {
+      const win = origWinOpen.call(this, url, target, features);
+      const urlStr = String(url || '');
+      if (win && (urlStr.includes('popup-viewer.html') || urlStr.includes('child.html'))) {
+        const dclCbs = new Set();
+        const loadCbs = new Set();
+        const wrapMap = new WeakMap();
+        let dclFired = false;
+        let loadFired = false;
+        const isRealDocReady = () => {
+          try {
+            const href = String((win.location && win.location.href) || '');
+            return Boolean(href && href !== 'about:blank' && win.document && win.document.body);
+          } catch {
+            return false;
+          }
+        };
+        try {
+          const origAdd = win.addEventListener.bind(win);
+          const origRem = win.removeEventListener.bind(win);
+          win.addEventListener = function (type, cb, opts) {
+            if (typeof cb === 'function' && (type === 'DOMContentLoaded' || type === 'load')) {
+              const set = type === 'DOMContentLoaded' ? dclCbs : loadCbs;
+              const already = type === 'DOMContentLoaded' ? dclFired : loadFired;
+              if (!already) {
+                const guarded = function (ev) {
+                  if (!isRealDocReady() || !set.has(cb)) return;
+                  set.delete(cb);
+                  if (type === 'DOMContentLoaded') dclFired = true;
+                  else loadFired = true;
+                  return cb.call(this, ev);
+                };
+                wrapMap.set(cb, guarded);
+                set.add(cb);
+                return origAdd(type, guarded, opts);
+              }
+            }
+            return origAdd(type, cb, opts);
+          };
+          win.removeEventListener = function (type, cb, opts) {
+            if (type === 'DOMContentLoaded') dclCbs.delete(cb);
+            else if (type === 'load') loadCbs.delete(cb);
+            return origRem(type, wrapMap.get(cb) || cb, opts);
+          };
+        } catch {}
+        const fireSet = (set, evName) => {
+          const fns = Array.from(set);
+          set.clear();
+          for (const fn of fns) {
+            try { fn.call(win, new Event(evName)); } catch {}
+          }
+        };
+        let ticks = 0;
+        const timer = setInterval(() => {
+          ticks += 1;
+          if (ticks > 200 || (dclFired && loadFired)) {
+            clearInterval(timer);
+            return;
+          }
+          try {
+            if (win.closed) { clearInterval(timer); return; }
+            if (!isRealDocReady()) return;
+            const rs = win.document.readyState;
+            if (!dclFired && (rs === 'interactive' || rs === 'complete')) {
+              dclFired = true;
+              fireSet(dclCbs, 'DOMContentLoaded');
+            }
+            if (!loadFired && rs === 'complete') {
+              loadFired = true;
+              fireSet(loadCbs, 'load');
+              clearInterval(timer);
+            }
+          } catch {}
+        }, 16);
+      }
+      return win;
+    };
+    wrappedWinOpen.__olazPopupReady = true;
+    window.open = wrappedWinOpen;
+  }
   const patchSrcProp = (Ctor) => {
     if (!Ctor || !Ctor.prototype) return;
     const desc = Object.getOwnPropertyDescriptor(Ctor.prototype, 'src');
@@ -923,12 +1069,37 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
   patchSrcProp(window.HTMLImageElement);
   patchSrcProp(window.HTMLMediaElement);
   patchSrcProp(window.HTMLSourceElement);
+  if (window.CSSStyleDeclaration && window.CSSStyleDeclaration.prototype) {
+    const cssProto = window.CSSStyleDeclaration.prototype;
+    if (typeof cssProto.setProperty === 'function' && !cssProto.setProperty.__olazZfile) {
+      const origSetProp = cssProto.setProperty;
+      const wrappedSetProp = function (prop, val, priority) {
+        return origSetProp.call(this, prop, rewriteCssUrls(val), priority);
+      };
+      wrappedSetProp.__olazZfile = true;
+      cssProto.setProperty = wrappedSetProp;
+    }
+    for (const prop of ['backgroundImage', 'background', 'cssText']) {
+      const desc = Object.getOwnPropertyDescriptor(cssProto, prop);
+      if (desc && desc.set && !desc.set.__olazZfile) {
+        const origCssSet = desc.set;
+        const wrappedCssSet = function (val) { return origCssSet.call(this, rewriteCssUrls(val)); };
+        wrappedCssSet.__olazZfile = true;
+        Object.defineProperty(cssProto, prop, Object.assign({}, desc, { set: wrappedCssSet }));
+      }
+    }
+  }
   const origSetAttr = Element.prototype.setAttribute;
   Element.prototype.setAttribute = function (name, val) {
-    if (typeof name === 'string' && name.toLowerCase() === 'src') {
-      const tag = this.tagName;
-      if (tag === 'IMG' || tag === 'AUDIO' || tag === 'VIDEO' || tag === 'SOURCE') {
-        val = rewriteFileUrl(val);
+    if (typeof name === 'string') {
+      const lower = name.toLowerCase();
+      if (lower === 'src') {
+        const tag = this.tagName;
+        if (tag === 'IMG' || tag === 'AUDIO' || tag === 'VIDEO' || tag === 'SOURCE') {
+          val = rewriteFileUrl(val);
+        }
+      } else if (lower === 'style') {
+        val = rewriteCssUrls(val);
       }
     }
     return origSetAttr.call(this, name, val);
@@ -1037,7 +1208,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     }
   }, false);
 
-  // 8. Page lifecycle & webpack module hooks (`login.html` vs `index.html`)
+  // 8. Page lifecycle & webpack module hooks (`login.html` vs `index.html` / `popup-viewer.html`)
   const page = location.pathname.split('/').pop();
   if (page === 'login.html') {
     const notifyLogin = () => postState({ page: 'login' });
@@ -1045,7 +1216,148 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     else notifyLogin();
     return;
   }
-  if (page !== 'index.html') return;
+  if (page !== 'index.html' && page !== 'popup-viewer.html') return;
+
+  // In-renderer replacement for Electron's `utility-process-media` (`PHOTO_FS`, `RESIZE`, `PING`)
+  const ensureParentDir = async (filePath) => {
+    const s = String(filePath || '');
+    const dir = path ? path.dirname(s) : s.slice(0, s.lastIndexOf('/'));
+    if (dir && dir !== '.' && dir !== '/') {
+      await callAsync('$znode.fsExtra.ensureDir', [dir]);
+    }
+  };
+  const executePhotoFs = async (payload) => {
+    const t = payload || {};
+    switch (t.operation) {
+      case 'EXISTS': {
+        try { await callAsync('$znode.fsPromise.stat', [String(t.path)]); return true; } catch { return false; }
+      }
+      case 'STAT':
+        return await callAsync('$znode.fsPromise.stat', [String(t.path)]);
+      case 'READ_PARTIAL': {
+        const start = Math.max(0, Number(t.start) || 0);
+        const len = Math.max(0, (Number(t.end) || 0) - start);
+        if (!(len > 0)) return new ArrayBuffer(0);
+        const ab = await callAsync('$zFileManager.readFileSlice', [String(t.path), start, len, false]);
+        return toExactArrayBuffer(toU8(ab));
+      }
+      case 'READ_ARRAY_BUFFER':
+      case 'READ_BLOB': {
+        const ab = await callAsync('$zFileManager.getFileArrayBuffer', [String(t.path)]);
+        return toExactArrayBuffer(toU8(ab));
+      }
+      case 'WRITE_BUFFER':
+      case 'WRITE_BLOB': {
+        await ensureParentDir(t.path);
+        await callAsync('$zFileManager.writeBufferToPath', [String(t.path), toU8(t.buffer)]);
+        return true;
+      }
+      case 'DELETE': {
+        try {
+          await callAsync('$znode.fsPromise.unlink', [String(t.path)]);
+        } catch (err) {
+          const msg = String((err && (err.code || err.message)) || err || '');
+          if (!msg.includes('ENOENT')) throw err;
+        }
+        return true;
+      }
+      case 'COPY': {
+        await ensureParentDir(t.dest);
+        await callAsync('$znode.fsExtra.copy', [String(t.src), String(t.dest)]);
+        return true;
+      }
+      case 'MOVE': {
+        await ensureParentDir(t.dest);
+        try {
+          await callAsync('$znode.fsExtra.move', [String(t.src), String(t.dest)]);
+        } catch {
+          await callAsync('$znode.fsExtra.copy', [String(t.src), String(t.dest)]);
+          try { await callAsync('$znode.fsPromise.unlink', [String(t.src)]); } catch {}
+        }
+        return true;
+      }
+      case 'ENSURE_DIR':
+        await callAsync('$znode.fsExtra.ensureDir', [String(t.path)]);
+        return true;
+      default:
+        throw new Error('Unsupported PHOTO_FS operation: ' + String(t.operation));
+    }
+  };
+  const executeResizeTask = async (payload) => {
+    const p = payload || {};
+    const ab = await callAsync('$zFileManager.getFileArrayBuffer', [String(p.src)]);
+    const srcU8 = toU8(ab);
+    const mime = p.outputFormat === 'image/png' || p.outputFormat === 'png' ? 'image/png' : 'image/jpeg';
+    const blob = new Blob([srcU8]);
+    const bmp = typeof createImageBitmap === 'function' ? await createImageBitmap(blob) : await new Promise((res, rej) => {
+      const img = new Image();
+      const url = URL.createObjectURL(blob);
+      img.onload = () => { URL.revokeObjectURL(url); res(img); };
+      img.onerror = (e) => { URL.revokeObjectURL(url); rej(e); };
+      img.src = url;
+    });
+    const sw = bmp.width || 1, sh = bmp.height || 1;
+    const tw = Number(p.width) || sw, th = Number(p.height) || sh;
+    const scale = Math.min(1, tw / sw, th / sh);
+    const dw = Math.max(1, Math.round(sw * scale)), dh = Math.max(1, Math.round(sh * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = dw; canvas.height = dh;
+    canvas.getContext('2d').drawImage(bmp, 0, 0, dw, dh);
+    if (bmp && typeof bmp.close === 'function') { try { bmp.close(); } catch {} }
+    const q = Math.max(0.1, Math.min(1, (Number(p.quality) || 85) > 1 ? Number(p.quality) / 100 : (Number(p.quality) || 0.85)));
+    const outBlob = await new Promise((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error('canvas.toBlob null'))), mime, q));
+    const outBytes = new Uint8Array(await outBlob.arrayBuffer());
+    if (p.destinationPath) {
+      await ensureParentDir(p.destinationPath);
+      await callAsync('$zFileManager.writeBufferToPath', [String(p.destinationPath), outBytes]);
+    }
+    return toExactArrayBuffer(outBytes);
+  };
+  const createUtilityMediaPort = () => {
+    const ch = new MessageChannel();
+    const hostPort = ch.port2;
+    hostPort.addEventListener('message', async (ev) => {
+      const msg = ev && ev.data;
+      if (!msg || msg.messageType !== 'request') return;
+      try {
+        let result;
+        if (msg.type === 'PING') {
+          result = 'pong';
+        } else if (msg.type === 'PHOTO_FS') {
+          result = await executePhotoFs(msg.params && msg.params.payload);
+        } else if (msg.type === 'RESIZE') {
+          result = await executeResizeTask(msg.params && msg.params.payload);
+        } else {
+          throw new Error('Unsupported utility-process-media task: ' + String(msg.type));
+        }
+        const xfer = result instanceof ArrayBuffer ? [result] : [];
+        hostPort.postMessage({
+          id: msg.id,
+          type: msg.type,
+          connectionId: msg.connectionId,
+          params: msg.params,
+          checkpoint: msg.checkpoint,
+          messageType: 'response',
+          result,
+          priority: msg.priority,
+          addToFront: msg.addToFront,
+        }, xfer);
+      } catch (err) {
+        hostPort.postMessage({
+          id: msg.id,
+          type: msg.type,
+          connectionId: msg.connectionId,
+          params: msg.params,
+          messageType: 'response',
+          error: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+          priority: msg.priority,
+          addToFront: msg.addToFront,
+        });
+      }
+    });
+    hostPort.start();
+    return ch.port1;
+  };
 
   const eachExport = (req, visit) => {
     for (const [id, mod] of Object.entries((req && req.c) || {})) {
@@ -1169,6 +1481,49 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
       const t = setInterval(() => { if (pinResizer()) clearInterval(t); }, 400);
       setTimeout(() => clearInterval(t), 60000);
     }
+
+    // Wire in-renderer `PhotoFs` + `utility-process-media` `MessageChannel` port responder
+    const patchMediaUtility = () => {
+      let hookedPhotoFs = false;
+      let hookedChannelMgr = false;
+      for (const reg of diRegistrations(req)) {
+        for (const c of [reg.instance, reg.provider && reg.provider.useClass, reg.provider]) {
+          const proto = typeof c === 'function' ? c.prototype : (c && typeof c === 'object' ? Object.getPrototypeOf(c) : null);
+          if (!proto) continue;
+          if (typeof proto.readPartial === 'function' && typeof proto.readArrayBuffer === 'function' && typeof proto.writeBuffer === 'function' && typeof proto.ensureDir === 'function') {
+            if (!proto.run.__olazPhotoFs) {
+              const directRun = function (payload) { return executePhotoFs(payload); };
+              directRun.__olazPhotoFs = true;
+              proto.run = directRun;
+              diag('media: PhotoFs bridged in-renderer (' + page + ')');
+            }
+            hookedPhotoFs = true;
+          }
+          if (typeof proto.requestOpenChannelTo === 'function') {
+            if (!proto.requestOpenChannelTo.__olazMediaPort) {
+              const origOpen = proto.requestOpenChannelTo;
+              const wrappedOpen = function (scriptName, channelId, ...rest) {
+                if (scriptName === 'utility-process-media') {
+                  diag('media: opened in-renderer MessagePort for ' + String(channelId));
+                  return Promise.resolve(createUtilityMediaPort());
+                }
+                return origOpen.call(this, scriptName, channelId, ...rest);
+              };
+              wrappedOpen.__olazMediaPort = true;
+              proto.requestOpenChannelTo = wrappedOpen;
+            }
+            hookedChannelMgr = true;
+          }
+        }
+      }
+      return hookedPhotoFs && hookedChannelMgr;
+    };
+    if (!patchMediaUtility()) {
+      const t = setInterval(() => { if (patchMediaUtility()) clearInterval(t); }, 100);
+      setTimeout(() => clearInterval(t), 60000);
+    }
+
+    if (page !== 'index.html') return true;
 
     // Attach Redux store once for user identity & window transition notification (event-driven, no polling)
     const attachStore = () => {
@@ -1490,6 +1845,13 @@ static JXL_ENCODE_CODEC_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("valid JXL encode codec regex")
 });
 
+static JXL_FALLBACK_RESIZE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"await Object\(([A-Za-z_$][\w$]*\.b)\)\(([A-Za-z_$][\w$]*),\{sizes:([A-Za-z_$][\w$]*),priority:0,outputFormat:"image/jpeg",quality:([A-Za-z_$][\w$]*)\.options\.quality,timeout:1e4\*([A-Za-z_$][\w$]*)\.length\}\)"#,
+    )
+    .expect("valid JXL fallback empty-resize regex")
+});
+
 static IMAGE_RESIZER_MAIN_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r#"![A-Za-z_$][\w$]*\.default\.image_resizer\.enable_libvips_macos\|\|"image/jpeg"!==[A-Za-z_$][\w$]*&&"image/png"!==[A-Za-z_$][\w$]*\?this\.compatibilityValidation\.isOffscreenCanvasSupported\(\)\?this\.resizerFactory\.createResizer\(([A-Za-z_$][\w$]*\.e)\.WEB_WORKER\):this\.compatibilityValidation\.isAutoRotationSupported\(\)\?this\.resizerFactory\.createResizer\([A-Za-z_$][\w$]*\.e\.MAIN\):this\.resizerFactory\.createResizer\([A-Za-z_$][\w$]*\.e\.PRIMITIVE\):this\.resizerFactory\.createResizer\([A-Za-z_$][\w$]*\.e\.LIBVIPS\)"#,
@@ -1520,6 +1882,7 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         b"Boolean(!1)?\"zfile://\"+e:e",
         b"enable_offload_encode_jxl",
         b"enable_offload_decode_jxl",
+        b"handleDecompdeJpegMultiFallback",
         b"enable_libvips_macos",
         b"createResizer(",
     ];
@@ -1723,11 +2086,11 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         changed = true;
     }
 
-    // 8. Local file subresource URL transform (`file:///...` -> `zfile://local/...`) for WebKit2GTK.
-    const ZFILE_TRANSFORM_REPL: &str = r#"static transformLocalUrl(e){return typeof e==="string"&&e.startsWith("file:")?"zfile://local/"+e.replace(/^file:\/+/,""):e}"#;
+    // 8. Local file subresource URL transform (`file:///...` -> `zfile://local/...`, including
+    //    WHATWG `URL` instances returned by `url.pathToFileURL` for Stickers, plus `//` -> `https://`).
+    const ZFILE_TRANSFORM_REPL: &str = r#"static transformLocalUrl(e){const s=e&&typeof e==="object"&&typeof e.href==="string"?e.href:e;return typeof s==="string"?s.startsWith("file:")?"zfile://local/"+s.replace(/^file:\/+/,""):s.startsWith("//")?"https:"+s:e:e}"#;
     const ZFILE_INLINE_FIND: &str = r#"Boolean(!1)?"zfile://"+e:e"#;
-    const ZFILE_INLINE_REPL: &str =
-        r#"(typeof e==="string"&&e.startsWith("file:")?"zfile://local/"+e.replace(/^file:\/+/,""):e)"#;
+    const ZFILE_INLINE_REPL: &str = r#"((()=>{const s=e&&typeof e==="object"&&typeof e.href==="string"?e.href:e;return typeof s==="string"?s.startsWith("file:")?"zfile://local/"+s.replace(/^file:\/+/,""):s.startsWith("//")?"https:"+s:e:e})())"#;
 
     if s.contains("checkNeedTransformLocalUrl") && TRANSFORM_LOCAL_URL_RE.is_match(&s) {
         let next = TRANSFORM_LOCAL_URL_RE
@@ -1746,7 +2109,8 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
     // 9. Route JXL encode/decode/resize codecs to Zalo's built-in WASM JXL worker (`yt`, `Me`,
     //    `LIBJXL_WASM`) instead of Electron native `$zFeatures.libjxl` or 60s offload BrowserWindow
     //    tasks (`St`, `Tt`, `ve`, `ue`) while preserving `jxlNativeSupported() === true` for native
-    //    desktop file download UI actions.
+    //    desktop file download UI actions. Also enable `_lazyDecoderFallbackInit=!0` and guard empty
+    //    `sizes:[]` (`timeout:0`) in `handleDecompdeJpegMultiFallback` so `"Original"` JXL photos decode.
     if s.contains("jxlNativeSupported") {
         for (re, repl) in [
             (&*JXL_RESIZE_CODEC_RE, "(!1/*olaz-wasm-jxl*/)?(${1}"),
@@ -1760,6 +2124,22 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
                     changed = true;
                 }
             }
+        }
+        if s.contains("._lazyDecoderFallbackInit=!1") {
+            s = s.replace("._lazyDecoderFallbackInit=!1", "._lazyDecoderFallbackInit=!0");
+            changed = true;
+        }
+    }
+    if s.contains("handleDecompdeJpegMultiFallback") && JXL_FALLBACK_RESIZE_RE.is_match(&s) {
+        let next = JXL_FALLBACK_RESIZE_RE
+            .replace_all(
+                &s,
+                r#"(${3}.length?await /*olaz-jxl-noresize*/Object(${1})(${2},{sizes:${3},priority:0,outputFormat:"image/jpeg",quality:${4}.options.quality,timeout:1e4*${5}.length}):[])"#,
+            )
+            .into_owned();
+        if next != s {
+            s = next;
+            changed = true;
         }
     }
 

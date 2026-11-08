@@ -632,10 +632,24 @@ impl OlazAppWindow {
                     break;
                 };
                 match cmd {
-                    WindowCommand::Minimize => {
+                    WindowCommand::Minimize { window_id } => {
+                        if let Some(ref wid) = window_id {
+                            if app.host.minimize_child_window(wid)
+                                || matches!(wid.as_str(), "photo-viewer" | "file-viewer")
+                            {
+                                continue;
+                            }
+                        }
                         app.window.iconify();
                     }
-                    WindowCommand::ToggleMaximize { target } => {
+                    WindowCommand::ToggleMaximize { window_id, target } => {
+                        if let Some(ref wid) = window_id {
+                            if app.host.toggle_maximize_child_window(wid, target)
+                                || matches!(wid.as_str(), "photo-viewer" | "file-viewer")
+                            {
+                                continue;
+                            }
+                        }
                         let should_max = target.unwrap_or_else(|| !app.window.is_maximized());
                         if should_max {
                             app.window.maximize();
@@ -643,7 +657,14 @@ impl OlazAppWindow {
                             app.window.unmaximize();
                         }
                     }
-                    WindowCommand::ToggleFullscreen { target } => {
+                    WindowCommand::ToggleFullscreen { window_id, target } => {
+                        if let Some(ref wid) = window_id {
+                            if app.host.toggle_fullscreen_child_window(wid, target)
+                                || matches!(wid.as_str(), "photo-viewer" | "file-viewer")
+                            {
+                                continue;
+                            }
+                        }
                         let cur = app
                             .main_process
                             .window_state()
@@ -658,11 +679,12 @@ impl OlazAppWindow {
                     }
                     WindowCommand::CloseOrHide { window_id }
                     | WindowCommand::Hide { window_id } => {
-                        if matches!(
-                            window_id.as_deref(),
-                            Some("photo-viewer" | "file-viewer")
-                        ) {
-                            continue;
+                        if let Some(ref wid) = window_id {
+                            if app.host.close_child_window(wid)
+                                || matches!(wid.as_str(), "photo-viewer" | "file-viewer")
+                            {
+                                continue;
+                            }
                         }
                         app.persist_window_geometry();
                         let has_live_tray = app
@@ -681,7 +703,14 @@ impl OlazAppWindow {
                             break;
                         }
                     }
-                    WindowCommand::Show { focus } => {
+                    WindowCommand::Show { window_id, focus } => {
+                        if let Some(ref wid) = window_id {
+                            if app.host.show_child_window(wid, focus)
+                                || matches!(wid.as_str(), "photo-viewer" | "file-viewer")
+                            {
+                                continue;
+                            }
+                        }
                         app.window.show_all();
                         app.window.deiconify();
                         if focus {
@@ -691,7 +720,14 @@ impl OlazAppWindow {
                             .bridge()
                             .send("visibility-change", vec![json!("show")]);
                     }
-                    WindowCommand::Focus => {
+                    WindowCommand::Focus { window_id } => {
+                        if let Some(ref wid) = window_id {
+                            if app.host.focus_child_window(wid)
+                                || matches!(wid.as_str(), "photo-viewer" | "file-viewer")
+                            {
+                                continue;
+                            }
+                        }
                         app.present_window();
                     }
                     WindowCommand::Quit => {
