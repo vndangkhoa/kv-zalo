@@ -55,6 +55,7 @@ struct LoginView: View {
     private var subtitle: String {
         switch state.step {
         case .generating: "Đang tạo mã QR…"
+        case .waitingScan where state.isSecondQR: "Đã quét lần 1. Tài khoản của bạn cần quét thêm mã mới dưới đây để xác nhận thiết bị."
         case .waitingScan: "Mở Zalo trên điện thoại, chạm biểu tượng quét mã QR rồi quét mã dưới đây."
         case .waitingConfirm: "Chọn Đăng nhập trên điện thoại của bạn để tiếp tục."
         case .expired: "Mã QR đã hết hạn."

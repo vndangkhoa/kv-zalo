@@ -335,7 +335,10 @@
       const canvas = root.querySelector('.login-qr__frame-qr canvas, .qr-code canvas');
       let qr = qrImg ? qrImg.src : null;
       if (!qr && canvas) { try { qr = canvas.toDataURL('image/png'); } catch {} }
-      const invalid = !!root.querySelector('.qr--invalid, .qr-img-err, .off--qr-code');
+      // The official page stops polling after `qr_retry` long-polls (~21 s each, so ~1 min) and marks the QR dead by
+      // renaming its <img> to `qr-image--none` (src becomes a placeholder). Older builds used the other classes.
+      const invalid = !!root.querySelector('img.qr-image--none, .qr--invalid, .qr-img-err, .off--qr-code');
+      if (invalid) qr = null;   // never forward the placeholder as a scannable QR
       const avatar = Array.from(root.querySelectorAll('img')).find((i) => /ava|avatar/.test(i.className + ' ' + i.src) && i !== qrImg);
       const buttons = Array.from(root.querySelectorAll('button, .z--btn--v2')).map((b) => (b.innerText || '').trim()).filter(Boolean);
       const text = (root.innerText || '').trim().replace(/\n{2,}/g, '\n').slice(0, 600);

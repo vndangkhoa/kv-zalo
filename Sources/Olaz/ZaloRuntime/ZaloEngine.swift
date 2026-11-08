@@ -37,6 +37,9 @@ final class ZaloEngine {
         }
         var step: Step = .generating
         var qrPNG: Data?
+        /// The server asked for a second scan (`error_code -20`, multi-layer QR for device linking): the QR on screen
+        /// is QR2, which the phone must scan before the login can be confirmed.
+        var isSecondQR = false
     }
 
     struct Profile: Equatable {
@@ -335,9 +338,27 @@ final class ZaloEngine {
         switch state["page"] as? String {
         case "login":
             guard case .login(var login) = phase else { return }
+            // The official page gave up on this QR (its poller ran out of `qr_retry`): it is no longer watched, so a
+            // scan would do nothing. Only from waiting-scan — after an accepted login the page also shows this state.
+            if state["invalid"] as? Bool == true, case .waitingScan = login.step {
+                loginTimeout?.cancel()
+                login.step = .expired
+                phase = .login(login)
+                return
+            }
             if let qr = state["qr"] as? String, let png = Self.decodeDataURL(qr) {
                 login.qrPNG = png
-                if state["event"] as? String == "qr" { login.step = .waitingScan }
+                switch state["event"] as? String {
+                case "qr":
+                    login.step = .waitingScan
+                    login.isSecondQR = false
+                case "qr2":
+                    // The official page generated the second QR after the server's -20; the user scans again.
+                    login.step = .waitingScan
+                    login.isSecondQR = true
+                default:
+                    break
+                }
                 phase = .login(login)
                 scheduleExpiry()
             }
@@ -396,6 +417,11 @@ final class ZaloEngine {
         let data = json["data"] as? [String: Any] ?? json
         let code = (json["error_code"] as? NSNumber)?.intValue ?? 0
         EngineLog.shared.write("qr-poll \(url.path()) error_code=\(code) data.keys=\(data.keys.sorted())")
+        // -20 is not an error: the first scan succeeded, but this account logs in with a second QR (device linking,
+        // "multi layer QR login mode"). The official poller turns `data` into QR2 via `genSecondQR` and keeps waiting
+        // for a scan; the page adapter forwards it as `event: "qr2"`. Its `error_message` ("Vui lòng thử lại QR mới.")
+        // must not be shown as a failure.
+        if code == Self.secondQRRequiredCode { return }
         if let name = data["display_name"] as? String, !name.isEmpty {
             login.step = .waitingConfirm(name: name, avatar: (data["avatar"] as? String).flatMap(URL.init(string:)))
             phase = .login(login)
@@ -405,7 +431,12 @@ final class ZaloEngine {
         }
     }
 
-    /// The server sets `qr_timeout`; mirror the official page's expiry UI.
+    /// `qr-id` poll result meaning "scanned once; show the second (device-linking) QR" — see `Dr`/`genSecondQR` in the
+    /// official `login-startup` chunk.
+    static let secondQRRequiredCode = -20
+
+    /// Fallback only: the page's own expiry (`invalid` above, ~1 min: `qr_retry` × ~21 s long-polls answered 408)
+    /// normally arrives first. This catches a page whose expiry marker we no longer recognise.
     private func scheduleExpiry() {
         loginTimeout?.cancel()
         loginTimeout = Task { [weak self] in
