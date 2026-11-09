@@ -270,6 +270,15 @@ pub fn bridge_spec_script(platform: &ZaloPlatform) -> String {
         "$znode.fs.copyFileSync",
         "$znode.fsExtra.copySync",
         "$znode.nativelibs.fileUtilsAddon.getDiskUsage",
+        "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeSync",
+        "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeTreeSync",
+        "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeByGlobSync",
+        "$znode.nativelibs.fileUtilitiesAddon.detectHardlinksSync",
+        "$znode.nativelibs.fileUtilitiesAddon.detectFilesystemSync",
+        "$znode.nativelibs.fileUtilitiesAddon.cancelJob",
+        "$znode.nativelibs.dbUtilsAddon.decompressAndDecryptDb_V2",
+        "$znode.nativelibs.dbUtilsAddon.decompressAndDecryptDb",
+        "$znode.nativelibs.dbUtilsAddon.parseBinNet",
         "$znode.crypto.encrypt",
         "$znode.crypto.decrypt",
         "$znode.crypto.hash",
@@ -324,7 +333,11 @@ pub fn bridge_spec_script(platform: &ZaloPlatform) -> String {
         "$znode.shell.openPath",
         "$znode.shell.openExternal",
         "$znode.shell.showItemInFolder",
+        "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeAsync",
+        "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeTreeAsync",
+        "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeByGlobAsync",
         "$znode.nativelibs.fileUtilitiesAddon.detectHardlinksAsync",
+        "$znode.nativelibs.fileUtilitiesAddon.detectFilesystemAsync",
         "$znode.nativelibs.zfileAddon.getDiskInfo",
         "$znode.nativelibs.zfileAddon.getInfo",
         "$znode.nativelibs.zfileAddon.copyFolder",
@@ -396,11 +409,271 @@ pub fn bridge_spec_script(platform: &ZaloPlatform) -> String {
     format!("window.__zaloBridgeSpec = {serialized};")
 }
 
+const LINUX_LOCAL_ADDONS_EXT: &str = r#"(() => {
+  'use strict';
+  const install = () => {
+    if (window.__olazLinuxAddonsInstalled) return;
+    window.__olazLinuxAddonsInstalled = true;
+    const local = window.__zaloLocal || (window.__zaloLocal = {});
+    const encodeArg = (v) => {
+      if (v instanceof ArrayBuffer) v = new Uint8Array(v);
+      if (ArrayBuffer.isView(v)) {
+        const b = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+        let s = '';
+        for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+        return { __bytes: btoa(s) };
+      }
+      if (Array.isArray(v)) return v.map(encodeArg);
+      if (v && typeof v === 'object') {
+        const o = {};
+        for (const k of Object.keys(v)) {
+          if (typeof v[k] !== 'function') o[k] = encodeArg(v[k]);
+        }
+        return o;
+      }
+      return typeof v === 'function' ? undefined : v;
+    };
+    const decodeVal = (v) => {
+      if (Array.isArray(v)) return v.map(decodeVal);
+      if (v && typeof v === 'object') {
+        if (typeof v.__bytes === 'string') {
+          const s = atob(v.__bytes);
+          const u = new Uint8Array(s.length);
+          for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
+          return v.__arraybuffer ? u.buffer : u;
+        }
+        if (v.__undefined) return undefined;
+        const o = {};
+        for (const k of Object.keys(v)) o[k] = decodeVal(v[k]);
+        return o;
+      }
+      return v;
+    };
+    const toErr = (e) => {
+      const msg = String(e);
+      const err = new Error(msg);
+      const m = /^([A-Z][A-Z0-9_]+):/.exec(msg);
+      if (m) err.code = m[1];
+      return err;
+    };
+    const ipcSendSync = (channel, ...args) => {
+      const Xhr = window.__zaloNativeXHR || window.XMLHttpRequest;
+      const xhr = new Xhr();
+      xhr.open('POST', 'zalo-app://local/__olaz/bridge-sync', false);
+      xhr.send(JSON.stringify({ channel, args: encodeArg(args) }));
+      const res = JSON.parse(xhr.responseText || '{}');
+      if (res.error) throw toErr(res.error);
+      return decodeVal(res.value);
+    };
+    window.__olazIpcSendSync = ipcSendSync;
+
+    const callBridgeSync = (fullPath, args) => {
+      if (window.__zaloBridge && typeof window.__zaloBridge.callSync === 'function') {
+        return window.__zaloBridge.callSync(fullPath, args || []);
+      }
+      const Xhr = window.__zaloNativeXHR || window.XMLHttpRequest;
+      const xhr = new Xhr();
+      xhr.open('POST', 'zalo-app://local/__olaz/bridge-sync', false);
+      xhr.send(JSON.stringify({ path: fullPath, args: encodeArg(args || []) }));
+      const res = JSON.parse(xhr.responseText || '{}');
+      if (res.error) throw toErr(res.error);
+      return decodeVal(res.value);
+    };
+    const callAddonSync = (addonName, method, args) => {
+      const cleanArgs = args || [];
+      const fullPath = '$znode.nativelibs.' + addonName + '.' + method;
+      const direct = callBridgeSync(fullPath, cleanArgs);
+      if (direct !== undefined) return direct;
+      return ipcSendSync('olaz-fs-sync', method, ...cleanArgs);
+    };
+
+    // 1. `fileUtilitiesAddon` / `fileUtilities` (6 sync + 5 async with AbortSignal -> cancelJob(jobId))
+    let nextFileUtilJobId = 1;
+    const stripSignalOptions = (options) => {
+      if (!options || typeof options !== 'object') return { cleanOpts: options, signal: null };
+      const signal = (options.signal && typeof options.signal === 'object') ? options.signal : null;
+      const cleanOpts = {};
+      for (const k of Object.keys(options)) {
+        if (k !== 'signal' && typeof options[k] !== 'function') cleanOpts[k] = options[k];
+      }
+      return { cleanOpts, signal };
+    };
+    const fileUtilitiesAddon = {};
+    for (const m of [
+      'getDirectorySizeSync',
+      'getDirectorySizeTreeSync',
+      'getDirectorySizeByGlobSync',
+      'detectHardlinksSync',
+      'detectFilesystemSync',
+      'cancelJob',
+    ]) {
+      fileUtilitiesAddon[m] = (...args) => callAddonSync('fileUtilitiesAddon', m, args);
+    }
+    for (const m of [
+      'getDirectorySizeAsync',
+      'getDirectorySizeTreeAsync',
+      'getDirectorySizeByGlobAsync',
+      'detectHardlinksAsync',
+      'detectFilesystemAsync',
+    ]) {
+      fileUtilitiesAddon[m] = (arg0, options, explicitJobId) => {
+        const { cleanOpts, signal } = stripSignalOptions(options);
+        const hasExplicitId = typeof explicitJobId === 'number' && Number.isFinite(explicitJobId);
+        const jobId = hasExplicitId ? explicitJobId : (signal ? nextFileUtilJobId++ : undefined);
+        let abortHandler = null;
+        if (signal && jobId !== undefined) {
+          if (signal.aborted) {
+            try { fileUtilitiesAddon.cancelJob(jobId); } catch {}
+          } else if (typeof signal.addEventListener === 'function') {
+            abortHandler = () => { try { fileUtilitiesAddon.cancelJob(jobId); } catch {} };
+            signal.addEventListener('abort', abortHandler, { once: true });
+          }
+        }
+        const callArgs = jobId !== undefined
+          ? [arg0, cleanOpts === undefined ? null : cleanOpts, jobId]
+          : (cleanOpts !== undefined ? [arg0, cleanOpts] : [arg0]);
+        const p = window.__zaloBridge.callAsync('$znode.nativelibs.fileUtilitiesAddon.' + m, callArgs);
+        if (abortHandler && signal && typeof signal.removeEventListener === 'function' && p && typeof p.finally === 'function') {
+          return p.finally(() => {
+            try { signal.removeEventListener('abort', abortHandler); } catch {}
+          });
+        }
+        return p;
+      };
+    }
+    local['$znode.nativelibs.fileUtilitiesAddon'] = fileUtilitiesAddon;
+    local['$znode.nativelibs.fileUtilities'] = () => fileUtilitiesAddon;
+
+    // 2. `dbUtilsAddon` / `dbUtils` (`decompressAndDecryptDb_V2`, `decompressAndDecryptDb`, `parseBinNet`)
+    const toByteArray = (input) => {
+      if (input instanceof Uint8Array) return Array.from(input);
+      if (input instanceof ArrayBuffer) return Array.from(new Uint8Array(input));
+      if (ArrayBuffer.isView(input)) return Array.from(new Uint8Array(input.buffer, input.byteOffset, input.byteLength));
+      if (Array.isArray(input)) return input;
+      return input;
+    };
+    const dbUtilsAddon = {
+      decompressAndDecryptDb_V2(src, dst, key, progressCb) {
+        const cb = typeof progressCb === 'function' ? progressCb : null;
+        const cleanArgs = [src, dst, key].filter((_, idx) => idx < 3);
+        const res = callAddonSync('dbUtilsAddon', 'decompressAndDecryptDb_V2', cleanArgs);
+        if (cb && res && res.result === 0) {
+          try { cb(null, 100); } catch {}
+        }
+        return res;
+      },
+      decompressAndDecryptDb(...args) {
+        const cb = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+        const res = callAddonSync('dbUtilsAddon', 'decompressAndDecryptDb', args);
+        if (cb && res && res.result === 0) {
+          try { cb(null, 100); } catch {}
+        }
+        return res;
+      },
+      parseBinNet(input, ...rest) {
+        return callAddonSync('dbUtilsAddon', 'parseBinNet', [toByteArray(input), ...rest]);
+      },
+    };
+    local['$znode.nativelibs.dbUtilsAddon'] = dbUtilsAddon;
+    local['$znode.nativelibs.dbUtils'] = () => dbUtilsAddon;
+
+    // 3. `zfile` longest-prefix mount `Proxy` (`zfile-linux.js` parity)
+    const resolveMountByPath = (disks, key) => {
+      if (typeof key !== 'string') return disks[key];
+      if (Object.prototype.hasOwnProperty.call(disks, key)) return disks[key];
+      if (key[0] !== '/') return disks[key];
+      let best;
+      let bestLen = -1;
+      for (const m of Object.keys(disks)) {
+        const match = m === '/' ? true : (key === m || key.startsWith(m + '/'));
+        if (match && m.length > bestLen) {
+          best = m;
+          bestLen = m.length;
+        }
+      }
+      return best === undefined ? undefined : disks[best];
+    };
+    const normalizeMountEntry = (mp, raw) => {
+      const r = (raw && typeof raw === 'object') ? raw : {};
+      const totalSpace = Number(r.totalSpace != null ? r.totalSpace : (r.total != null ? r.total : (r.size != null ? r.size : 100 * 1024 * 1024 * 1024)));
+      const freeSpace = Number(r.freeSpace != null ? r.freeSpace : (r.free != null ? r.free : (r.available != null ? r.available : 50 * 1024 * 1024 * 1024)));
+      return Object.assign({}, r, {
+        label: r.label || mp,
+        mountpoint: r.mountpoint || mp,
+        totalSpace,
+        freeSpace,
+        total: r.total != null ? Number(r.total) : totalSpace,
+        free: r.free != null ? Number(r.free) : freeSpace,
+      });
+    };
+    const wrapDiskMapProxy = (rawDisks) => {
+      const disks = {};
+      if (rawDisks && typeof rawDisks === 'object' && !Array.isArray(rawDisks)) {
+        const mountKeys = Object.keys(rawDisks).filter((k) => rawDisks[k] && typeof rawDisks[k] === 'object' && !Array.isArray(rawDisks[k]));
+        if (mountKeys.length > 0) {
+          for (const k of mountKeys) disks[k] = normalizeMountEntry(k, rawDisks[k]);
+        } else if (rawDisks.total != null || rawDisks.totalSpace != null || rawDisks.free != null || rawDisks.freeSpace != null) {
+          disks['/'] = normalizeMountEntry('/', rawDisks);
+        }
+      }
+      if (Object.keys(disks).length === 0) {
+        let fallback = null;
+        try {
+          if (window.$znode && window.$znode.nativelibs && window.$znode.nativelibs.fileUtilsAddon) {
+            fallback = window.$znode.nativelibs.fileUtilsAddon.getDiskUsage('/');
+          } else {
+            fallback = callBridgeSync('$znode.nativelibs.fileUtilsAddon.getDiskUsage', ['/']);
+          }
+        } catch {}
+        disks['/'] = normalizeMountEntry('/', fallback || {});
+      }
+      return new Proxy(disks, {
+        get(target, key) {
+          if (typeof key === 'symbol') return target[key];
+          return resolveMountByPath(target, key);
+        },
+      });
+    };
+    const fetchDiskMapProxy = async (p) => {
+      let raw = null;
+      try {
+        const addon = window.$znode && window.$znode.nativelibs && window.$znode.nativelibs.zfileAddon;
+        if (addon && typeof addon.getDiskInfo === 'function') {
+          raw = p !== undefined ? await addon.getDiskInfo(String(p)) : await addon.getDiskInfo();
+        } else if (window.__zaloBridge && typeof window.__zaloBridge.callAsync === 'function') {
+          raw = await window.__zaloBridge.callAsync('$znode.nativelibs.zfileAddon.getDiskInfo', p !== undefined ? [String(p)] : []);
+        }
+      } catch {}
+      return wrapDiskMapProxy(raw);
+    };
+    window.__olazFetchDiskMapProxy = fetchDiskMapProxy;
+    local['$znode.nativelibs.zfile'] = () => ({
+      canRead: (p) => { try { const v = callBridgeSync('$znode.nativelibs.zfileAddon.canRead', [String(p)]); return v === undefined ? true : v; } catch { return true; } },
+      canWrite: (p) => { try { const v = callBridgeSync('$znode.nativelibs.zfileAddon.canWrite', [String(p)]); return v === undefined ? true : v; } catch { return true; } },
+      canReadAndWrite: (p) => { try { const v = callBridgeSync('$znode.nativelibs.zfileAddon.canReadAndWrite', [String(p)]); return v === undefined ? true : v; } catch { return true; } },
+      getInfo: (p) => window.__zaloBridge.callAsync('$znode.nativelibs.zfileAddon.getInfo', [String(p || '/')]),
+      getDiskInfo: (p) => fetchDiskMapProxy(p),
+      diskInfo: () => fetchDiskMapProxy(),
+      copyFolder: (src, dst, cb) => window.__zaloBridge.callAsync('$znode.nativelibs.zfileAddon.copyFolder', [String(src || ''), String(dst || '')]).then((r) => {
+        if (typeof cb === 'function') cb(null, r);
+        return r;
+      }),
+      cancelCopy: () => window.__zaloBridge.callAsync('$znode.nativelibs.zfileAddon.cancelCopy', []),
+    });
+  };
+  window.__olazInstallLinuxAddons = install;
+  install();
+})();"#;
+
 /// Formats an embedded host script with its `//# sourceURL=olaz-<name>.js` footer.
 pub fn host_script(name: &str) -> Option<String> {
+    if name == "local-modules" {
+        return Some(format!(
+            "{SCRIPT_LOCAL_MODULES}\n{LINUX_LOCAL_ADDONS_EXT}\n//# sourceURL=olaz-{name}.js"
+        ));
+    }
     let raw = match name {
         "network-shim" => SCRIPT_NETWORK_SHIM,
-        "local-modules" => SCRIPT_LOCAL_MODULES,
         "bridge" => SCRIPT_BRIDGE,
         "state-adapter" => SCRIPT_STATE_ADAPTER,
         "chat-adapter" => SCRIPT_CHAT_ADAPTER,
@@ -520,6 +793,18 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
   const invokeIPC = (channel, args) => window.webkit.messageHandlers.zbridge
     .postMessage({ kind: 'invoke', channel, args: encodeBridgeArg(args || []) })
     .then(decodeBridgeVal);
+  const ipcSendSync = (channel, ...args) => {
+    if (typeof window.__olazIpcSendSync === 'function') {
+      return window.__olazIpcSendSync(channel, ...args);
+    }
+    const Xhr = window.__zaloNativeXHR || window.XMLHttpRequest;
+    const xhr = new Xhr();
+    xhr.open('POST', 'zalo-app://local/__olaz/bridge-sync', false);
+    xhr.send(JSON.stringify({ channel, args: encodeBridgeArg(args) }));
+    const res = JSON.parse(xhr.responseText || '{}');
+    if (res.error) throw new Error(String(res.error));
+    return decodeBridgeVal(res.value);
+  };
   const postState = (state) => {
     try { window.webkit.messageHandlers.zstate.postMessage(state); } catch {}
   };
@@ -532,7 +817,110 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
   const safe = (fn, d) => {
     try { const v = fn(); return v === undefined ? d : v; } catch { return d; }
   };
+  if (typeof window.__olazInstallLinuxAddons === 'function') {
+    window.__olazInstallLinuxAddons();
+  }
   const path = local['$znode.path'];
+
+  // 0. Live Privacy Receipt Blocker (`window.__olazPrivacy` / `window.__olazSetPrivacy`)
+  const PRIVACY_OK_BODY = '{"error_code":0,"error_message":"Successful.","data":""}';
+  window.__olazPrivacy = Object.assign(
+    { blockTyping: false, blockSeen: false, blockDelivered: false },
+    (window.__olazPrivacy && typeof window.__olazPrivacy === 'object') ? window.__olazPrivacy : {},
+  );
+  window.__olazSetPrivacy = (cfg) => {
+    if (cfg && typeof cfg === 'object') {
+      Object.assign(window.__olazPrivacy, cfg);
+    }
+    return Object.assign({}, window.__olazPrivacy);
+  };
+  const shouldBlockPrivacyReceipt = (rawUrl) => {
+    const u = typeof rawUrl === 'string'
+      ? rawUrl
+      : (rawUrl && typeof rawUrl === 'object' ? String(rawUrl.url || rawUrl.href || '') : String(rawUrl || ''));
+    if (!u) return false;
+    const p = window.__olazPrivacy || {};
+    if (p.blockTyping && /\/api\/(message|group)\/typing\b/.test(u)) return true;
+    if (p.blockSeen && /\/api\/(message|group)\/seen\b/.test(u)) return true;
+    if (p.blockDelivered && /\/api\/(message|group)\/delivered\b/.test(u)) return true;
+    return false;
+  };
+  if (typeof window.fetch === 'function' && !window.fetch.__olazPrivacy) {
+    const origFetch = window.fetch;
+    const wrappedFetch = function (input, init) {
+      if (shouldBlockPrivacyReceipt(input)) {
+        if (typeof Response === 'function') {
+          return Promise.resolve(new Response(PRIVACY_OK_BODY, {
+            status: 200,
+            statusText: 'OK',
+            headers: { 'Content-Type': 'application/json' },
+          }));
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          headers: { get: (h) => (String(h).toLowerCase() === 'content-type' ? 'application/json' : null) },
+          text: () => Promise.resolve(PRIVACY_OK_BODY),
+          json: () => Promise.resolve(JSON.parse(PRIVACY_OK_BODY)),
+        });
+      }
+      return origFetch.apply(this, arguments);
+    };
+    wrappedFetch.__olazPrivacy = true;
+    window.fetch = wrappedFetch;
+  }
+  if (typeof window.XMLHttpRequest === 'function'
+      && window.XMLHttpRequest.prototype
+      && !window.XMLHttpRequest.prototype.__olazPrivacy) {
+    const xhrProto = window.XMLHttpRequest.prototype;
+    const origOpen = xhrProto.open;
+    const origSend = xhrProto.send;
+    xhrProto.open = function (method, url) {
+      this.__olazReqUrl = typeof url === 'string' ? url : (url && typeof url.href === 'string' ? url.href : String(url || ''));
+      this.__olazReqAsync = arguments.length < 3 ? true : Boolean(arguments[2]);
+      return origOpen.apply(this, arguments);
+    };
+    xhrProto.send = function () {
+      if (shouldBlockPrivacyReceipt(this && this.__olazReqUrl)) {
+        const self = this;
+        const parsedJson = () => ({ error_code: 0, error_message: 'Successful.', data: '' });
+        const defineProp = (k, getter) => {
+          try { Object.defineProperty(self, k, { configurable: true, get: getter }); } catch {
+            try { self[k] = getter(); } catch {}
+          }
+        };
+        defineProp('readyState', () => 4);
+        defineProp('status', () => 200);
+        defineProp('statusText', () => 'OK');
+        defineProp('responseURL', () => String(self.__olazReqUrl || ''));
+        defineProp('responseText', () => PRIVACY_OK_BODY);
+        defineProp('response', () => (self.responseType === 'json' ? parsedJson() : PRIVACY_OK_BODY));
+        const hasNativeDomOn = typeof XMLHttpRequestEventTarget === 'function' && self instanceof XMLHttpRequestEventTarget;
+        const fireXhrEvent = (type) => {
+          let ev;
+          try { ev = new Event(type); } catch { ev = { type, target: self, currentTarget: self }; }
+          if (typeof self.dispatchEvent === 'function') {
+            try { self.dispatchEvent(ev); } catch {}
+          }
+          if (!hasNativeDomOn) {
+            const cb = self['on' + type];
+            if (typeof cb === 'function') { try { cb.call(self, ev); } catch {} }
+          }
+        };
+        const complete = () => {
+          fireXhrEvent('readystatechange');
+          fireXhrEvent('load');
+          fireXhrEvent('loadend');
+        };
+        if (self.__olazReqAsync === false) complete();
+        else setTimeout(complete, 0);
+        return;
+      }
+      return origSend.apply(this, arguments);
+    };
+    xhrProto.__olazPrivacy = true;
+  }
 
   // 1. Native clipboard image read/write (`$zelectronNative.getClipboardImage`)
   local['$zelectronNative.getClipboardImage'] = () => {
@@ -541,7 +929,13 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     return {
       isEmpty: () => !bytes || bytes.length === 0,
       toPNG: () => bytes,
-      toJPEG: () => bytes,
+      toJPEG: (q) => {
+        const quality = typeof q === 'number' ? q : 85;
+        const raw = safe(() => ipcSendSync('olaz-clipboard-image-jpeg', quality), null);
+        if (!raw) return bytes;
+        const jpg = toU8(raw);
+        return jpg.byteLength > 0 ? jpg : bytes;
+      },
     };
   };
   local['$zelectronNative.writeImageToClipboard'] = (buf) => {
@@ -649,6 +1043,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     if (v instanceof Uint8Array) return v;
     if (v instanceof ArrayBuffer) return new Uint8Array(v);
     if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+    if (Array.isArray(v)) return new Uint8Array(v);
     return new Uint8Array(0);
   };
   const toExactArrayBuffer = (u8) => (
@@ -917,28 +1312,83 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     window.XMLHttpRequest.prototype.__olazUploadEvents = true;
   }
 
-  // 3. `$znode.nativelibs.zfile` (Settings -> Data Management disk info + folder copy)
-  local['$znode.nativelibs.zfile'] = () => ({
-    canRead: (p) => safe(() => sync('$znode.nativelibs.zfileAddon.canRead', [String(p)]), true),
-    canWrite: (p) => safe(() => sync('$znode.nativelibs.zfileAddon.canWrite', [String(p)]), true),
-    canReadAndWrite: (p) => safe(() => sync('$znode.nativelibs.zfileAddon.canReadAndWrite', [String(p)]), true),
-    getInfo: (p) => callAsync('$znode.nativelibs.zfileAddon.getInfo', [String(p || '/')]),
-    getDiskInfo: (p) => callAsync('$znode.nativelibs.zfileAddon.getDiskInfo', [String(p || '/')]),
-    diskInfo: async () => {
-      const u = safe(() => sync('$znode.nativelibs.fileUtilsAddon.getDiskUsage', ['/']), null) || {};
-      const totalSpace = Number(u.total || u.totalSpace || 100 * 1024 * 1024 * 1024);
-      const freeSpace = Number(u.free || u.available || u.freeSpace || 50 * 1024 * 1024 * 1024);
-      const root = { label: '/', mountpoint: '/', totalSpace, freeSpace, total: totalSpace, free: freeSpace };
-      return new Proxy({ '/': root }, {
-        get: (t, k) => (typeof k === 'string' && k.startsWith('/')) ? Object.assign({}, root, { mountpoint: '/', label: '/' }) : t[k],
+  // 3. `$znode.nativelibs.zfile` (Settings -> Data Management disk info + longest-prefix mount `Proxy` + folder copy)
+  {
+    const resolveMountByPath = (disks, key) => {
+      if (typeof key !== 'string') return disks[key];
+      if (Object.prototype.hasOwnProperty.call(disks, key)) return disks[key];
+      if (key[0] !== '/') return disks[key];
+      let best;
+      let bestLen = -1;
+      for (const m of Object.keys(disks)) {
+        const match = m === '/' ? true : (key === m || key.startsWith(m + '/'));
+        if (match && m.length > bestLen) {
+          best = m;
+          bestLen = m.length;
+        }
+      }
+      return best === undefined ? undefined : disks[best];
+    };
+    const normalizeMountEntry = (mp, raw) => {
+      const r = (raw && typeof raw === 'object') ? raw : {};
+      const totalSpace = Number(r.totalSpace != null ? r.totalSpace : (r.total != null ? r.total : (r.size != null ? r.size : 100 * 1024 * 1024 * 1024)));
+      const freeSpace = Number(r.freeSpace != null ? r.freeSpace : (r.free != null ? r.free : (r.available != null ? r.available : 50 * 1024 * 1024 * 1024)));
+      return Object.assign({}, r, {
+        label: r.label || mp,
+        mountpoint: r.mountpoint || mp,
+        totalSpace,
+        freeSpace,
+        total: r.total != null ? Number(r.total) : totalSpace,
+        free: r.free != null ? Number(r.free) : freeSpace,
       });
-    },
-    copyFolder: (src, dst, cb) => callAsync('$znode.nativelibs.zfileAddon.copyFolder', [String(src || ''), String(dst || '')]).then((r) => {
-      if (typeof cb === 'function') cb(null, r);
-      return r;
-    }),
-    cancelCopy: () => callAsync('$znode.nativelibs.zfileAddon.cancelCopy', []),
-  });
+    };
+    const fetchDiskProxy = async (p) => {
+      if (typeof window.__olazFetchDiskMapProxy === 'function') {
+        return window.__olazFetchDiskMapProxy(p);
+      }
+      let raw = null;
+      try {
+        const addon = window.$znode && window.$znode.nativelibs && window.$znode.nativelibs.zfileAddon;
+        if (addon && typeof addon.getDiskInfo === 'function') {
+          raw = p !== undefined ? await addon.getDiskInfo(String(p)) : await addon.getDiskInfo();
+        } else {
+          raw = await callAsync('$znode.nativelibs.zfileAddon.getDiskInfo', p !== undefined ? [String(p)] : []);
+        }
+      } catch {}
+      const disks = {};
+      if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        const mountKeys = Object.keys(raw).filter((k) => raw[k] && typeof raw[k] === 'object' && !Array.isArray(raw[k]));
+        if (mountKeys.length > 0) {
+          for (const k of mountKeys) disks[k] = normalizeMountEntry(k, raw[k]);
+        } else if (raw.total != null || raw.totalSpace != null || raw.free != null || raw.freeSpace != null) {
+          disks['/'] = normalizeMountEntry('/', raw);
+        }
+      }
+      if (Object.keys(disks).length === 0) {
+        const u = safe(() => sync('$znode.nativelibs.fileUtilsAddon.getDiskUsage', ['/']), null) || {};
+        disks['/'] = normalizeMountEntry('/', u);
+      }
+      return new Proxy(disks, {
+        get(target, key) {
+          if (typeof key === 'symbol') return target[key];
+          return resolveMountByPath(target, key);
+        },
+      });
+    };
+    local['$znode.nativelibs.zfile'] = () => ({
+      canRead: (p) => safe(() => sync('$znode.nativelibs.zfileAddon.canRead', [String(p)]), true),
+      canWrite: (p) => safe(() => sync('$znode.nativelibs.zfileAddon.canWrite', [String(p)]), true),
+      canReadAndWrite: (p) => safe(() => sync('$znode.nativelibs.zfileAddon.canReadAndWrite', [String(p)]), true),
+      getInfo: (p) => callAsync('$znode.nativelibs.zfileAddon.getInfo', [String(p || '/')]),
+      getDiskInfo: (p) => fetchDiskProxy(p),
+      diskInfo: () => fetchDiskProxy(),
+      copyFolder: (src, dst, cb) => callAsync('$znode.nativelibs.zfileAddon.copyFolder', [String(src || ''), String(dst || '')]).then((r) => {
+        if (typeof cb === 'function') cb(null, r);
+        return r;
+      }),
+      cancelCopy: () => callAsync('$znode.nativelibs.zfileAddon.cancelCopy', []),
+    });
+  }
 
   // 3b. `$znode.url.format`, `$znode.util`, `$znode.diskSpace`
   if (local['$znode.url'] && typeof local['$znode.url'].format !== 'function') {
@@ -1696,7 +2146,169 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
         orientation = 1 + readBits(3);
       }
     } catch {}
-    return { width, height, orientation };
+    return { width, height, orientation, status_code: 1 };
+  };
+  const readMediaInputBytes = async (payload) => {
+    const p = payload || {};
+    const src = p.input !== undefined ? p.input
+      : (p.buffer !== undefined ? p.buffer
+        : (p.localPath !== undefined ? p.localPath
+          : (p.path !== undefined ? p.path : p.src)));
+    if (typeof src === 'string' && src) {
+      const ab = await callAsync('$zFileManager.getFileArrayBuffer', [src]);
+      return denoiseZaloU8(ab);
+    }
+    return denoiseZaloU8(src);
+  };
+  const decodeBytesToBitmap = async (srcU8) => {
+    if (!srcU8 || !srcU8.byteLength || typeof document === 'undefined' || typeof document.createElement !== 'function') {
+      return null;
+    }
+    const blob = new Blob([srcU8]);
+    if (typeof createImageBitmap === 'function') {
+      return await createImageBitmap(blob);
+    }
+    if (typeof Image === 'function' && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+      return await new Promise((res, rej) => {
+        const img = new Image();
+        const url = URL.createObjectURL(blob);
+        img.onload = () => { URL.revokeObjectURL(url); res(img); };
+        img.onerror = (e) => { URL.revokeObjectURL(url); rej(e); };
+        img.src = url;
+      });
+    }
+    return null;
+  };
+  const renderBitmapToBytes = async (bmp, targetW, targetH, mime, quality) => {
+    const sw = bmp.width || 1, sh = bmp.height || 1;
+    const tw = Number(targetW) > 0 ? Number(targetW) : sw;
+    const th = Number(targetH) > 0 ? Number(targetH) : sh;
+    const scale = Math.min(1, tw / sw, th / sh);
+    const dw = Math.max(1, Math.round(sw * scale));
+    const dh = Math.max(1, Math.round(sh * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = dw;
+    canvas.height = dh;
+    canvas.getContext('2d').drawImage(bmp, 0, 0, dw, dh);
+    const rawQ = Number(quality);
+    const q = Math.max(0.1, Math.min(1, Number.isFinite(rawQ) && rawQ > 0 ? (rawQ > 1 ? rawQ / 100 : rawQ) : 0.85));
+    const outBlob = await new Promise((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error('canvas.toBlob null'))), mime || 'image/jpeg', q));
+    const bytes = new Uint8Array(await outBlob.arrayBuffer());
+    return { bytes, width: dw, height: dh };
+  };
+  const executeJxlMediaTask = async (taskType, payload) => {
+    const p = payload || {};
+    if (typeof window.__olazUtilityJxlHandler === 'function') {
+      const delegated = await window.__olazUtilityJxlHandler(taskType, p);
+      if (delegated !== undefined) return delegated;
+    }
+    const srcU8 = await safe(() => readMediaInputBytes(p), Promise.resolve(new Uint8Array(0))).catch(() => new Uint8Array(0));
+    const info = safe(() => parseJxlInfo(srcU8), { width: Number(p.width) || 0, height: Number(p.height) || 0, orientation: 1, status_code: 0 });
+    const mime = p.outputFormat === 'image/png' || p.outputFormat === 'png' ? 'image/png' : 'image/jpeg';
+
+    if (taskType === 'ENCODE_JXL') {
+      try {
+        const w = Number(p.width) || 0;
+        const h = Number(p.height) || 0;
+        if (w > 0 && h > 0 && srcU8.byteLength >= w * h * 3 && typeof document !== 'undefined' && typeof document.createElement === 'function') {
+          const canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          const rgba = new Uint8ClampedArray(w * h * 4);
+          const ch = srcU8.byteLength >= w * h * 4 ? 4 : 3;
+          for (let i = 0, px = w * h; i < px; i++) {
+            rgba[i * 4] = srcU8[i * ch];
+            rgba[i * 4 + 1] = srcU8[i * ch + 1];
+            rgba[i * 4 + 2] = srcU8[i * ch + 2];
+            rgba[i * 4 + 3] = ch === 4 ? srcU8[i * 4 + 3] : 255;
+          }
+          if (typeof ImageData === 'function') {
+            ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
+          } else {
+            const imgData = ctx.createImageData(w, h);
+            imgData.data.set(rgba);
+            ctx.putImageData(imgData, 0, 0);
+          }
+          const outBlob = await new Promise((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error('canvas.toBlob null'))), mime, 0.9));
+          const outBytes = new Uint8Array(await outBlob.arrayBuffer());
+          const dest = p.destinationPath || p.outputPath;
+          if (dest) {
+            await ensureParentDir(dest);
+            await callAsync('$zFileManager.writeBufferToPath', [String(dest), outBytes]);
+          }
+          return { data: outBytes, size: outBytes.byteLength, width: w, height: h, status_code: 1 };
+        }
+        const bmp = await decodeBytesToBitmap(srcU8);
+        if (bmp) {
+          const rendered = await renderBitmapToBytes(bmp, p.width, p.height, mime, p.quality);
+          if (typeof bmp.close === 'function') { try { bmp.close(); } catch {} }
+          const dest = p.destinationPath || p.outputPath;
+          if (dest) {
+            await ensureParentDir(dest);
+            await callAsync('$zFileManager.writeBufferToPath', [String(dest), rendered.bytes]);
+          }
+          return { data: rendered.bytes, size: rendered.bytes.byteLength, width: rendered.width, height: rendered.height, status_code: 1 };
+        }
+      } catch {}
+      return { data: new Uint8Array(0), size: 0, width: info.width, height: info.height, status_code: 0, fallback: true };
+    }
+
+    if (taskType === 'DECODE') {
+      const tasks = Array.isArray(p.tasks) ? p.tasks : (Array.isArray(p.sizes) ? p.sizes : []);
+      try {
+        const bmp = await decodeBytesToBitmap(srcU8);
+        if (bmp) {
+          const outputs = [];
+          const list = tasks.length ? tasks : [{}];
+          for (const t of list) {
+            const tw = Number(t && (t.maxWidth || t.width)) || bmp.width;
+            const th = Number(t && (t.maxHeight || t.height)) || bmp.height;
+            const rendered = await renderBitmapToBytes(bmp, tw, th, mime, p.quality);
+            const outPath = (t && (t.outputPath || t.destinationPath)) ? String(t.outputPath || t.destinationPath) : '';
+            if (outPath) {
+              await ensureParentDir(outPath);
+              await callAsync('$zFileManager.writeBufferToPath', [outPath, rendered.bytes]);
+              outputs.push({ data: undefined, size: rendered.bytes.byteLength, outputPath: outPath, width: rendered.width, height: rendered.height });
+            } else {
+              outputs.push({ data: rendered.bytes, size: rendered.bytes.byteLength, outputPath: '', width: rendered.width, height: rendered.height });
+            }
+          }
+          if (typeof bmp.close === 'function') { try { bmp.close(); } catch {} }
+          return { data: outputs, results: outputs, status_code: 1 };
+        }
+      } catch {}
+      return { data: [], results: [], width: info.width, height: info.height, status_code: 0, fallback: true };
+    }
+
+    // `DECODE_JXL_SINGLE` and `RESIZE_JXL`
+    try {
+      const bmp = await decodeBytesToBitmap(srcU8);
+      if (bmp) {
+        const rendered = await renderBitmapToBytes(bmp, p.width, p.height, mime, p.quality);
+        if (typeof bmp.close === 'function') { try { bmp.close(); } catch {} }
+        const dest = p.destinationPath || p.outputPath;
+        if (dest) {
+          await ensureParentDir(dest);
+          await callAsync('$zFileManager.writeBufferToPath', [String(dest), rendered.bytes]);
+        }
+        return {
+          data: rendered.bytes,
+          size: rendered.bytes.byteLength,
+          width: rendered.width,
+          height: rendered.height,
+          status_code: 1,
+        };
+      }
+    } catch {}
+    return {
+      data: taskType === 'RESIZE_JXL' ? srcU8 : new Uint8Array(0),
+      size: taskType === 'RESIZE_JXL' ? srcU8.byteLength : 0,
+      width: Number(p.width) || info.width,
+      height: Number(p.height) || info.height,
+      status_code: 0,
+      fallback: true,
+    };
   };
   const createUtilityMediaPort = () => {
     const ch = new MessageChannel();
@@ -1714,7 +2326,15 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
         } else if (msg.type === 'RESIZE') {
           result = await executeResizeTask(payload);
         } else if (msg.type === 'GET_JXL_INFO') {
-          result = parseJxlInfo(payload && payload.input);
+          const jxlBytes = await readMediaInputBytes(payload);
+          result = parseJxlInfo(jxlBytes);
+        } else if (
+          msg.type === 'DECODE'
+          || msg.type === 'DECODE_JXL_SINGLE'
+          || msg.type === 'RESIZE_JXL'
+          || msg.type === 'ENCODE_JXL'
+        ) {
+          result = await executeJxlMediaTask(msg.type, payload);
         } else {
           throw new Error('Unsupported utility-process-media task: ' + String(msg.type));
         }
@@ -2562,6 +3182,20 @@ static ZIMG_MOUNT_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("valid Z.d.Image componentDidMount regex")
 });
 
+static VIDEO_THUMB_GATE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"Object\([A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*\)\(\)(\)(?:throw\{error_code:"NOT_SUPPORT"|\{(?:const|var|let)\s+[A-Za-z_$][\w$]*=\{error_code:(?:"NOT_SUPPORT"|[A-Za-z_$][\w$.]*\.NOT_SUPPORT)))"#,
+    )
+    .expect("valid video-thumb NOT_SUPPORT gate regex")
+});
+
+static DRIVE_MIGRATION_FS_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#""ntfs"===((?:[A-Za-z_$][\w$.]*|\([0-9]+,[A-Za-z_$][\w$.]*\)|Object\([A-Za-z_$][\w$.]*\)\(\))\.detectFilesystemSync\((?:[^;{}()]+|\([^;{}()]*\))+\)\.filesystemType\.to(?:Locale)?LowerCase\(\))"#,
+    )
+    .expect("valid DriveMigrationService detectFilesystemSync regex")
+});
+
 /// Applies `vndangkhoa/zalo-linux` renderer patches on-the-fly without altering `getClientType() == 23`:
 /// - Login titlebar `platform:"WIN32"` (`fa-Minus` + `fa-Close`)
 /// - Main `#titleBar` Windows controls (`Lock`, `Minus`, `Maximize`/`Minimize`, `Close`) + `"WIN32"` layout class
@@ -2571,6 +3205,8 @@ static ZIMG_MOUNT_RE: Lazy<Regex> = Lazy::new(|| {
 /// - Incoming call caller name/avatar enrichment (`e._caller`) & chat call-log outcome bubbles
 /// - WASM JXL encode/decode/resize routing + HTML `<canvas>` (`MAIN`) JPEG/PNG resizer routing
 /// - General Settings Linux autostart + "Launch minimized to system tray" toggle (`STR_OLAZ_START_IN_TRAY`)
+/// - Client-side video thumbnail generation flag (`gen_video_thumb:{enable:!0}` + `NOT_SUPPORT` gate bypass)
+/// - Linux filesystem allowlist (`ext4`, `btrfs`, `xfs`, `f2fs`, `zfs`, `ntfs`) in `DriveMigrationService`
 pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
     const FAST_NEEDLES: &[&[u8]] = &[
         b"handlerMinimiseAppWindowOS",
@@ -2593,6 +3229,10 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         b"\"data-z-element-type\":\"image\"",
         b"STR_START_ZALO_WITH_OS",
         b"isAutoLauch",
+        b"gen_video_thumb:{enable:!1",
+        b")throw{error_code:\"NOT_SUPPORT\"",
+        b".NOT_SUPPORT",
+        b"detectFilesystemSync",
     ];
     if !FAST_NEEDLES
         .iter()
@@ -2992,6 +3632,39 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
             .into_owned();
         if step_ui != s {
             s = step_ui;
+            changed = true;
+        }
+    }
+
+    // 15. Force client-side video thumbnail generation (`mp4thumb` / `generateVideoThumbnail`) ON
+    //     and neutralize the `NOT_SUPPORT` remote-config gate (`patch-video-thumb-flag.js`).
+    const VIDEO_THUMB_ANCHOR: &str = "gen_video_thumb:{enable:!1";
+    const VIDEO_THUMB_FORCED: &str = "gen_video_thumb:{enable:!0";
+    if s.contains(VIDEO_THUMB_ANCHOR) {
+        s = s.replace(VIDEO_THUMB_ANCHOR, VIDEO_THUMB_FORCED);
+        changed = true;
+    }
+    if (s.contains(r#")throw{error_code:"NOT_SUPPORT""#) || s.contains(".NOT_SUPPORT"))
+        && VIDEO_THUMB_GATE_RE.is_match(&s)
+    {
+        let next = VIDEO_THUMB_GATE_RE.replace_all(&s, "!0${1}").into_owned();
+        if next != s {
+            s = next;
+            changed = true;
+        }
+    }
+
+    // 16. Allow standard Linux filesystems (`ext4`, `btrfs`, `xfs`, `f2fs`, `zfs`) alongside
+    //     `ntfs` in `DriveMigrationService.filterAvailableDrive`.
+    if s.contains("detectFilesystemSync") && DRIVE_MIGRATION_FS_RE.is_match(&s) {
+        let next = DRIVE_MIGRATION_FS_RE
+            .replace_all(
+                &s,
+                r#"(["ntfs","ext4","btrfs","xfs","f2fs","zfs"].includes(${1}))"#,
+            )
+            .into_owned();
+        if next != s {
+            s = next;
             changed = true;
         }
     }

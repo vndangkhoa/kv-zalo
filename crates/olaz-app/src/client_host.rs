@@ -28,12 +28,13 @@ use soup::{MessageHeaders, MessageHeadersType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use url::Url;
 use webkit2gtk::{
-    AutoplayPolicy, DownloadExt, FileChooserRequest, FileChooserRequestExt,
-    HardwareAccelerationPolicy, LoadEvent, NavigationAction, NavigationPolicyDecision,
-    NavigationPolicyDecisionExt, PolicyDecisionExt, PolicyDecisionType, ResponsePolicyDecision,
-    ResponsePolicyDecisionExt, SecurityManagerExt, Settings, SettingsExt, URIRequestExt,
-    URISchemeRequest, URISchemeRequestExt, URISchemeResponse, URISchemeResponseExt,
-    UserContentInjectedFrames, UserContentManager, UserContentManagerExt, UserScript,
+    AutoplayPolicy, DeviceInfoPermissionRequest, DownloadExt, FileChooserRequest,
+    FileChooserRequestExt, HardwareAccelerationPolicy, LoadEvent, NavigationAction,
+    NavigationPolicyDecision, NavigationPolicyDecisionExt, PermissionRequestExt,
+    PolicyDecisionExt, PolicyDecisionType, ResponsePolicyDecision, ResponsePolicyDecisionExt,
+    SecurityManagerExt, Settings, SettingsExt, URIRequestExt, URISchemeRequest,
+    URISchemeRequestExt, URISchemeResponse, URISchemeResponseExt, UserContentInjectedFrames,
+    UserContentManager, UserContentManagerExt, UserMediaPermissionRequest, UserScript,
     UserScriptInjectionTime, WebContext, WebContextExt, WebView, WebViewExt, WebsiteDataManager,
     WebsitePolicies,
 };
@@ -1783,6 +1784,14 @@ fn wire_ucm_znet_and_zbridge(
 }
 
 fn configure_zalo_policy(webview: &WebView, allow_popups: bool) {
+    webview.connect_permission_request(|_wv, req| {
+        if req.is::<UserMediaPermissionRequest>() || req.is::<DeviceInfoPermissionRequest>() {
+            PermissionRequestExt::allow(req);
+            return true;
+        }
+        false
+    });
+
     webview.connect_decide_policy(move |_, decision, decision_type| {
         if decision_type == PolicyDecisionType::Response {
             if let Ok(resp_decision) = decision.clone().downcast::<ResponsePolicyDecision>() {
@@ -2444,6 +2453,17 @@ impl OfficialClientHost {
         reparent_webview_to(&self.webview, target.upcast_ref::<gtk::Container>());
     }
 
+    /// Reparents `self.webview` back into the mapped `gtk::OffscreenWindow` when the primary
+    /// window hides to the system tray so WebKitGTK never throttles background sync/timers.
+    pub fn unmount_to_offscreen(&self) {
+        reparent_webview_to(
+            &self.webview,
+            self.offscreen_window.upcast_ref::<gtk::Container>(),
+        );
+        self.webview.show();
+        self.offscreen_window.show_all();
+    }
+
     /// Updates the backing `gtk::OffscreenWindow` dimensions so a `--minimized` start-in-tray
     /// launch renders `index.html` at full desktop viewport size before the primary window maps.
     pub fn resize_offscreen(&self, width: i32, height: i32) {
@@ -2655,6 +2675,8 @@ fn build_zalo_webkit_settings(user_agent: &str, direct_ui: bool) -> Settings {
         settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
     }
     settings.set_enable_developer_extras(true);
+    settings.set_enable_media_stream(true);
+    settings.set_enable_mediasource(true);
     settings.set_javascript_can_open_windows_automatically(direct_ui);
     settings.set_media_playback_requires_user_gesture(!direct_ui);
     settings.set_enable_back_forward_navigation_gestures(false);

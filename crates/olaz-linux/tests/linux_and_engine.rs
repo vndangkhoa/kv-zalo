@@ -42,8 +42,10 @@ use olaz_linux::portals::{
     uri_to_local_path,
 };
 use olaz_linux::tray::{
-    render_tray_icon_argb32, render_tray_pixmaps, OlazTray, OlazTrayEvent, LABEL_QUIT,
-    LABEL_SCREENSHOT, LABEL_SHOW_OLAZ,
+    render_tray_icon_argb32, render_tray_pixmaps, OlazTray, OlazTrayEvent, PrivacyField,
+    TrayPrivacyState, LABEL_BLOCK_DELIVERED, LABEL_BLOCK_SEEN, LABEL_BLOCK_TYPING,
+    LABEL_NEW_PROFILE, LABEL_PRIVACY_MENU, LABEL_QUIT, LABEL_SCREENSHOT, LABEL_SHOW_OLAZ,
+    LABEL_STATUS_BUSY, LABEL_STATUS_MENU, LABEL_STATUS_ONLINE,
 };
 
 // ============================================================================
@@ -642,8 +644,12 @@ fn tray_icon_argb32_pixmaps_and_menu_actions() {
 
     tray.activate(10, 10);
 
+    assert_eq!(tray.online_busy_index(), 0);
+    assert_eq!(tray.privacy_state(), TrayPrivacyState::default());
+
     let mut menu = tray.menu();
-    assert_eq!(menu.len(), 5); // Show, Status submenu, Screenshot, Separator, Quit
+    // Show, Status submenu, Privacy submenu, Screenshot, New Profile, Separator, Quit
+    assert_eq!(menu.len(), 7);
 
     let mut labels = Vec::new();
     for item in &mut menu {
@@ -652,12 +658,44 @@ fn tray_icon_argb32_pixmaps_and_menu_actions() {
                 labels.push(std_item.label.clone());
                 (std_item.activate)(&mut tray);
             }
-            MenuItem::SubMenu(sub) => {
+            MenuItem::SubMenu(sub) if sub.label == LABEL_STATUS_MENU => {
+                assert_eq!(sub.icon_name, "user-available-symbolic");
+                assert_eq!(sub.submenu.len(), 1);
+                match &mut sub.submenu[0] {
+                    MenuItem::RadioGroup(radio) => {
+                        assert_eq!(radio.selected, 0);
+                        assert_eq!(radio.options.len(), 2);
+                        assert_eq!(radio.options[0].label, LABEL_STATUS_ONLINE);
+                        assert_eq!(radio.options[1].label, LABEL_STATUS_BUSY);
+                        (radio.select)(&mut tray, 1);
+                        assert_eq!(tray.online_busy_index(), 1);
+                        (radio.select)(&mut tray, 0);
+                        assert_eq!(tray.online_busy_index(), 0);
+                    }
+                    other => panic!("expected RadioGroup in Status submenu, got {other:?}"),
+                }
+            }
+            MenuItem::SubMenu(sub) if sub.label == LABEL_PRIVACY_MENU => {
+                assert_eq!(sub.submenu.len(), 3);
+                let mut check_labels = Vec::new();
                 for sub_item in &mut sub.submenu {
-                    if let MenuItem::Standard(std_sub) = sub_item {
-                        (std_sub.activate)(&mut tray);
+                    match sub_item {
+                        MenuItem::Checkmark(chk) => {
+                            assert!(!chk.checked);
+                            check_labels.push(chk.label.clone());
+                            (chk.activate)(&mut tray);
+                        }
+                        other => panic!("expected CheckmarkItem in Privacy submenu, got {other:?}"),
                     }
                 }
+                assert_eq!(
+                    check_labels,
+                    vec![
+                        LABEL_BLOCK_TYPING.to_string(),
+                        LABEL_BLOCK_SEEN.to_string(),
+                        LABEL_BLOCK_DELIVERED.to_string(),
+                    ]
+                );
             }
             _ => {}
         }
@@ -667,18 +705,80 @@ fn tray_icon_argb32_pixmaps_and_menu_actions() {
         vec![
             LABEL_SHOW_OLAZ.to_string(),
             LABEL_SCREENSHOT.to_string(),
+            LABEL_NEW_PROFILE.to_string(),
             LABEL_QUIT.to_string(),
         ]
     );
 
+    // Verify updated menu reflects privacy checkmarks and busy radio selection.
+    assert_eq!(
+        tray.privacy_state(),
+        TrayPrivacyState {
+            block_typing: true,
+            block_seen: true,
+            block_delivered: true,
+        }
+    );
+    tray.set_online_busy_index(1);
+    let refreshed_menu = tray.menu();
+    match &refreshed_menu[1] {
+        MenuItem::SubMenu(sub) => {
+            assert_eq!(sub.icon_name, "user-busy-symbolic");
+            match &sub.submenu[0] {
+                MenuItem::RadioGroup(radio) => assert_eq!(radio.selected, 1),
+                other => panic!("expected RadioGroup, got {other:?}"),
+            }
+        }
+        other => panic!("expected Status SubMenu, got {other:?}"),
+    }
+    match &refreshed_menu[2] {
+        MenuItem::SubMenu(sub) => {
+            for sub_item in &sub.submenu {
+                match sub_item {
+                    MenuItem::Checkmark(chk) => assert!(chk.checked),
+                    other => panic!("expected CheckmarkItem, got {other:?}"),
+                }
+            }
+        }
+        other => panic!("expected Privacy SubMenu, got {other:?}"),
+    }
+
+    tray.set_privacy_state(TrayPrivacyState {
+        block_typing: false,
+        block_seen: true,
+        block_delivered: false,
+    });
+    assert!(!tray.privacy_state().get(PrivacyField::BlockTyping));
+    assert!(tray.privacy_state().get(PrivacyField::BlockSeen));
+    assert!(!tray.privacy_state().get(PrivacyField::BlockDelivered));
+
     let recorded = events.lock().unwrap().clone();
-    assert_eq!(recorded.len(), 6);
+    assert_eq!(
+        recorded,
+        vec![
+            recorded[0].clone(),
+            recorded[1].clone(),
+            OlazTrayEvent::SetUserStatusBusy,
+            OlazTrayEvent::SetUserStatusOnline,
+            OlazTrayEvent::TogglePrivacy {
+                field: PrivacyField::BlockTyping,
+                enabled: true,
+            },
+            OlazTrayEvent::TogglePrivacy {
+                field: PrivacyField::BlockSeen,
+                enabled: true,
+            },
+            OlazTrayEvent::TogglePrivacy {
+                field: PrivacyField::BlockDelivered,
+                enabled: true,
+            },
+            OlazTrayEvent::Screenshot,
+            OlazTrayEvent::LaunchSecondaryProfile,
+            OlazTrayEvent::Quit,
+        ]
+    );
     assert!(matches!(recorded[0], OlazTrayEvent::ToggleWindow { .. }));
     assert!(matches!(recorded[1], OlazTrayEvent::ShowWindow { .. }));
-    assert_eq!(recorded[2], OlazTrayEvent::SetUserStatusOnline);
-    assert_eq!(recorded[3], OlazTrayEvent::SetUserStatusBusy);
-    assert_eq!(recorded[4], OlazTrayEvent::Screenshot);
-    assert_eq!(recorded[5], OlazTrayEvent::Quit);
 }
 
 // ============================================================================

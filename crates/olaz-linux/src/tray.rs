@@ -6,8 +6,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ksni::menu::{StandardItem, SubMenu};
+use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{Category, Icon, MenuItem, Status, ToolTip, Tray, TrayMethods};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 /// Menu item labels displayed in the StatusNotifierItem DBusMenu.
@@ -15,8 +16,48 @@ pub const LABEL_SHOW_OLAZ: &str = "Mở Zalo / Open Zalo";
 pub const LABEL_STATUS_MENU: &str = "Trạng thái / Status";
 pub const LABEL_STATUS_ONLINE: &str = "Đang hoạt động / Online";
 pub const LABEL_STATUS_BUSY: &str = "Bận / Busy";
+pub const LABEL_PRIVACY_MENU: &str = "Quyền riêng tư";
+pub const LABEL_BLOCK_TYPING: &str = "Chặn trạng thái đang soạn (Block Typing)";
+pub const LABEL_BLOCK_SEEN: &str = "Chặn đã xem (Block Seen)";
+pub const LABEL_BLOCK_DELIVERED: &str = "Chặn đã nhận (Block Delivered)";
 pub const LABEL_SCREENSHOT: &str = "Chụp màn hình / Screenshot";
+pub const LABEL_NEW_PROFILE: &str = "Mở tài khoản khác (New Profile)";
 pub const LABEL_QUIT: &str = "Thoát / Quit";
+
+/// Individual receipt-blocking flag controlled from the Privacy tray submenu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PrivacyField {
+    BlockTyping,
+    BlockSeen,
+    BlockDelivered,
+}
+
+/// Live receipt-blocking configuration synced between the tray menu and `window.__olazPrivacy`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TrayPrivacyState {
+    pub block_typing: bool,
+    pub block_seen: bool,
+    pub block_delivered: bool,
+}
+
+impl TrayPrivacyState {
+    pub fn get(&self, field: PrivacyField) -> bool {
+        match field {
+            PrivacyField::BlockTyping => self.block_typing,
+            PrivacyField::BlockSeen => self.block_seen,
+            PrivacyField::BlockDelivered => self.block_delivered,
+        }
+    }
+
+    pub fn set(&mut self, field: PrivacyField, enabled: bool) {
+        match field {
+            PrivacyField::BlockTyping => self.block_typing = enabled,
+            PrivacyField::BlockSeen => self.block_seen = enabled,
+            PrivacyField::BlockDelivered => self.block_delivered = enabled,
+        }
+    }
+}
 
 /// Events emitted by the Olaz StatusNotifierItem tray.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,8 +70,12 @@ pub enum OlazTrayEvent {
     SetUserStatusOnline,
     /// Switch Zalo user presence to Busy (`change-user-mode-busy`).
     SetUserStatusBusy,
+    /// Toggle a live privacy receipt blocker (`window.__olazSetPrivacy`).
+    TogglePrivacy { field: PrivacyField, enabled: bool },
     /// "Chụp màn hình / Screenshot" menu action.
     Screenshot,
+    /// "Mở tài khoản khác (New Profile)" menu action.
+    LaunchSecondaryProfile,
     /// "Thoát / Quit" menu action.
     Quit,
 }
@@ -157,6 +202,8 @@ pub fn render_tray_pixmaps(has_unread: bool) -> Vec<Icon> {
 /// `ksni::Tray` implementation for Olaz.
 pub struct OlazTray {
     unread_count: u64,
+    online_busy_index: usize,
+    privacy_state: TrayPrivacyState,
     on_event: Arc<dyn Fn(OlazTrayEvent) + Send + Sync + 'static>,
 }
 
@@ -164,6 +211,8 @@ impl OlazTray {
     pub fn new(on_event: impl Fn(OlazTrayEvent) + Send + Sync + 'static) -> Self {
         Self {
             unread_count: 0,
+            online_busy_index: 0,
+            privacy_state: TrayPrivacyState::default(),
             on_event: Arc::new(on_event),
         }
     }
@@ -178,6 +227,23 @@ impl OlazTray {
 
     pub fn set_unread_count(&mut self, count: u64) {
         self.unread_count = count;
+    }
+
+    /// Active presence radio index (`0` = Online, `1` = Busy/DND).
+    pub fn online_busy_index(&self) -> usize {
+        self.online_busy_index
+    }
+
+    pub fn set_online_busy_index(&mut self, index: usize) {
+        self.online_busy_index = index.min(1);
+    }
+
+    pub fn privacy_state(&self) -> TrayPrivacyState {
+        self.privacy_state
+    }
+
+    pub fn set_privacy_state(&mut self, state: TrayPrivacyState) {
+        self.privacy_state = state;
     }
 
     fn emit(&self, event: OlazTrayEvent) {
@@ -234,6 +300,11 @@ impl Tray for OlazTray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
+        let status_icon = if self.online_busy_index == 0 {
+            "user-available-symbolic"
+        } else {
+            "user-busy-symbolic"
+        };
         vec![
             StandardItem {
                 label: LABEL_SHOW_OLAZ.to_string(),
@@ -249,22 +320,77 @@ impl Tray for OlazTray {
             .into(),
             SubMenu {
                 label: LABEL_STATUS_MENU.to_string(),
-                icon_name: "user-available-symbolic".to_string(),
-                submenu: vec![
-                    StandardItem {
-                        label: LABEL_STATUS_ONLINE.to_string(),
-                        icon_name: "user-available-symbolic".to_string(),
-                        activate: Box::new(|tray: &mut Self| {
+                icon_name: status_icon.to_string(),
+                submenu: vec![RadioGroup {
+                    selected: self.online_busy_index.min(1),
+                    select: Box::new(|tray: &mut Self, idx: usize| {
+                        let normalized = idx.min(1);
+                        tray.online_busy_index = normalized;
+                        if normalized == 0 {
                             tray.emit(OlazTrayEvent::SetUserStatusOnline);
+                        } else {
+                            tray.emit(OlazTrayEvent::SetUserStatusBusy);
+                        }
+                    }),
+                    options: vec![
+                        RadioItem {
+                            label: LABEL_STATUS_ONLINE.to_string(),
+                            icon_name: "user-available-symbolic".to_string(),
+                            ..Default::default()
+                        },
+                        RadioItem {
+                            label: LABEL_STATUS_BUSY.to_string(),
+                            icon_name: "user-busy-symbolic".to_string(),
+                            ..Default::default()
+                        },
+                    ],
+                }
+                .into()],
+                ..Default::default()
+            }
+            .into(),
+            SubMenu {
+                label: LABEL_PRIVACY_MENU.to_string(),
+                icon_name: "security-high-symbolic".to_string(),
+                submenu: vec![
+                    CheckmarkItem {
+                        label: LABEL_BLOCK_TYPING.to_string(),
+                        checked: self.privacy_state.block_typing,
+                        activate: Box::new(|tray: &mut Self| {
+                            let next = !tray.privacy_state.block_typing;
+                            tray.privacy_state.block_typing = next;
+                            tray.emit(OlazTrayEvent::TogglePrivacy {
+                                field: PrivacyField::BlockTyping,
+                                enabled: next,
+                            });
                         }),
                         ..Default::default()
                     }
                     .into(),
-                    StandardItem {
-                        label: LABEL_STATUS_BUSY.to_string(),
-                        icon_name: "user-busy-symbolic".to_string(),
+                    CheckmarkItem {
+                        label: LABEL_BLOCK_SEEN.to_string(),
+                        checked: self.privacy_state.block_seen,
                         activate: Box::new(|tray: &mut Self| {
-                            tray.emit(OlazTrayEvent::SetUserStatusBusy);
+                            let next = !tray.privacy_state.block_seen;
+                            tray.privacy_state.block_seen = next;
+                            tray.emit(OlazTrayEvent::TogglePrivacy {
+                                field: PrivacyField::BlockSeen,
+                                enabled: next,
+                            });
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                    CheckmarkItem {
+                        label: LABEL_BLOCK_DELIVERED.to_string(),
+                        checked: self.privacy_state.block_delivered,
+                        activate: Box::new(|tray: &mut Self| {
+                            let next = !tray.privacy_state.block_delivered;
+                            tray.privacy_state.block_delivered = next;
+                            tray.emit(OlazTrayEvent::TogglePrivacy {
+                                field: PrivacyField::BlockDelivered,
+                                enabled: next,
+                            });
                         }),
                         ..Default::default()
                     }
@@ -278,6 +404,15 @@ impl Tray for OlazTray {
                 icon_name: "applets-screenshooter-symbolic".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     tray.emit(OlazTrayEvent::Screenshot);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: LABEL_NEW_PROFILE.to_string(),
+                icon_name: "contact-new-symbolic".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    tray.emit(OlazTrayEvent::LaunchSecondaryProfile);
                 }),
                 ..Default::default()
             }
@@ -316,6 +451,26 @@ impl OlazTrayHandle {
     /// Toggles the unread dot directly as a boolean (`1` vs `0` when count is binary).
     pub async fn set_has_unread(&self, has_unread: bool) {
         self.set_unread_count(u64::from(has_unread)).await;
+    }
+
+    /// Updates the active presence radio selection (`0` = Online, `1` = Busy/DND) over D-Bus.
+    pub async fn set_online_busy_index(&self, index: usize) {
+        let _ = self
+            .inner
+            .update(move |tray| {
+                tray.set_online_busy_index(index);
+            })
+            .await;
+    }
+
+    /// Updates the Privacy submenu checkmarks over D-Bus.
+    pub async fn set_privacy_state(&self, state: TrayPrivacyState) {
+        let _ = self
+            .inner
+            .update(move |tray| {
+                tray.set_privacy_state(state);
+            })
+            .await;
     }
 
     /// Cleanly unregisters and shuts down the StatusNotifierItem service.
