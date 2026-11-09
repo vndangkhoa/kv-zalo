@@ -1836,6 +1836,10 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
     let mut hit_autostart_ui = false;
     let mut hit_autostart_lang_en = false;
     let mut hit_autostart_lang_vi = false;
+    let mut hit_video_thumb_flag = false;
+    let mut hit_video_thumb_gate = false;
+    let mut raw_had_ntfs_fs_check = false;
+    let mut hit_drive_migration_fs = false;
     let mut hit_html_csp = 0usize;
     let mut preserved_client_type_23 = false;
     let mut patched_files = 0usize;
@@ -1872,6 +1876,9 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
         if let Ok(raw_s) = std::str::from_utf8(&raw) {
             if raw_s.contains("getClientType(){return 23}") {
                 preserved_client_type_23 = true;
+            }
+            if raw_s.contains("detectFilesystemSync(") && raw_s.contains(r#""ntfs"==="#) {
+                raw_had_ntfs_fs_check = true;
             }
         }
         let Some(patched) = patch_asar_bundle(path, &raw) else {
@@ -1948,6 +1955,17 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
         if s.contains(r#""STR_OLAZ_START_IN_TRAY":"Khởi động thu nhỏ dưới khay hệ thống""#) {
             hit_autostart_lang_vi = true;
         }
+        if s.contains("gen_video_thumb:{enable:!0") {
+            hit_video_thumb_flag = true;
+        }
+        if s.contains(r#"!0)throw{error_code:"NOT_SUPPORT""#)
+            || (s.contains("genVideoThumbFromFile(") && s.contains("if(!!0){const ") && s.contains(".NOT_SUPPORT"))
+        {
+            hit_video_thumb_gate = true;
+        }
+        if s.contains(r#"["ntfs","ext4","btrfs","xfs","f2fs","zfs"].includes("#) {
+            hit_drive_migration_fs = true;
+        }
         if !path.contains("dal-worker.") && !path.contains("sync-v2-sub-worker.") {
             assert!(
                 patch_zalo_linux_renderer_bundle(&patched).is_none(),
@@ -1990,6 +2008,11 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
     assert!(hit_autostart_ui, "Expected General Settings autostart + start-in-tray UI patch to match live app.asar");
     assert!(hit_autostart_lang_en, "Expected STR_OLAZ_START_IN_TRAY English translation in live app.asar");
     assert!(hit_autostart_lang_vi, "Expected STR_OLAZ_START_IN_TRAY Vietnamese translation in live app.asar");
+    assert!(hit_video_thumb_flag, "Expected gen_video_thumb:{{enable:!0 patch to match live app.asar");
+    assert!(hit_video_thumb_gate, "Expected genVideoThumbFromFile NOT_SUPPORT gate patch to match live app.asar");
+    if raw_had_ntfs_fs_check {
+        assert!(hit_drive_migration_fs, "Expected DriveMigrationService Linux filesystem patch to match live app.asar");
+    }
 }
 
 #[test]
@@ -2972,3 +2995,439 @@ globalThis.webkit = {{
     assert_eq!(res["partHex"], "ffd8ffe0");
     assert_eq!(res["sliceCheckNoise"], true);
 }
+
+#[test]
+fn video_thumb_flag_and_drive_migration_filesystem_patches_work_and_are_idempotent() {
+    let synthetic = br#"const cfg={zalo_cloud:{z_cloud:{feats:{gen_video_thumb:{enable:!1,timeout:5e3}}}}};async function genVideoThumbFromFile(e){if(!Object(J.l)())throw{error_code:"NOT_SUPPORT",message:"Version not support"};return e}class DriveMigrationService{filterAvailableDrive(e,t){return"ntfs"===t.detectFilesystemSync(e).filesystemType.toLocaleLowerCase()}}"#;
+    let patched = patch_zalo_linux_renderer_bundle(synthetic)
+        .expect("video-thumb + DriveMigrationService patch must match");
+    let patched_str = std::str::from_utf8(&patched).unwrap();
+    assert!(patched_str.contains("gen_video_thumb:{enable:!0"));
+    assert!(patched_str.contains(r#"if(!!0)throw{error_code:"NOT_SUPPORT""#));
+    assert!(patched_str.contains(r#"(["ntfs","ext4","btrfs","xfs","f2fs","zfs"].includes(t.detectFilesystemSync(e).filesystemType.toLocaleLowerCase()))"#));
+    assert!(
+        patch_zalo_linux_renderer_bundle(&patched).is_none(),
+        "video-thumb + DriveMigrationService patches must be idempotent"
+    );
+
+    let js = format!(
+        r#"
+(async () => {{
+  const J = {{ l: () => false }};
+  {patched_str}
+  const thumbOut = await genVideoThumbFromFile('/tmp/clip.mp4');
+  const svc = new DriveMigrationService();
+  const fsHelper = (fsType) => ({{
+    detectFilesystemSync: (_p) => ({{ filesystemType: fsType }}),
+  }});
+  const allowed = ['NTFS', 'ext4', 'BTRFS', 'xfs', 'f2fs', 'ZFS'].map((f) => svc.filterAvailableDrive('/mnt', fsHelper(f)));
+  const rejected = ['vfat', 'tmpfs', 'overlay'].map((f) => svc.filterAvailableDrive('/mnt', fsHelper(f)));
+  console.log(JSON.stringify({{
+    cfgEnable: cfg.zalo_cloud.z_cloud.feats.gen_video_thumb.enable,
+    thumbOut,
+    allowed,
+    rejected,
+  }}));
+  process.exit(0);
+}})();
+"#
+    );
+    let res = run_node_json(&js);
+    assert_eq!(res["cfgEnable"], true);
+    assert_eq!(res["thumbOut"], "/tmp/clip.mp4");
+    assert_eq!(res["allowed"], json!([true, true, true, true, true, true]));
+    assert_eq!(res["rejected"], json!([false, false, false]));
+}
+
+#[test]
+fn preload_file_utilities_dbutils_zfile_longest_prefix_and_clipboard_jpeg_work_in_node() {
+    let tmp = TempDir::new().unwrap();
+    let platform = ZaloPlatform::with_root(tmp.path(), "26.10.20");
+
+    // 1. Verify `bridge_spec_script` registers all sync and async addon members.
+    let spec_js = bridge_spec_script(&platform);
+    let json_str = spec_js
+        .strip_prefix("window.__zaloBridgeSpec = ")
+        .and_then(|s| s.strip_suffix(';'))
+        .unwrap();
+    let spec: Value = serde_json::from_str(json_str).unwrap();
+    for sync_path in [
+        "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeSync",
+        "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeTreeSync",
+        "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeByGlobSync",
+        "$znode.nativelibs.fileUtilitiesAddon.detectHardlinksSync",
+        "$znode.nativelibs.fileUtilitiesAddon.detectFilesystemSync",
+        "$znode.nativelibs.fileUtilitiesAddon.cancelJob",
+        "$znode.nativelibs.dbUtilsAddon.decompressAndDecryptDb_V2",
+        "$znode.nativelibs.dbUtilsAddon.decompressAndDecryptDb",
+        "$znode.nativelibs.dbUtilsAddon.parseBinNet",
+    ] {
+        assert_eq!(
+            spec["members"][sync_path],
+            json!("sync"),
+            "missing sync member {sync_path}"
+        );
+    }
+    for async_path in [
+        "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeAsync",
+        "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeTreeAsync",
+        "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeByGlobAsync",
+        "$znode.nativelibs.fileUtilitiesAddon.detectHardlinksAsync",
+        "$znode.nativelibs.fileUtilitiesAddon.detectFilesystemAsync",
+    ] {
+        assert_eq!(
+            spec["members"][async_path],
+            json!("async"),
+            "missing async member {async_path}"
+        );
+    }
+
+    let scripts = olaz_core::direct_ui_user_scripts(&platform, false);
+    let find_script = |name: &str| -> String {
+        scripts
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_else(|| panic!("missing script {name}"))
+    };
+
+    // 2. Run Node harness verifying:
+    //    - `fileUtilitiesAddon` sync + async + `AbortSignal` -> `jobId` (3rd arg) + `cancelJob(jobId)`
+    //    - `dbUtilsAddon.decompressAndDecryptDb_V2` stripping 4th `progressCallback` function arg and invoking `cb(null, 100)` when `result === 0`
+    //    - `dbUtilsAddon.parseBinNet` converting `Uint8Array` / `ArrayBuffer` into numeric `Array` for `olaz-fs-sync`
+    //    - `zfile.diskInfo()` & `zfile.getDiskInfo()` longest-prefix mount `Proxy` + `Object.keys(disks)`
+    //    - `$zelectronNative.getClipboardImage().toJPEG(quality)` via `olaz-clipboard-image-jpeg` + fallback to PNG bytes when `null`
+    let script = format!(
+        r#"
+(async () => {{
+  const syncCalls = [];
+  const asyncCalls = [];
+  let clipJpegMode = 'jpeg';
+  const pngClipBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x01, 0x02]);
+  const jpgClipBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0xaa, 0xbb, 0xff, 0xd9]);
+
+  globalThis.window = globalThis;
+  globalThis.location = {{ protocol: 'zalo-app:', href: 'zalo-app://local/login.html', pathname: '/login.html' }};
+  globalThis.document = {{ readyState: 'complete', addEventListener() {{}} }};
+  globalThis.addEventListener = () => {{}};
+  globalThis.__zaloNativeXHR = class {{
+    open(_m, _u) {{}}
+    send(body) {{
+      const req = JSON.parse(body);
+      syncCalls.push(req);
+      if (req.path === '$zelectronNative.clipboardImagePng') {{
+        this.responseText = JSON.stringify({{ value: {{ __bytes: pngClipBytes.toString('base64') }} }});
+        return;
+      }}
+      if (req.channel === 'olaz-clipboard-image-jpeg') {{
+        if (clipJpegMode === 'jpeg') {{
+          this.responseText = JSON.stringify({{ value: {{ __bytes: jpgClipBytes.toString('base64') }} }});
+        }} else {{
+          this.responseText = JSON.stringify({{ value: null }});
+        }}
+        return;
+      }}
+      if (req.channel === 'olaz-fs-sync') {{
+        const [method, ...rest] = req.args;
+        if (method === 'detectFilesystemSync') {{
+          this.responseText = JSON.stringify({{ value: {{ filesystemType: 'ext4', path: rest[0] }} }});
+        }} else if (method === 'cancelJob') {{
+          this.responseText = JSON.stringify({{ value: true }});
+        }} else if (method === 'decompressAndDecryptDb_V2') {{
+          this.responseText = JSON.stringify({{ value: {{ result: 0, argsCount: rest.length }} }});
+        }} else if (method === 'parseBinNet') {{
+          this.responseText = JSON.stringify({{ value: {{ ok: true, isArray: Array.isArray(rest[0]), bytes: rest[0] }} }});
+        }} else {{
+          this.responseText = JSON.stringify({{ value: {{ method, rest }} }});
+        }}
+        return;
+      }}
+      // Unhandled `path` returns `__undefined: true` so addon sync helper falls back to `olaz-fs-sync`.
+      this.responseText = JSON.stringify({{ value: {{ __undefined: true }} }});
+    }}
+  }};
+  globalThis.webkit = {{
+    messageHandlers: {{
+      zlog: {{ postMessage() {{}} }},
+      zstate: {{ postMessage() {{}} }},
+      __olaz_win_drag: {{ postMessage() {{}} }},
+      zbridge: {{
+        postMessage(msg) {{
+          asyncCalls.push(msg);
+          if (msg.kind === 'call' && msg.path === '$znode.nativelibs.zfileAddon.getDiskInfo') {{
+            return Promise.resolve({{
+              '/': {{ label: 'Root', mountpoint: '/', totalSpace: 500e9, freeSpace: 200e9 }},
+              '/home': {{ label: 'Home', mountpoint: '/home', totalSpace: 1000e9, freeSpace: 600e9 }},
+              '/home/khoavo/mnt': {{ label: 'Data', mountpoint: '/home/khoavo/mnt', totalSpace: 2000e9, freeSpace: 1500e9 }},
+            }});
+          }}
+          if (msg.kind === 'call' && msg.path.startsWith('$znode.nativelibs.fileUtilitiesAddon.')) {{
+            return new Promise((resolve) => setTimeout(() => resolve({{ totalSize: 4096, fileCount: 3, args: msg.args }}), 20));
+          }}
+          return Promise.resolve(null);
+        }},
+      }},
+    }},
+  }};
+
+  {bridge_spec}
+  {local_modules}
+  {direct_ui}
+  {bridge_js}
+
+  // A. `fileUtilities` sync + async AbortSignal -> cancelJob(jobId)
+  const fu = window.$znode.nativelibs.fileUtilities();
+  const fsInfo = fu.detectFilesystemSync('/home/khoavo');
+  const ac = new AbortController();
+  const dirSizePromise = fu.getDirectorySizeAsync('/home/khoavo/Zalo', {{ workers: 2, signal: ac.signal }});
+  ac.abort();
+  const dirSizeRes = await dirSizePromise;
+  const cancelCalls = syncCalls.filter((c) => c.channel === 'olaz-fs-sync' && c.args[0] === 'cancelJob');
+
+  // B. `dbUtils` decompressAndDecryptDb_V2 + parseBinNet
+  const db = window.$znode.nativelibs.dbUtils();
+  const progressEvents = [];
+  const decRes = db.decompressAndDecryptDb_V2('/tmp/in.db', '/tmp/out.db', 'secret', (err, pct) => {{
+    progressEvents.push([err, pct]);
+  }});
+  const parsedU8 = db.parseBinNet(new Uint8Array([10, 20, 30]));
+  const parsedAb = db.parseBinNet(new Uint8Array([40, 50]).buffer);
+
+  // C. `zfile` longest-prefix mount `Proxy`
+  const zf = window.$znode.nativelibs.zfile();
+  const disks = await zf.diskInfo();
+  const diskKeys = Object.keys(disks);
+  const resolvedRoot = disks['/var/log/syslog'].mountpoint;
+  const resolvedHome = disks['/home/khoavo/.local/share/olaz'].mountpoint;
+  const resolvedNested = disks['/home/khoavo/mnt/projects/zalo'].mountpoint;
+  const resolvedSibling = disks['/home2/other'].mountpoint;
+  const disks2 = await zf.getDiskInfo();
+  const resolvedHome2 = disks2['/home/khoavo/Downloads'].mountpoint;
+
+  // D. Clipboard `toJPEG(quality)` + fallback
+  const clip1 = window.$zelectronNative.getClipboardImage();
+  const jpg72 = Array.from(clip1.toJPEG(72));
+  const jpgDefault = Array.from(clip1.toJPEG());
+  const jpegArgs = syncCalls.filter((c) => c.channel === 'olaz-clipboard-image-jpeg').map((c) => c.args[0]);
+  clipJpegMode = 'null';
+  const clipFallback = Array.from(window.$zelectronNative.getClipboardImage().toJPEG(90));
+
+  console.log(JSON.stringify({{
+    fsType: fsInfo.filesystemType,
+    asyncArgs: dirSizeRes.args,
+    cancelJobArgs: cancelCalls.map((c) => c.args),
+    decRes,
+    progressEvents,
+    parsedU8,
+    parsedAb,
+    diskKeys,
+    resolvedRoot,
+    resolvedHome,
+    resolvedNested,
+    resolvedSibling,
+    resolvedHome2,
+    jpg72,
+    jpgDefault,
+    jpegArgs,
+    clipFallback,
+  }}));
+  process.exit(0);
+}})();
+"#,
+        bridge_spec = find_script("bridge-spec"),
+        local_modules = find_script("local-modules"),
+        direct_ui = find_script("linux-direct-ui"),
+        bridge_js = find_script("bridge"),
+    );
+
+    let res = run_node_json(&script);
+    assert_eq!(res["fsType"], "ext4");
+    assert_eq!(res["asyncArgs"], json!(["/home/khoavo/Zalo", { "workers": 2 }, 1]));
+    assert_eq!(res["cancelJobArgs"], json!([["cancelJob", 1]]));
+    assert_eq!(res["decRes"], json!({ "result": 0, "argsCount": 3 }));
+    assert_eq!(res["progressEvents"], json!([[null, 100]]));
+    assert_eq!(res["parsedU8"], json!({ "ok": true, "isArray": true, "bytes": [10, 20, 30] }));
+    assert_eq!(res["parsedAb"], json!({ "ok": true, "isArray": true, "bytes": [40, 50] }));
+    assert_eq!(res["diskKeys"], json!(["/", "/home", "/home/khoavo/mnt"]));
+    assert_eq!(res["resolvedRoot"], "/");
+    assert_eq!(res["resolvedHome"], "/home");
+    assert_eq!(res["resolvedNested"], "/home/khoavo/mnt");
+    assert_eq!(res["resolvedSibling"], "/");
+    assert_eq!(res["resolvedHome2"], "/home");
+    assert_eq!(res["jpg72"], json!([0xff, 0xd8, 0xff, 0xe0, 0xaa, 0xbb, 0xff, 0xd9]));
+    assert_eq!(res["jpgDefault"], json!([0xff, 0xd8, 0xff, 0xe0, 0xaa, 0xbb, 0xff, 0xd9]));
+    assert_eq!(res["jpegArgs"], json!([72, 85]));
+    assert_eq!(res["clipFallback"], json!([0x89, 0x50, 0x4e, 0x47, 0x01, 0x02]));
+}
+
+#[test]
+fn utility_media_port_jxl_tasks_and_live_privacy_receipt_blocker_work_in_node() {
+    let tmp = TempDir::new().unwrap();
+    let platform = ZaloPlatform::with_root(tmp.path(), "26.10.20");
+    let scripts = olaz_core::direct_ui_user_scripts(&platform, false);
+    let find_script = |name: &str| -> String {
+        scripts
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_else(|| panic!("missing script {name}"))
+    };
+
+    let script = format!(
+        r#"
+(async () => {{
+  const networkHits = [];
+  globalThis.window = globalThis;
+  globalThis.location = {{ protocol: 'zalo-app:', href: 'zalo-app://local/login.html', pathname: '/login.html' }};
+  globalThis.document = {{ readyState: 'complete', addEventListener() {{}} }};
+  globalThis.addEventListener = () => {{}};
+  globalThis.fetch = async (input) => {{
+    const u = typeof input === 'string' ? input : input.url;
+    networkHits.push(['fetch', u]);
+    return new Response(JSON.stringify({{ realNetwork: true, url: u }}), {{ status: 200 }});
+  }};
+  class MockXHR extends EventTarget {{
+    constructor() {{
+      super();
+      this.headers = {{}};
+      this.responseType = '';
+      this.onreadystatechange = null;
+      this.onload = null;
+      this.onloadend = null;
+    }}
+    open(method, url, asyncFlag = true) {{
+      this._m = method;
+      this._u = url;
+      this._a = asyncFlag;
+    }}
+    setRequestHeader(k, v) {{
+      this.headers[k] = v;
+    }}
+    send(_body) {{
+      networkHits.push(['xhr', this._u]);
+      this.status = 200;
+      this.readyState = 4;
+      this.responseText = JSON.stringify({{ realNetwork: true, url: this._u }});
+      this.response = this.responseType === 'json' ? JSON.parse(this.responseText) : this.responseText;
+      if (typeof this.onload === 'function') this.onload({{ type: 'load' }});
+    }}
+  }}
+  globalThis.XMLHttpRequest = MockXHR;
+  globalThis.__zaloNativeXHR = class {{
+    open() {{}}
+    send() {{ this.responseText = JSON.stringify({{ value: null }}); }}
+  }};
+  globalThis.webkit = {{
+    messageHandlers: {{
+      zlog: {{ postMessage() {{}} }},
+      zstate: {{ postMessage() {{}} }},
+      __olaz_win_drag: {{ postMessage() {{}} }},
+      zbridge: {{ postMessage() {{ return Promise.resolve(null); }} }},
+    }},
+  }};
+
+  {bridge_spec}
+  {local_modules}
+  {direct_ui}
+  {bridge_js}
+
+  // 1. Live privacy receipt blocker (`window.__olazPrivacy` & `window.__olazSetPrivacy`)
+  // Initially all false -> requests hit network.
+  await (await window.fetch('https://chat.zalo.me/api/message/typing?zpw_ver=645')).json();
+  window.__olazSetPrivacy({{ blockTyping: true, blockSeen: true, blockDelivered: true }});
+
+  const blockedTyping = await (await window.fetch('https://chat.zalo.me/api/message/typing?zpw_ver=645')).json();
+  const blockedGroupSeen = await (await window.fetch('https://chat.zalo.me/api/group/seen?zpw_ver=645')).json();
+  const allowedSend = await (await window.fetch('https://chat.zalo.me/api/message/sms?zpw_ver=645')).json();
+
+  const xhrDelivered = await new Promise((resolve) => {{
+    const x = new window.XMLHttpRequest();
+    x.responseType = 'json';
+    x.open('POST', 'https://chat.zalo.me/api/group/delivered?zpw_ver=645', true);
+    x.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    x.onload = () => resolve({{ status: x.status, readyState: x.readyState, body: x.response }});
+    x.send('params=abc');
+  }});
+
+  window.__olazSetPrivacy({{ blockSeen: false }});
+  await (await window.fetch('https://chat.zalo.me/api/message/seen?zpw_ver=645')).json();
+
+  // 2. `createUtilityMediaPort` `GET_JXL_INFO` (`status_code: 1`) + `DECODE` / `DECODE_JXL_SINGLE` / `RESIZE_JXL` / `ENCODE_JXL`
+  let deliveredPort = null;
+  window.$zsub.$zMsgChannel.onReceiveTransferredPortV2((ev, payload) => {{
+    deliveredPort = ev.ports[0];
+    window.$zMsgChannel.notifyPortDelivered('main-renderer', 'utility-process-media', 'chan-jxl', payload.channelSessionID);
+  }});
+  await window.$zMsgChannel.requestOpenChannelTo('main-renderer', 'utility-process-media', 'chan-jxl');
+  await new Promise((r) => setTimeout(r, 15));
+  deliveredPort.start();
+
+  const askPort = (id, type, payload) => new Promise((resolve, reject) => {{
+    const h = (ev) => {{
+      const d = ev.data || ev;
+      if (d && d.id === id && d.messageType === 'response') {{
+        deliveredPort.removeEventListener('message', h);
+        d.error ? reject(new Error(JSON.stringify(d.error))) : resolve(d.result);
+      }}
+    }};
+    deliveredPort.addEventListener('message', h);
+    deliveredPort.postMessage({{ id, type, messageType: 'request', params: {{ payload }} }});
+  }});
+
+  // Minimal 8x8 naked JXL codestream: FF 0A + div8=1 (1), h8=0 -> 8px (5 bits=0), ratio=1 (3 bits=1 -> w=h=8), all_default=1 (1 bit=1)
+  const jxl8x8 = new Uint8Array([0xff, 0x0a, 0b01000001, 0b00000010]);
+  const jxlInfo = await askPort(1, 'GET_JXL_INFO', {{ input: jxl8x8 }});
+  const decMulti = await askPort(2, 'DECODE', {{ input: jxl8x8, tasks: [{{ maxWidth: 4, maxHeight: 4 }}] }});
+  const decSingle = await askPort(3, 'DECODE_JXL_SINGLE', {{ input: jxl8x8 }});
+  const resJxl = await askPort(4, 'RESIZE_JXL', {{ input: jxl8x8, width: 4, height: 4 }});
+  const encJxl = await askPort(5, 'ENCODE_JXL', {{ buffer: new Uint8Array(12), width: 2, height: 2 }});
+  deliveredPort.close();
+
+  console.log(JSON.stringify({{
+    networkHits,
+    blockedTyping,
+    blockedGroupSeen,
+    allowedSend,
+    xhrDelivered,
+    jxlInfo,
+    decMultiFallback: Boolean(decMulti && decMulti.status_code !== undefined),
+    decSingleFallback: Boolean(decSingle && decSingle.status_code !== undefined),
+    resJxlWidth: resJxl.width,
+    encJxlFallback: Boolean(encJxl && encJxl.status_code !== undefined),
+  }}));
+  process.exit(0);
+}})();
+"#,
+        bridge_spec = find_script("bridge-spec"),
+        local_modules = find_script("local-modules"),
+        direct_ui = find_script("linux-direct-ui"),
+        bridge_js = find_script("bridge"),
+    );
+
+    let res = run_node_json(&script);
+    assert_eq!(
+        res["networkHits"],
+        json!([
+            ["fetch", "https://chat.zalo.me/api/message/typing?zpw_ver=645"],
+            ["fetch", "https://chat.zalo.me/api/message/sms?zpw_ver=645"],
+            ["fetch", "https://chat.zalo.me/api/message/seen?zpw_ver=645"]
+        ])
+    );
+    let expected_ok = json!({ "error_code": 0, "error_message": "Successful.", "data": "" });
+    assert_eq!(res["blockedTyping"], expected_ok);
+    assert_eq!(res["blockedGroupSeen"], expected_ok);
+    assert_eq!(res["allowedSend"]["realNetwork"], true);
+    assert_eq!(
+        res["xhrDelivered"],
+        json!({ "status": 200, "readyState": 4, "body": expected_ok })
+    );
+    assert_eq!(
+        res["jxlInfo"],
+        json!({ "width": 8, "height": 8, "orientation": 1, "status_code": 1 })
+    );
+    assert_eq!(res["decMultiFallback"], true);
+    assert_eq!(res["decSingleFallback"], true);
+    assert_eq!(res["resJxlWidth"], 4);
+    assert_eq!(res["encJxlFallback"], true);
+}
+

@@ -4,7 +4,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -15,11 +18,12 @@ use gtk::prelude::*;
 use javascriptcore::ValueExt as JscValueExt;
 use olaz_core::{InstallProgress, ZaloPlatform, ZaloRuntimeManager};
 use olaz_linux::{
-    capture_interactive_screenshot, has_gstreamer_audio_sink, load_omarchy_theme, pick_open_files,
-    spawn_omarchy_watcher, spawn_tray, stage_screenshot_file, ComposerDraft, Conversation,
-    DesktopTheme, EnginePhase, FileCard, IncomingVoipCall, InstanceEvent, Mention,
-    NotificationPolicy, OlazTrayEvent, OlazTrayHandle, OmarchyWatcherHandle, WaitingConfirm,
-    ZaloEngineState, LINUX_CALL_UNSUPPORTED_MESSAGE, SCREENSHOT_STAGING_DIR,
+    capture_interactive_screenshot, has_gstreamer_audio_sink, instance_socket_path,
+    load_omarchy_theme, pick_open_files, resolve_olaz_executable_path, spawn_omarchy_watcher,
+    spawn_tray, stage_screenshot_file, ComposerDraft, Conversation, DesktopTheme, EnginePhase,
+    FileCard, IncomingVoipCall, InstanceEvent, Mention, NotificationPolicy, OlazTrayEvent,
+    OlazTrayHandle, OmarchyWatcherHandle, TrayPrivacyState, WaitingConfirm, ZaloEngineState,
+    SCREENSHOT_STAGING_DIR,
 };
 use olaz_net::{serve_local_media_range, MediaLoader, MediaRangeResponse};
 use serde::{Deserialize, Serialize};
@@ -251,12 +255,19 @@ impl UiRuntimeProgress {
     }
 }
 
+/// Minimum width/height allowed when persisting tiled/floating main-window geometry.
+const MIN_MAIN_WINDOW_DIM: i32 = 420;
+
 /// Persisted main-window geometry stored at `<user_data>/olaz-window-state.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SavedWindowState {
     width: i32,
     height: i32,
     maximized: bool,
+    #[serde(default)]
+    pos_x: Option<i32>,
+    #[serde(default)]
+    pos_y: Option<i32>,
 }
 
 impl Default for SavedWindowState {
@@ -265,6 +276,8 @@ impl Default for SavedWindowState {
             width: 1180,
             height: 760,
             maximized: false,
+            pos_x: None,
+            pos_y: None,
         }
     }
 }
@@ -273,8 +286,8 @@ impl SavedWindowState {
     fn load(path: &Path) -> Self {
         if let Ok(bytes) = std::fs::read(path) {
             if let Ok(mut parsed) = serde_json::from_slice::<Self>(&bytes) {
-                parsed.width = parsed.width.max(800);
-                parsed.height = parsed.height.max(560);
+                parsed.width = parsed.width.max(MIN_MAIN_WINDOW_DIM);
+                parsed.height = parsed.height.max(MIN_MAIN_WINDOW_DIM);
                 return parsed;
             }
         }
@@ -285,6 +298,19 @@ impl SavedWindowState {
         if let Ok(bytes) = serde_json::to_vec_pretty(self) {
             let _ = std::fs::write(path, bytes);
         }
+    }
+}
+
+fn load_privacy_state(path: &Path) -> TrayPrivacyState {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<TrayPrivacyState>(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_privacy_state(state: &TrayPrivacyState, path: &Path) {
+    if let Ok(bytes) = serde_json::to_vec_pretty(state) {
+        let _ = std::fs::write(path, bytes);
     }
 }
 
@@ -314,6 +340,10 @@ pub struct OlazAppWindow {
     settings_path: PathBuf,
     saved_win_state: RefCell<SavedWindowState>,
     win_state_path: PathBuf,
+    win_state_save_source: RefCell<Option<glib::SourceId>>,
+    window_size_restored: Cell<bool>,
+    privacy_state: RefCell<TrayPrivacyState>,
+    privacy_path: PathBuf,
     in_login_mode: Cell<bool>,
     desktop_theme: RefCell<DesktopTheme>,
     ui_loaded: Cell<bool>,
@@ -380,6 +410,8 @@ impl OlazAppWindow {
         let settings = UiSettings::load(&settings_path, &initial_theme.language);
         let win_state_path = platform.user_data().join("olaz-window-state.json");
         let saved_win_state = SavedWindowState::load(&win_state_path);
+        let privacy_path = platform.user_data().join("olaz-privacy.json");
+        let initial_privacy = load_privacy_state(&privacy_path);
 
         let ui_context = build_ui_web_context(
             &platform,
@@ -471,6 +503,10 @@ impl OlazAppWindow {
             settings_path,
             saved_win_state: RefCell::new(saved_win_state),
             win_state_path,
+            win_state_save_source: RefCell::new(None),
+            window_size_restored: Cell::new(false),
+            privacy_state: RefCell::new(initial_privacy),
+            privacy_path,
             in_login_mode: Cell::new(false),
             desktop_theme: RefCell::new(initial_theme),
             ui_loaded: Cell::new(false),
@@ -550,7 +586,7 @@ impl OlazAppWindow {
     fn install_window_lifecycle(self: &Rc<Self>) {
         // Close-to-tray when a StatusNotifierItem tray is active; quit cleanly otherwise.
         let app_weak = Rc::downgrade(self);
-        self.window.connect_delete_event(move |win, _| {
+        self.window.connect_delete_event(move |_, _| {
             let Some(app) = app_weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
@@ -561,17 +597,7 @@ impl OlazAppWindow {
                 .as_ref()
                 .is_some_and(|h| !h.is_closed());
             if !app.quitting.get() && has_live_tray {
-                win.hide();
-                app.main_process
-                    .window_state()
-                    .is_visible
-                    .store(false, Ordering::Relaxed);
-                app.host
-                    .bridge()
-                    .send("visibility-change", vec![json!("hide")]);
-                app.host
-                    .bridge()
-                    .send("visibility-change", vec![json!("blur"), json!("1")]);
+                app.hide_to_tray();
                 return glib::Propagation::Stop;
             }
             app.shutdown_and_quit();
@@ -630,10 +656,24 @@ impl OlazAppWindow {
             if let Some(app) = app_weak_cfg.upgrade() {
                 if !app.in_login_mode.get() && !win.is_maximized() {
                     let (w, h) = ev.size();
-                    if w >= 800 && h >= 560 {
-                        let mut st = app.saved_win_state.borrow_mut();
-                        st.width = w as i32;
-                        st.height = h as i32;
+                    let min_dim = MIN_MAIN_WINDOW_DIM as u32;
+                    if w >= min_dim && h >= min_dim {
+                        let (wx, wy) = win.position();
+                        let (x, y) = if wx != 0 || wy != 0 {
+                            (wx, wy)
+                        } else {
+                            ev.position()
+                        };
+                        {
+                            let mut st = app.saved_win_state.borrow_mut();
+                            st.width = w as i32;
+                            st.height = h as i32;
+                            if x != 0 || y != 0 {
+                                st.pos_x = Some(x);
+                                st.pos_y = Some(y);
+                            }
+                        }
+                        app.schedule_debounced_window_state_save();
                     }
                 }
             }
@@ -765,17 +805,7 @@ impl OlazAppWindow {
                             .as_ref()
                             .is_some_and(|h| !h.is_closed());
                         if !app.quitting.get() && has_live_tray {
-                            app.window.hide();
-                            app.main_process
-                                .window_state()
-                                .is_visible
-                                .store(false, Ordering::Relaxed);
-                            app.host
-                                .bridge()
-                                .send("visibility-change", vec![json!("hide")]);
-                            app.host
-                                .bridge()
-                                .send("visibility-change", vec![json!("blur"), json!("1")]);
+                            app.hide_to_tray();
                         } else {
                             app.quitting.set(true);
                             app.shutdown_and_quit();
@@ -799,18 +829,21 @@ impl OlazAppWindow {
                         if focus {
                             app.present_window();
                         } else {
-                            if !app.window.is_visible()
-                                && !app.demo_mode
+                            let was_visible = app.window.is_visible();
+                            if !app.demo_mode
                                 && app.host.is_direct_ui()
                                 && !app.installing_runtime.get()
                             {
                                 app.host.mount_into(&app.zalo_container);
+                                app.host.webview().show();
                                 app.zalo_container.show_all();
                                 app.stack.set_visible_child_name("zalo");
-                                if app.in_login_mode.get() {
-                                    app.apply_login_window_size();
-                                } else {
-                                    app.apply_main_window_size();
+                                if !was_visible {
+                                    if app.in_login_mode.get() {
+                                        app.apply_login_window_size();
+                                    } else {
+                                        app.apply_main_window_size();
+                                    }
                                 }
                             }
                             app.main_process
@@ -938,6 +971,7 @@ impl OlazAppWindow {
                     }
                     PageEvent::FinishedLoading(page) => {
                         app.main_process.page_did_finish_loading(page);
+                        app.sync_privacy_to_webview();
                         if page == HostPage::Main && app.main_process.has_session() {
                             let needs_ready = app.signing_in.get()
                                 || matches!(app.engine_state.borrow().phase, EnginePhase::Booting);
@@ -1197,9 +1231,11 @@ impl OlazAppWindow {
             };
             if let Some(app) = app_weak.upgrade() {
                 let unread = app.engine_state.borrow().total_unread();
+                let initial_privacy = *app.privacy_state.borrow();
                 *app.tray_handle.borrow_mut() = Some(handle.clone());
                 app.tokio_handle.spawn(async move {
                     handle.set_unread_count(unread).await;
+                    handle.set_privacy_state(initial_privacy).await;
                 });
             }
 
@@ -1214,30 +1250,46 @@ impl OlazAppWindow {
                     }
                     OlazTrayEvent::ToggleWindow { .. } => {
                         if app.window.is_visible() && app.window.is_active() {
-                            app.persist_window_geometry();
-                            app.window.hide();
-                            app.main_process
-                                .window_state()
-                                .is_visible
-                                .store(false, Ordering::Relaxed);
-                            app.host
-                                .bridge()
-                                .send("visibility-change", vec![json!("hide")]);
-                            app.host
-                                .bridge()
-                                .send("visibility-change", vec![json!("blur"), json!("1")]);
+                            app.hide_to_tray();
                         } else {
                             app.present_window();
                             app.host.bridge().send("show-from-tray", vec![]);
                         }
                     }
                     OlazTrayEvent::SetUserStatusOnline => {
-                        app.present_window();
+                        // Silent presence toggle: keep the window hidden if hidden in tray!
                         app.host.bridge().send("change-user-mode-online", vec![]);
+                        if let Some(tray) = app.tray_handle.borrow().clone() {
+                            app.tokio_handle.spawn(async move {
+                                tray.set_online_busy_index(0).await;
+                            });
+                        }
                     }
                     OlazTrayEvent::SetUserStatusBusy => {
-                        app.present_window();
+                        // Silent DND/Busy toggle: keep the window hidden if hidden in tray!
                         app.host.bridge().send("change-user-mode-busy", vec![]);
+                        if let Some(tray) = app.tray_handle.borrow().clone() {
+                            app.tokio_handle.spawn(async move {
+                                tray.set_online_busy_index(1).await;
+                            });
+                        }
+                    }
+                    OlazTrayEvent::TogglePrivacy { field, enabled } => {
+                        let next_state = {
+                            let mut st = app.privacy_state.borrow_mut();
+                            st.set(field, enabled);
+                            *st
+                        };
+                        save_privacy_state(&next_state, &app.privacy_path);
+                        app.sync_privacy_to_webview();
+                        if let Some(tray) = app.tray_handle.borrow().clone() {
+                            app.tokio_handle.spawn(async move {
+                                tray.set_privacy_state(next_state).await;
+                            });
+                        }
+                    }
+                    OlazTrayEvent::LaunchSecondaryProfile => {
+                        app.launch_secondary_profile();
                     }
                     OlazTrayEvent::Screenshot => {
                         if app.host.is_direct_ui() {
@@ -1457,17 +1509,30 @@ impl OlazAppWindow {
         }
 
         if self.host.is_direct_ui() {
+            let start_hidden = self.suppress_renderer_auto_show.get();
             if logged_in {
                 let st = self.saved_win_state.borrow().clone();
-                self.host
-                    .resize_offscreen(st.width.max(800), st.height.max(560));
-                self.apply_main_window_size();
+                self.host.resize_offscreen(
+                    st.width.max(MIN_MAIN_WINDOW_DIM),
+                    st.height.max(MIN_MAIN_WINDOW_DIM),
+                );
+                if start_hidden {
+                    self.in_login_mode.set(false);
+                } else {
+                    self.apply_main_window_size();
+                }
             } else {
                 self.host.resize_offscreen(400, 580);
-                self.apply_login_window_size();
+                if start_hidden {
+                    self.in_login_mode.set(true);
+                    self.window_size_restored.set(false);
+                } else {
+                    self.apply_login_window_size();
+                }
             }
-            if !self.suppress_renderer_auto_show.get() {
+            if !start_hidden {
                 self.host.mount_into(&self.zalo_container);
+                self.host.webview().show();
                 self.zalo_container.show_all();
                 self.stack.set_visible_child_name("zalo");
             }
@@ -1683,6 +1748,7 @@ impl OlazAppWindow {
         }
         self.persist_window_geometry();
         self.in_login_mode.set(true);
+        self.window_size_restored.set(false);
         if self.window.is_maximized() {
             self.window.unmaximize();
         }
@@ -1697,23 +1763,69 @@ impl OlazAppWindow {
             return;
         }
         self.in_login_mode.set(false);
+        if self.window_size_restored.replace(true) {
+            return;
+        }
         let st = self.saved_win_state.borrow().clone();
-        let w = st.width.max(800);
-        let h = st.height.max(560);
+        let w = st.width.max(MIN_MAIN_WINDOW_DIM);
+        let h = st.height.max(MIN_MAIN_WINDOW_DIM);
         self.window.set_resizable(true);
-        self.window.set_size_request(800, 560);
+        self.window
+            .set_size_request(MIN_MAIN_WINDOW_DIM, MIN_MAIN_WINDOW_DIM);
         self.window.set_default_size(w, h);
         self.window.resize(w, h);
+        if let (Some(x), Some(y)) = (st.pos_x, st.pos_y) {
+            if x != 0 || y != 0 {
+                self.window.move_(x, y);
+            }
+        }
         if st.maximized {
             self.window.maximize();
         }
     }
 
+    fn schedule_debounced_window_state_save(self: &Rc<Self>) {
+        if let Some(prev) = self.win_state_save_source.borrow_mut().take() {
+            prev.remove();
+        }
+        let app_weak = Rc::downgrade(self);
+        let source_id = glib::timeout_add_local_once(Duration::from_millis(250), move || {
+            if let Some(app) = app_weak.upgrade() {
+                app.win_state_save_source.borrow_mut().take();
+                app.persist_window_geometry();
+            }
+        });
+        *self.win_state_save_source.borrow_mut() = Some(source_id);
+    }
+
     fn persist_window_geometry(&self) {
+        if let Some(pending) = self.win_state_save_source.borrow_mut().take() {
+            pending.remove();
+        }
         if self.demo_mode || self.in_login_mode.get() {
             return;
         }
         self.saved_win_state.borrow().save(&self.win_state_path);
+    }
+
+    fn hide_to_tray(&self) {
+        self.persist_window_geometry();
+        if !self.demo_mode && self.host.is_direct_ui() && !self.installing_runtime.get() {
+            // Keep the Zalo WebView mapped inside `offscreen_window` while hidden in the tray
+            // so WebKit2GTK never throttles WebSocket frames, timers, or IndexedDB writes.
+            self.host.unmount_to_offscreen();
+        }
+        self.window.hide();
+        self.main_process
+            .window_state()
+            .is_visible
+            .store(false, Ordering::Relaxed);
+        self.host
+            .bridge()
+            .send("visibility-change", vec![json!("hide")]);
+        self.host
+            .bridge()
+            .send("visibility-change", vec![json!("blur"), json!("1")]);
     }
 
     pub fn present_window(&self) {
@@ -1722,18 +1834,18 @@ impl OlazAppWindow {
             .window_state()
             .is_visible
             .store(true, Ordering::Relaxed);
-        if !self.window.is_visible()
-            && !self.demo_mode
-            && self.host.is_direct_ui()
-            && !self.installing_runtime.get()
-        {
+        let was_visible = self.window.is_visible();
+        if !self.demo_mode && self.host.is_direct_ui() && !self.installing_runtime.get() {
             self.host.mount_into(&self.zalo_container);
+            self.host.webview().show();
             self.zalo_container.show_all();
             self.stack.set_visible_child_name("zalo");
-            if self.in_login_mode.get() {
-                self.apply_login_window_size();
-            } else {
-                self.apply_main_window_size();
+            if !was_visible {
+                if self.in_login_mode.get() {
+                    self.apply_login_window_size();
+                } else {
+                    self.apply_main_window_size();
+                }
             }
         }
         self.window.show_all();
@@ -1748,6 +1860,60 @@ impl OlazAppWindow {
         self.host
             .bridge()
             .send("visibility-change", vec![json!("focus"), json!("1")]);
+    }
+
+    fn sync_privacy_to_webview(&self) {
+        let state = *self.privacy_state.borrow();
+        if let Ok(cfg_json) = serde_json::to_string(&state) {
+            let js = format!(
+                "if (typeof window.__olazSetPrivacy === 'function') {{ window.__olazSetPrivacy({cfg_json}); }} else {{ window.__olazPrivacy = Object.assign({{ blockTyping: false, blockSeen: false, blockDelivered: false }}, window.__olazPrivacy || {{}}, {cfg_json}); }}"
+            );
+            self.host.webview().evaluate_javascript(
+                &js,
+                None,
+                None,
+                gio::Cancellable::NONE,
+                |_| {},
+            );
+        }
+    }
+
+    fn launch_secondary_profile(&self) {
+        let (data_home, cache_home) = match prepare_secondary_profile_dirs(
+            self.platform.base_dir(),
+            self.platform.runtime_root(),
+        ) {
+            Ok(pair) => pair,
+            Err(err) => {
+                tracing::error!(%err, "failed to prepare isolated secondary profile directories");
+                return;
+            }
+        };
+
+        let exe_path = resolve_olaz_executable_path();
+        match Command::new(&exe_path)
+            .env("XDG_DATA_HOME", &data_home)
+            .env("XDG_CACHE_HOME", &cache_home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                tracing::info!(
+                    pid = child.id(),
+                    xdg_data_home = %data_home.display(),
+                    "launched isolated secondary Olaz profile"
+                );
+            }
+            Err(err) => {
+                tracing::error!(
+                    %err,
+                    exe = %exe_path.display(),
+                    "failed to spawn secondary Olaz profile process"
+                );
+            }
+        }
     }
 
     fn shutdown_and_quit(&self) {
@@ -2082,16 +2248,21 @@ impl OlazAppWindow {
                         "return await window.__zaloConvActions.unhide({cid_json}, {pin_json});"
                     ),
                     "call" | "video_call" => {
-                        return Err(LINUX_CALL_UNSUPPORTED_MESSAGE.to_string());
+                        let is_video = action == "video_call";
+                        format!(
+                            "return window.__zaloCall && typeof window.__zaloCall.start === 'function' ? await window.__zaloCall.start({cid_json}, {is_video}) : false;"
+                        )
                     }
                     _ => return Ok(json!({ "ok": true })),
                 };
 
                 let out = self.eval_host_js(&js).await?;
-                if out.as_bool() == Some(false) {
+                if out.as_bool() == Some(false)
+                    || matches!(out.as_str(), Some("error" | "missing"))
+                {
                     return Err("Thao tác hội thoại không thành công.".to_string());
                 }
-                Ok(json!({ "ok": true }))
+                Ok(json!({ "ok": true, "result": out }))
             }
 
             "set_conv_label" => {
@@ -3809,6 +3980,65 @@ pub fn serialize_chat_message(msg: &olaz_linux::ChatMessage) -> Value {
     })
 }
 
+fn is_instance_socket_alive(sock_path: &Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(sock_path) else {
+        return false;
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    if stream.write_all(b"ping\n").is_err() || stream.flush().is_err() {
+        return false;
+    }
+    let mut reader = BufReader::new(stream);
+    let mut reply = String::new();
+    reader.read_line(&mut reply).is_ok() && reply.trim() == "ok"
+}
+
+fn resolve_profiles_root(base_dir: &Path) -> PathBuf {
+    for ancestor in base_dir.ancestors() {
+        if ancestor.file_name().is_some_and(|n| n == "profiles") {
+            return ancestor.to_path_buf();
+        }
+    }
+    base_dir.join("profiles")
+}
+
+fn prepare_secondary_profile_dirs(
+    current_base_dir: &Path,
+    current_runtime_root: &Path,
+) -> std::io::Result<(PathBuf, PathBuf)> {
+    let profiles_root = resolve_profiles_root(current_base_dir);
+    let runtime_source = std::fs::read_link(current_runtime_root)
+        .unwrap_or_else(|_| current_runtime_root.to_path_buf());
+
+    for slot in 2..=32_u32 {
+        let slot_root = profiles_root.join(format!("profile-{slot}"));
+        let xdg_data_home = slot_root.join("share");
+        let xdg_cache_home = slot_root.join("cache");
+        let slot_olaz_dir = xdg_data_home.join("olaz");
+        if slot_olaz_dir == current_base_dir {
+            continue;
+        }
+        let sock = instance_socket_path(&slot_olaz_dir);
+        if is_instance_socket_alive(&sock) {
+            continue;
+        }
+
+        std::fs::create_dir_all(&slot_olaz_dir)?;
+        std::fs::create_dir_all(&xdg_cache_home)?;
+
+        let runtime_link = slot_olaz_dir.join("ZaloRuntime");
+        if std::fs::symlink_metadata(&runtime_link).is_err() && runtime_source.exists() {
+            let _ = std::os::unix::fs::symlink(&runtime_source, &runtime_link);
+        }
+        return Ok((xdg_data_home, xdg_cache_home));
+    }
+
+    Err(std::io::Error::other(
+        "all secondary profile slots (2..=32) are currently active",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3957,6 +4187,78 @@ mod tests {
         assert!(validate_confined_media_file(&ok_file, &roots).is_ok());
         assert!(validate_confined_media_file(&bad_file, &roots).is_err());
         assert!(validate_confined_media_file(&allowed, &roots).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_window_state_persists_tiled_width_and_x11_position_with_legacy_compat() {
+        let dir = std::env::temp_dir().join(format!("olaz-winstate-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_file = dir.join("olaz-window-state.json");
+
+        // Legacy JSON without pos_x / pos_y deserializes cleanly and allows tiled widths >= 420.
+        std::fs::write(
+            &state_file,
+            r#"{"width": 520, "height": 480, "maximized": false}"#,
+        )
+        .unwrap();
+        let loaded_legacy = SavedWindowState::load(&state_file);
+        assert_eq!(loaded_legacy.width, 520);
+        assert_eq!(loaded_legacy.height, 480);
+        assert_eq!(loaded_legacy.pos_x, None);
+        assert_eq!(loaded_legacy.pos_y, None);
+
+        // Sub-minimum dimensions clamp up to MIN_MAIN_WINDOW_DIM (420).
+        std::fs::write(
+            &state_file,
+            r#"{"width": 200, "height": 180, "maximized": true, "pos_x": 140, "pos_y": 90}"#,
+        )
+        .unwrap();
+        let loaded_clamped = SavedWindowState::load(&state_file);
+        assert_eq!(loaded_clamped.width, 420);
+        assert_eq!(loaded_clamped.height, 420);
+        assert!(loaded_clamped.maximized);
+        assert_eq!(loaded_clamped.pos_x, Some(140));
+        assert_eq!(loaded_clamped.pos_y, Some(90));
+
+        // Round-trip save + load preserves X11 position and privacy state.
+        let saved = SavedWindowState {
+            width: 460,
+            height: 920,
+            maximized: false,
+            pos_x: Some(960),
+            pos_y: Some(32),
+        };
+        saved.save(&state_file);
+        assert_eq!(SavedWindowState::load(&state_file), saved);
+
+        let priv_file = dir.join("olaz-privacy.json");
+        let priv_state = TrayPrivacyState {
+            block_typing: true,
+            block_seen: true,
+            block_delivered: false,
+        };
+        save_privacy_state(&priv_state, &priv_file);
+        assert_eq!(load_privacy_state(&priv_file), priv_state);
+
+        // Secondary profile helper allocates non-nested profile slots and links ZaloRuntime.
+        let primary_base = dir.join("olaz");
+        let primary_rt = primary_base.join("ZaloRuntime");
+        std::fs::create_dir_all(primary_rt.join("current")).unwrap();
+
+        let (data_home_2, _cache_home_2) =
+            prepare_secondary_profile_dirs(&primary_base, &primary_rt).unwrap();
+        assert_eq!(data_home_2, primary_base.join("profiles/profile-2/share"));
+        assert!(data_home_2.join("olaz/ZaloRuntime/current").is_dir());
+
+        // Calling from inside profile-2 skips profile-2 itself and selects profile-3 without nesting.
+        let profile2_base = data_home_2.join("olaz");
+        let profile2_rt = profile2_base.join("ZaloRuntime");
+        let (data_home_3, _) =
+            prepare_secondary_profile_dirs(&profile2_base, &profile2_rt).unwrap();
+        assert_eq!(data_home_3, primary_base.join("profiles/profile-3/share"));
+        assert!(data_home_3.join("olaz/ZaloRuntime/current").is_dir());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

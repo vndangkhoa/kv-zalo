@@ -70,6 +70,7 @@ pub use portals::{
 };
 pub use tray::{
     render_tray_icon_argb32, render_tray_pixmaps, spawn_tray, OlazTray, OlazTrayEvent,
-    OlazTrayHandle, LABEL_QUIT, LABEL_SCREENSHOT, LABEL_SHOW_OLAZ, LABEL_STATUS_BUSY,
-    LABEL_STATUS_MENU, LABEL_STATUS_ONLINE,
+    OlazTrayHandle, PrivacyField, TrayPrivacyState, LABEL_BLOCK_DELIVERED, LABEL_BLOCK_SEEN,
+    LABEL_BLOCK_TYPING, LABEL_NEW_PROFILE, LABEL_PRIVACY_MENU, LABEL_QUIT, LABEL_SCREENSHOT,
+    LABEL_SHOW_OLAZ, LABEL_STATUS_BUSY, LABEL_STATUS_MENU, LABEL_STATUS_ONLINE,
 };
