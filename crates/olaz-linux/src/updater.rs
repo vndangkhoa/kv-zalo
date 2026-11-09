@@ -22,14 +22,14 @@ use crate::privacy::write_atomic_private;
 
 /// Primary GitHub Releases `/releases/latest` endpoint.
 pub const GITHUB_LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/vndangkhoa/zalo-swift-re/releases/latest";
+    "https://api.github.com/repos/vndangkhoa/kv-zalo/releases/latest";
 
 /// Fallback self-hosted Forgejo Releases `/releases/latest` endpoint.
 pub const FORGEJO_LATEST_RELEASE_URL: &str =
-    "https://git.khoavo.myds.me/api/v1/repos/vndangkhoa/zalo-swift-re/releases/latest";
+    "https://git.khoavo.myds.me/api/v1/repos/vndangkhoa/kv-zalo/releases/latest";
 
 /// Canonical upstream repository slug.
-pub const DEFAULT_REPO_SLUG: &str = "vndangkhoa/zalo-swift-re";
+pub const DEFAULT_REPO_SLUG: &str = "vndangkhoa/kv-zalo";
 
 /// Current compiled Olaz crate version (`env!("CARGO_PKG_VERSION")`).
 pub const CURRENT_OLAZ_VERSION: &str = env!("CARGO_PKG_VERSION");

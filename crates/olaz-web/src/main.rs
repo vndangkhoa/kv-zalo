@@ -1,4 +1,4 @@
-//! CLI entrypoint for `olaz-web` stateless self-hosted relay.
+//! CLI entrypoint for `kv-zalo-web` stateless self-hosted relay.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -11,21 +11,21 @@ use tracing::info;
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 
 const HELP_TEXT: &str = "\
-olaz-web — Zero-Server-Persistence Self-Hosted Zalo Web Relay
+kv-zalo-web — Zero-Server-Persistence Self-Hosted Zalo Web Relay
 
 USAGE:
-    olaz-web [OPTIONS]
+    kv-zalo-web [OPTIONS]
 
 OPTIONS:
-    --listen <ADDR:PORT>     Bind address & port [env: OLAZ_WEB_LISTEN] [default: 127.0.0.1:8080]
-    --asar <PATH>            Path to read-only app.asar (or unpacked bundle dir) [env: OLAZ_ASAR_PATH]
+    --listen <ADDR:PORT>     Bind address & port [env: KVZALO_WEB_LISTEN / OLAZ_WEB_LISTEN] [default: 127.0.0.1:8080]
+    --asar <PATH>            Path to read-only app.asar (or unpacked bundle dir) [env: KVZALO_ASAR_PATH / OLAZ_ASAR_PATH]
                              Auto-discovers ~/.local/share/olaz/ZaloRuntime/current/Contents/Resources/app.asar
     --fetch-asar <DEST_DIR>  Download & SHA-256 verify official VNG app.asar into <DEST_DIR> and exit
-    --token <SECRET>         Optional constant-time edge auth token [env: OLAZ_WEB_TOKEN]
+    --token <SECRET>         Optional constant-time edge auth token [env: KVZALO_WEB_TOKEN / OLAZ_WEB_TOKEN]
     -h, --help               Print this help message and exit
 
 ZERO-PERSISTENCE GUARANTEE:
-    olaz-web never stores cookies (zpw_sek), credentials, keys, or chat messages on the server.
+    kv-zalo-web never stores cookies (zpw_sek), credentials, keys, or chat messages on the server.
     All user state lives strictly in the user's browser (IndexedDB + localStorage + OPFS).
 ";
 
@@ -42,19 +42,26 @@ enum CliAction {
     },
 }
 
+fn first_non_empty_env(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| {
+        std::env::var(k)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    })
+}
+
 fn parse_cli<I>(mut args: I) -> Result<CliAction>
 where
     I: Iterator<Item = String>,
 {
-    let mut listen_raw: Option<String> = std::env::var("OLAZ_WEB_LISTEN")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    let mut asar_raw: Option<PathBuf> = std::env::var_os("OLAZ_ASAR_PATH")
-        .filter(|s| !s.is_empty())
+    let mut listen_raw: Option<String> =
+        first_non_empty_env(&["KVZALO_WEB_LISTEN", "OLAZ_WEB_LISTEN"]);
+    let mut asar_raw: Option<PathBuf> = ["KVZALO_ASAR_PATH", "OLAZ_ASAR_PATH"]
+        .iter()
+        .find_map(|k| std::env::var_os(k).filter(|s| !s.is_empty()))
         .map(PathBuf::from);
-    let mut token: Option<String> = std::env::var("OLAZ_WEB_TOKEN")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    let mut token: Option<String> =
+        first_non_empty_env(&["KVZALO_WEB_TOKEN", "OLAZ_WEB_TOKEN"]);
     let mut fetch_dest: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {

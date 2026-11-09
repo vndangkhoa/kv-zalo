@@ -4,7 +4,7 @@ runtime-version: '47'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-command: olaz
+command: kv-zalo
 
 finish-args:
   - --share=ipc
@@ -41,10 +41,11 @@ modules:
         - --share=network
     build-commands:
       - cargo build --release -p olaz-app
-      - install -Dm755 target/release/olaz /app/bin/olaz
-      - install -Dm644 pkgbuild/olaz.desktop /app/share/applications/app.olaz.Olaz.desktop
+      - install -Dm755 target/release/kv-zalo /app/bin/kv-zalo
+      - ln -sf kv-zalo /app/bin/olaz
+      - install -Dm644 pkgbuild/kv-zalo.desktop /app/share/applications/app.olaz.Olaz.desktop
       - desktop-file-edit --set-icon=app.olaz.Olaz /app/share/applications/app.olaz.Olaz.desktop
-      - install -Dm644 pkgbuild/olaz.svg /app/share/icons/hicolor/scalable/apps/app.olaz.Olaz.svg
+      - install -Dm644 pkgbuild/kv-zalo.svg /app/share/icons/hicolor/scalable/apps/app.olaz.Olaz.svg
       - install -Dm644 LICENSE /app/share/licenses/app.olaz.Olaz/LICENSE
     sources:
       - type: dir

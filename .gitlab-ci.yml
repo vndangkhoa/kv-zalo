@@ -20,7 +20,7 @@ build-linux-packages:
     - export PATH="$HOME/.cargo/bin:$PATH"
     - VER="${CI_COMMIT_TAG#v}"
     - ./packaging/build-linux-release.sh --version "$VER"
-    - ./dist/${CI_COMMIT_TAG}/olaz-setup-linux-x86_64.run --check
+    - ./dist/${CI_COMMIT_TAG}/kv-zalo-setup-linux-x86_64.run --check
   artifacts:
     paths:
       - dist/${CI_COMMIT_TAG}/*
@@ -36,7 +36,7 @@ publish-gitlab-release:
     - if: '$CI_COMMIT_TAG =~ /^v/'
   script:
     - VER="${CI_COMMIT_TAG#v}"
-    - PKG_BASE="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/olaz/${VER}"
+    - PKG_BASE="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/kv-zalo/${VER}"
     - |
       for f in dist/${CI_COMMIT_TAG}/*; do
         name="$(basename "$f")"

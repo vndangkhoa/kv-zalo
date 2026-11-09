@@ -21,7 +21,7 @@ if [ "$USER_INSTALL" -eq 0 ] && [ -z "${PREFIX:-}" ] && command -v makepkg >/dev
   exec makepkg -fsi "${ARGS[@]}"
 fi
 
-if [ ! -x "$ROOT/target/release/olaz" ]; then
+if [ ! -x "$ROOT/target/release/kv-zalo" ]; then
   "$ROOT/bin/build"
 fi
 
@@ -38,30 +38,32 @@ if [ ! -w "$(dirname -- "$TARGET_ROOT")" ] && [ ! -w "$TARGET_ROOT" ] && [ "$(id
   SUDO="sudo"
 fi
 
-$SUDO install -Dm755 "$ROOT/target/release/olaz" "${TARGET_ROOT}/bin/olaz"
+$SUDO install -Dm755 "$ROOT/target/release/kv-zalo" "${TARGET_ROOT}/bin/kv-zalo"
+$SUDO ln -sf kv-zalo "${TARGET_ROOT}/bin/olaz"
 
 TMP_DESKTOP="$(mktemp)"
 trap 'rm -f "$TMP_DESKTOP"' EXIT
 if [ "$PREFIX" != "/usr" ]; then
-  sed "s|^Exec=olaz %u$|Exec=${PREFIX}/bin/olaz %u\nTryExec=${PREFIX}/bin/olaz|" \
-    "$ROOT/pkgbuild/olaz.desktop" > "$TMP_DESKTOP"
+  sed "s|^Exec=kv-zalo %u$|Exec=${PREFIX}/bin/kv-zalo %u\nTryExec=${PREFIX}/bin/kv-zalo|" \
+    "$ROOT/pkgbuild/kv-zalo.desktop" > "$TMP_DESKTOP"
 else
-  cp "$ROOT/pkgbuild/olaz.desktop" "$TMP_DESKTOP"
+  cp "$ROOT/pkgbuild/kv-zalo.desktop" "$TMP_DESKTOP"
 fi
-$SUDO install -Dm644 "$TMP_DESKTOP" "${TARGET_ROOT}/share/applications/olaz.desktop"
+$SUDO install -Dm644 "$TMP_DESKTOP" "${TARGET_ROOT}/share/applications/kv-zalo.desktop"
+$SUDO rm -f "${TARGET_ROOT}/share/applications/olaz.desktop"
 
-$SUDO install -Dm644 "$ROOT/pkgbuild/olaz.svg" "${TARGET_ROOT}/share/icons/hicolor/scalable/apps/olaz.svg"
+$SUDO install -Dm644 "$ROOT/pkgbuild/kv-zalo.svg" "${TARGET_ROOT}/share/icons/hicolor/scalable/apps/kv-zalo.svg"
 if command -v rsvg-convert >/dev/null 2>&1; then
   for size in 32 48 64 128 256 512; do
     $SUDO install -dm755 "${TARGET_ROOT}/share/icons/hicolor/${size}x${size}/apps"
     TMP_PNG="$(mktemp --suffix=.png)"
-    rsvg-convert -w "$size" -h "$size" "$ROOT/pkgbuild/olaz.svg" -o "$TMP_PNG"
-    $SUDO install -Dm644 "$TMP_PNG" "${TARGET_ROOT}/share/icons/hicolor/${size}x${size}/apps/olaz.png"
+    rsvg-convert -w "$size" -h "$size" "$ROOT/pkgbuild/kv-zalo.svg" -o "$TMP_PNG"
+    $SUDO install -Dm644 "$TMP_PNG" "${TARGET_ROOT}/share/icons/hicolor/${size}x${size}/apps/kv-zalo.png"
     rm -f "$TMP_PNG"
   done
 fi
 
-$SUDO install -Dm644 "$ROOT/LICENSE" "${TARGET_ROOT}/share/licenses/olaz/LICENSE"
+$SUDO install -Dm644 "$ROOT/LICENSE" "${TARGET_ROOT}/share/licenses/kv-zalo/LICENSE"
 
 if [ -z "$DESTDIR" ]; then
   if command -v update-desktop-database >/dev/null 2>&1; then
@@ -72,4 +74,4 @@ if [ -z "$DESTDIR" ]; then
   fi
 fi
 
-echo "Installed Olaz into ${TARGET_ROOT}"
+echo "Installed KV Zalo into ${TARGET_ROOT}"

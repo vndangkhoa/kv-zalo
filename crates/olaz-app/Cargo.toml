@@ -3,11 +3,11 @@ name = "olaz-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Olaz — Native Linux client for Zalo (Omarchy & Ubuntu)"
-default-run = "olaz"
+description = "KV Zalo — Native Linux client for Zalo (Omarchy & Ubuntu)"
+default-run = "kv-zalo"
 
 [[bin]]
-name = "olaz"
+name = "kv-zalo"
 path = "src/main.rs"
 
 [dependencies]
@@ -40,20 +40,23 @@ gio.workspace = true
 soup.workspace = true
 
 [package.metadata.deb]
-name = "olaz"
-maintainer = "Olaz Contributors <noreply@olaz.app>"
-copyright = "2026, Quan Nguyen & Olaz Contributors"
+name = "kv-zalo"
+maintainer = "KV Apps <noreply@khoavo.myds.me>"
+copyright = "2026, Quan Nguyen, Khoa Vo & Contributors"
 license-file = ["../../LICENSE", "0"]
+provides = "olaz"
+conflicts = "olaz"
+replaces = "olaz"
 extended-description = """\
-Olaz is a native Linux desktop client for Zalo built in Rust on WebKit2GTK. \
+KV Zalo is a native Linux desktop client for Zalo built in Rust on WebKit2GTK. \
 It mounts the official Zalo PC interface with Linux desktop integration, pure-Rust 1:1 & group audio/video/screen-share VoIP calls, \
-inline GStreamer media playback, full E2EE, ZDB4.0 storage, multi-account profiles, SOCKS5/HTTP proxy, REST/MCP automation, \
+call recording, default anti-recall, inline GStreamer media playback, full E2EE, ZDB4.0 storage, multi-account profiles, SOCKS5/HTTP proxy, REST/MCP automation, \
 system tray, and XDG Desktop Portal support."""
 depends = "$auto, libopus0, libpulse0, ffmpeg, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-pipewire | gstreamer1.0-pulseaudio | gstreamer1.0-alsa, xdg-desktop-portal, 7zip | p7zip-full"
 section = "net"
 priority = "optional"
 assets = [
-    ["target/release/olaz", "usr/bin/", "755"],
-    ["../../pkgbuild/olaz.desktop", "usr/share/applications/", "644"],
-    ["../../pkgbuild/olaz.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["target/release/kv-zalo", "usr/bin/", "755"],
+    ["../../pkgbuild/kv-zalo.desktop", "usr/share/applications/", "644"],
+    ["../../pkgbuild/kv-zalo.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
 ]

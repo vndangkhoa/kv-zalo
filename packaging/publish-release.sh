@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Publishes Olaz Linux 1-Click Release (Omarchy & Ubuntu) across all configured Git forges:
-#   1. Forgejo (origin / forgejo: https://git.khoavo.myds.me/vndangkhoa/zalo-swift-re)
-#   2. GitHub  (github:           https://github.com/vndangkhoa/zalo-swift-re)
-#   3. GitLab  (gitlab:           https://gitlab.khoavo.myds.me/vndangkhoa/zalo-swift-re)
+# Publishes KV Zalo Linux 1-Click Release (Omarchy & Ubuntu) across all configured Git forges:
+#   1. Forgejo (origin / forgejo: https://git.khoavo.myds.me/vndangkhoa/kv-zalo)
+#   2. Forgejo (forgejo-vndns:    https://git.khoavo.vndns.net/vndangkhoa/kv-zalo)
+#   3. GitHub  (github:           https://github.com/vndangkhoa/kv-zalo)
+#   4. GitLab  (gitlab:           https://gitlab.khoavo.myds.me/vndangkhoa/kv-zalo)
 set -euo pipefail
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -34,7 +35,7 @@ while [ $# -gt 0 ]; do
 done
 
 WORKSPACE_VER="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
-VER="${VERSION_OVERRIDE:-${OLAZ_VERSION:-$WORKSPACE_VER}}"
+VER="${VERSION_OVERRIDE:-${KVZALO_VERSION:-${OLAZ_VERSION:-$WORKSPACE_VER}}}"
 VER="${VER#v}"
 TAG="v${VER}"
 DIST_DIR="$ROOT/dist/${TAG}"
@@ -45,15 +46,19 @@ fi
 
 # Ensure annotated git tag exists
 if [ "$FORCE_TAG" -eq 1 ] || ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
-  git tag -fa "$TAG" -m "Olaz ${TAG} — 1-Click Setup for Omarchy & Ubuntu"
+  git tag -fa "$TAG" -m "KV Zalo ${TAG} — 1-Click Setup for Omarchy & Ubuntu"
 fi
 
 echo "==> Pushing branch & tag ${TAG} to remotes..."
 git push origin main
 git push $( [ "$FORCE_TAG" -eq 1 ] && printf '%s' '--force' ) origin "$TAG"
 
+if git remote get-url forgejo-vndns >/dev/null 2>&1; then
+  git push forgejo-vndns main || true
+  git push $( [ "$FORCE_TAG" -eq 1 ] && printf '%s' '--force' ) forgejo-vndns "$TAG" || true
+fi
+
 git push github main
-git push github main:feat/linux-rust-omarchy-ubuntu || true
 if [ "$FORCE_TAG" -eq 1 ]; then
   git push github ":refs/tags/${TAG}" 2>/dev/null || true
 fi
@@ -68,51 +73,50 @@ fi
 NOTES_FILE="$(mktemp)"
 trap 'rm -f "$NOTES_FILE"' EXIT
 cat > "$NOTES_FILE" <<EOF
-## Olaz ${TAG} — Pure-Rust VoIP Calls, Native Parity & Power Features for Omarchy & Ubuntu
+## KV Zalo ${TAG} — Pure-Rust VoIP Calls, Call Recorder, Anti-Recall & Multi-Account for Omarchy & Ubuntu
 
-100% pure-Rust + GTK3 + WebKit2GTK 4.1 desktop client for Zalo on Linux, integrating full parity across \`zalo-linux\` and \`ctdozlite\`:
+100% pure-Rust + GTK3 + WebKit2GTK 4.1 desktop client & zero-persistence self-hosted web relay for Zalo:
 
-- **📞 Pure-Rust 1:1 & Group VoIP Calls (\`zcall\` + \`zrtc\`)**: Full-duplex Opus 16 kHz audio (PulseAudio/PipeWire + \`cpal\`), H.264 \`PT 98\`/\`97\` V4L2 camera & X11 screen sharing, \`ZaviNullAuthNoSeq\` & \`SRTP_AES128_CM_HMAC_SHA1_80\` media encryption, \`InitZRTP\` \`0x0b\`/\`0x0c\` framing, and native GTK3/WebKit2GTK incoming/in-call/device-picker windows.
-- **🗄️ Native Modules & Storage Parity**: Pure-Rust \`db-cross-v4\` (\`ZDB4.0\` 64 KiB \`AES-256-CBC\` + XZ + \`parseBinNet\` TLV), \`zwalker\` (all 5 async channels + cancellation), \`file-utilities\` (all 11 sync/async ops), \`zfile\` (\`/proc/mounts\` + drive migration filter), and file-manager \`Ctrl+C\` image clipboard paste.
-- **🛡️ Privacy, Multi-Account & Proxy (\`ctdozlite\` parity)**: Multi-account \`--profile <slug>\` & \`--data-dir <path>\`, \`zalo://\` deep-link Unix-socket IPC, SOCKS5/HTTP \`--proxy <url>\` (with DoH & WebKit2GTK routing), and tray + API toggles blocking typing/seen/delivered receipts.
-- **🤖 Automation, Local REST API, MCP & Self-Updater**: Persistent message scheduler & keyword/regex auto-reply engine, loopback HTTP REST API (\`--api\` / \`--api-port\`), stdio Model Context Protocol server (\`--mcp\`), and SHA-256 verified release updater (\`--check-update\` / \`--update\`).
-- **🎬 Media, Stickers & Desktop UX**: Inline GStreamer HTTP 206 video playback, \`MediaViewer\` (\`popup-viewer.html\`) photo & JXL preview, Stickers, E2EE, login autostart + start-in-tray, unthrottled background message delivery, and persistent window geometry.
+- **📞 Pure-Rust 1:1 & Group VoIP Calls + Call Recorder (\`zcall\` + \`zrtc\`)**: Full-duplex Opus 16 kHz audio, stereo WAV / Ogg-Opus call recording with configurable save folder, H.264 camera & screen sharing, Zavi/SRTP encryption, and native incoming/in-call/device windows.
+- **🛡️ Default Anti-Recall ("Giữ thu hồi") & Multi-Account Sidebar**: Preserves recalled messages with per-bubble \`...\` toggle, and native \`#main-tab\` blue sidebar account switcher + \`+\` Add Account button.
+- **🌐 Zero-Server-Persistence Self-Hosted Web (\`kv-zalo-web\`)**: Hardened \`--read-only\` Docker / systemd relay storing 100% of cookies, vault keys, OPFS files, and chats exclusively in the browser.
+- **🗄️ Native Modules, Proxy & Automation**: Pure-Rust \`db-cross-v4\` (\`ZDB4.0\`), \`zwalker\`, \`file-utilities\`, \`zfile\`, SOCKS5/HTTP \`--proxy\`, loopback REST API (\`--api\`), stdio MCP server (\`--mcp\`), and SHA-256 verified release updater (\`--check-update\` / \`--update\`).
 
 ### 🚀 1-Command Terminal Setup (Auto-detects Omarchy & Ubuntu)
 
 \`\`\`bash
 # GitHub mirror:
-curl -fsSL https://github.com/vndangkhoa/zalo-swift-re/releases/download/${TAG}/install.sh | bash
+curl -fsSL https://github.com/vndangkhoa/kv-zalo/releases/download/${TAG}/install.sh | bash
 
 # Forgejo mirror:
-curl -fsSL https://git.khoavo.myds.me/vndangkhoa/zalo-swift-re/releases/download/${TAG}/install.sh | bash
+curl -fsSL https://git.khoavo.myds.me/vndangkhoa/kv-zalo/releases/download/${TAG}/install.sh | bash
 \`\`\`
 
 ### 📦 1-Click Offline / Graphical Setup Packages
 
 | Platform | File | 1-Click Action |
 |---|---|---|
-| **Omarchy + Ubuntu (Universal)** | \`olaz-setup-linux-x86_64.run\` | \`chmod +x olaz-setup-linux-x86_64.run && ./olaz-setup-linux-x86_64.run\` (or double-click) |
-| **Ubuntu 22.04 / 24.04+ / Debian / Mint** | \`olaz_${VER}_amd64.deb\` | Double-click in Software Install or \`sudo apt install ./olaz_${VER}_amd64.deb\` |
-| **Omarchy / Arch Linux** | \`olaz-${VER}-1-x86_64.pkg.tar.zst\` | \`sudo pacman -U ./olaz-${VER}-1-x86_64.pkg.tar.zst\` |
-| **Portable (\`~/.local\`, no root)** | \`olaz-${VER}-linux-x86_64.tar.gz\` | \`tar -xzf olaz-${VER}-linux-x86_64.tar.gz && ./olaz-${VER}-linux-x86_64/install-user.sh\` |
+| **Omarchy + Ubuntu (Universal)** | \`kv-zalo-setup-linux-x86_64.run\` | \`chmod +x kv-zalo-setup-linux-x86_64.run && ./kv-zalo-setup-linux-x86_64.run\` (or double-click) |
+| **Ubuntu 22.04 / 24.04+ / Debian / Mint** | \`kv-zalo_${VER}_amd64.deb\` | Double-click in Software Install or \`sudo apt install ./kv-zalo_${VER}_amd64.deb\` |
+| **Omarchy / Arch Linux** | \`kv-zalo-${VER}-1-x86_64.pkg.tar.zst\` | \`sudo pacman -U ./kv-zalo-${VER}-1-x86_64.pkg.tar.zst\` |
+| **Portable (\`~/.local\`, no root)** | \`kv-zalo-${VER}-linux-x86_64.tar.gz\` | \`tar -xzf kv-zalo-${VER}-linux-x86_64.tar.gz && ./kv-zalo-${VER}-linux-x86_64/install-user.sh\` |
 EOF
 
 # 1. GitHub Release (direct via `gh` if authenticated, otherwise via GitHub Actions tag workflow)
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
   echo "==> Publishing release ${TAG} directly to GitHub via gh..."
-  if gh release view "$TAG" --repo vndangkhoa/zalo-swift-re >/dev/null 2>&1; then
-    gh release edit "$TAG" --repo vndangkhoa/zalo-swift-re \
-      --title "Olaz ${TAG} — 1-Click Setup for Omarchy & Ubuntu" \
+  if gh release view "$TAG" --repo vndangkhoa/kv-zalo >/dev/null 2>&1; then
+    gh release edit "$TAG" --repo vndangkhoa/kv-zalo \
+      --title "KV Zalo ${TAG} — 1-Click Setup for Omarchy & Ubuntu" \
       --notes-file "$NOTES_FILE"
-    gh release upload "$TAG" "$DIST_DIR"/* --repo vndangkhoa/zalo-swift-re --clobber
+    gh release upload "$TAG" "$DIST_DIR"/* --repo vndangkhoa/kv-zalo --clobber
   else
-    gh release create "$TAG" "$DIST_DIR"/* --repo vndangkhoa/zalo-swift-re \
-      --title "Olaz ${TAG} — 1-Click Setup for Omarchy & Ubuntu" \
+    gh release create "$TAG" "$DIST_DIR"/* --repo vndangkhoa/kv-zalo \
+      --title "KV Zalo ${TAG} — 1-Click Setup for Omarchy & Ubuntu" \
       --notes-file "$NOTES_FILE"
   fi
 else
-  echo "==> Pushed tag ${TAG} to GitHub; .github/workflows/release-linux.yml will publish https://github.com/vndangkhoa/zalo-swift-re/releases/tag/${TAG}"
+  echo "==> Pushed tag ${TAG} to GitHub; .github/workflows/release-linux.yml will publish https://github.com/vndangkhoa/kv-zalo/releases/tag/${TAG}"
 fi
 
 # 2 & 3. Forgejo + GitLab REST API release & asset upload (using git credential helper safely in-memory)
@@ -120,7 +124,6 @@ GIT_TERMINAL_PROMPT=0 python3 - "$TAG" "$VER" "$DIST_DIR" "$NOTES_FILE" <<'PY'
 import base64
 import json
 import mimetypes
-import os
 import pathlib
 import subprocess
 import sys
@@ -132,9 +135,9 @@ import uuid
 tag, ver, dist_dir_str, notes_path = sys.argv[1:5]
 dist_dir = pathlib.Path(dist_dir_str)
 notes = pathlib.Path(notes_path).read_text(encoding="utf-8")
-title = f"Olaz {tag} — 1-Click Setup for Omarchy & Ubuntu"
+title = f"KV Zalo {tag} — 1-Click Setup for Omarchy & Ubuntu"
 assets = sorted(p for p in dist_dir.iterdir() if p.is_file())
-ua = "Mozilla/5.0 (X11; Linux x86_64) olaz-release-publisher/1.0"
+ua = "Mozilla/5.0 (X11; Linux x86_64) kv-zalo-release-publisher/1.0"
 
 
 def get_git_cred(host: str):
@@ -163,7 +166,7 @@ def api_json(url: str, method: str, headers: dict, payload=None):
 # ── Forgejo (`git.khoavo.myds.me`) ───────────────────────────────────────────
 fj_user, fj_pw = get_git_cred("git.khoavo.myds.me")
 if fj_pw:
-    fj_base = "https://git.khoavo.myds.me/api/v1/repos/vndangkhoa/zalo-swift-re"
+    fj_base = "https://git.khoavo.myds.me/api/v1/repos/vndangkhoa/kv-zalo"
     b64 = base64.b64encode(f"{fj_user}:{fj_pw}".encode("utf-8")).decode("ascii")
     fj_hdrs = {"Authorization": f"Basic {b64}"}
     try:
@@ -199,7 +202,7 @@ if fj_pw:
                 with urllib.request.urlopen(del_req, timeout=30):
                     pass
 
-            boundary = f"----OlazBoundary{uuid.uuid4().hex}"
+            boundary = f"----KVZaloBoundary{uuid.uuid4().hex}"
             ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
             file_bytes = path.read_bytes()
             head = (
@@ -223,7 +226,7 @@ if fj_pw:
             )
             with urllib.request.urlopen(up_req, timeout=180) as r:
                 print(f"  [Forgejo] Uploaded {path.name} ({len(file_bytes)} bytes) -> HTTP {r.status}")
-        print(f"==> Published Forgejo release: https://git.khoavo.myds.me/vndangkhoa/zalo-swift-re/releases/tag/{tag}")
+        print(f"==> Published Forgejo release: https://git.khoavo.myds.me/vndangkhoa/kv-zalo/releases/tag/{tag}")
     except Exception as exc:
         print(f"Warning: Forgejo release publish error: {exc}", file=sys.stderr)
 else:
@@ -232,12 +235,12 @@ else:
 # ── GitLab (`gitlab.khoavo.myds.me`) ─────────────────────────────────────────
 gl_user, gl_pw = get_git_cred("gitlab.khoavo.myds.me")
 if gl_pw:
-    gl_proj = "https://gitlab.khoavo.myds.me/api/v4/projects/vndangkhoa%2Fzalo-swift-re"
+    gl_proj = "https://gitlab.khoavo.myds.me/api/v4/projects/vndangkhoa%2Fkv-zalo"
     gl_hdrs = {"PRIVATE-TOKEN": gl_pw}
     try:
         links = []
         for path in assets:
-            pkg_url = f"{gl_proj}/packages/generic/olaz/{urllib.parse.quote(ver)}/{urllib.parse.quote(path.name)}"
+            pkg_url = f"{gl_proj}/packages/generic/kv-zalo/{urllib.parse.quote(ver)}/{urllib.parse.quote(path.name)}"
             file_bytes = path.read_bytes()
             up_req = urllib.request.Request(
                 pkg_url,
@@ -271,7 +274,7 @@ if gl_pw:
                 gl_hdrs,
                 {"name": title, "tag_name": tag, "ref": "main", "description": notes, "assets": {"links": links}},
             )
-        print(f"==> Published GitLab release: https://gitlab.khoavo.myds.me/vndangkhoa/zalo-swift-re/-/releases/{tag}")
+        print(f"==> Published GitLab release: https://gitlab.khoavo.myds.me/vndangkhoa/kv-zalo/-/releases/{tag}")
     except Exception as exc:
         print(f"Warning: GitLab release publish unavailable ({exc})", file=sys.stderr)
 PY

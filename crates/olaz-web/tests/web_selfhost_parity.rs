@@ -1404,11 +1404,11 @@ async fn security_auth_gate_and_ssrf_allowlist_rejections() {
 #[tokio::test]
 async fn browser_preload_multi_account_pin_vault_sw_and_cli_smoke() {
     // 1. CLI `--help` smoke test on compiled binary
-    let bin_path = env!("CARGO_BIN_EXE_olaz-web");
+    let bin_path = env!("CARGO_BIN_EXE_kv-zalo-web");
     let help_out = Command::new(bin_path)
         .arg("--help")
         .output()
-        .expect("run olaz-web --help");
+        .expect("run kv-zalo-web --help");
     assert!(help_out.status.success());
     let help_str = String::from_utf8_lossy(&help_out.stdout);
     assert!(help_str.contains("--listen"));

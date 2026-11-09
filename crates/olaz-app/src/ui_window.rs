@@ -726,7 +726,7 @@ impl OlazAppWindow {
 
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
         if demo_mode {
-            window.set_title("Olaz");
+            window.set_title("KV Zalo");
             window.set_default_size(1180, 760);
             window.set_size_request(960, 620);
         } else {
@@ -1332,7 +1332,7 @@ impl OlazAppWindow {
 
         menu.append(&gtk::SeparatorMenuItem::new());
 
-        let item_remove = gtk::MenuItem::with_label("Xóa tài khoản khỏi Olaz");
+        let item_remove = gtk::MenuItem::with_label("Xóa tài khoản khỏi KV Zalo");
         {
             let app_weak = Rc::downgrade(self);
             let slug_rm = slug.to_string();

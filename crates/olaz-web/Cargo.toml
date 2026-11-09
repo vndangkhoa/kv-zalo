@@ -3,11 +3,11 @@ name = "olaz-web"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Olaz — Stateless zero-server-persistence self-hosted web relay & browser host runtime"
-default-run = "olaz-web"
+description = "KV Zalo Web — Stateless zero-server-persistence self-hosted web relay & browser host runtime"
+default-run = "kv-zalo-web"
 
 [[bin]]
-name = "olaz-web"
+name = "kv-zalo-web"
 path = "src/main.rs"
 
 [dependencies]

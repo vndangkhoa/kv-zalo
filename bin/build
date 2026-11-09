@@ -5,4 +5,4 @@ ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT"
 
 cargo build --release -p olaz-app "$@"
-echo "Built $ROOT/target/release/olaz"
+echo "Built $ROOT/target/release/kv-zalo"

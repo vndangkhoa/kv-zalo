@@ -1,15 +1,15 @@
 [Unit]
-Description=Olaz Web — Zero-Server-Persistence Stateless Zalo Relay
-Documentation=https://github.com/vndangkhoa/zalo-swift-re
+Description=KV Zalo Web — Zero-Server-Persistence Stateless Zalo Relay
+Documentation=https://github.com/vndangkhoa/kv-zalo
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/olaz-web --listen 127.0.0.1:8080 --asar /opt/olaz/app.asar
+ExecStart=/usr/local/bin/kv-zalo-web --listen 127.0.0.1:8080 --asar /opt/kv-zalo/app.asar
 Environment=RUST_LOG=info
-# Optional shared token gate: load OLAZ_WEB_TOKEN=... from a root-owned 0400 file
-EnvironmentFile=-/etc/olaz/olaz-web.env
+# Optional shared token gate: load KVZALO_WEB_TOKEN=... from a root-owned 0400 file
+EnvironmentFile=-/etc/kv-zalo/kv-zalo-web.env
 
 # Zero-Persistence & Ephemeral User Sandboxing
 DynamicUser=yes

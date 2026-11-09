@@ -1,11 +1,14 @@
-# Maintainer: Olaz Contributors <noreply@olaz.app>
-pkgname=olaz
+# Maintainer: KV Apps <noreply@khoavo.myds.me>
+pkgname=kv-zalo
 pkgver=0.2.0
 pkgrel=1
-pkgdesc='Native Zalo desktop client for Linux (Omarchy & Ubuntu) built in Rust on WebKit2GTK'
+pkgdesc='KV Zalo — Native Zalo desktop client for Linux (Omarchy & Ubuntu) built in Rust on WebKit2GTK'
 arch=('x86_64' 'aarch64')
-url='https://github.com/vndangkhoa/zalo-swift-re'
+url='https://github.com/vndangkhoa/kv-zalo'
 license=('GPL-3.0-only')
+provides=('olaz')
+conflicts=('olaz')
+replaces=('olaz')
 depends=(
   'webkit2gtk-4.1'
   'gtk3'
@@ -41,15 +44,16 @@ check() {
 
 package() {
   cd "$startdir/.."
-  install -Dm755 "target/release/olaz" "$pkgdir/usr/bin/olaz"
-  install -Dm644 "$startdir/olaz.desktop" "$pkgdir/usr/share/applications/olaz.desktop"
-  install -Dm644 "$startdir/olaz.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/olaz.svg"
+  install -Dm755 "target/release/kv-zalo" "$pkgdir/usr/bin/kv-zalo"
+  ln -sf kv-zalo "$pkgdir/usr/bin/olaz"
+  install -Dm644 "$startdir/kv-zalo.desktop" "$pkgdir/usr/share/applications/kv-zalo.desktop"
+  install -Dm644 "$startdir/kv-zalo.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/kv-zalo.svg"
   if command -v rsvg-convert >/dev/null 2>&1; then
     for size in 32 48 64 128 256 512; do
       install -dm755 "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps"
-      rsvg-convert -w "$size" -h "$size" "$startdir/olaz.svg" \
-        -o "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/olaz.png"
+      rsvg-convert -w "$size" -h "$size" "$startdir/kv-zalo.svg" \
+        -o "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/kv-zalo.png"
     done
   fi
-  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/olaz/LICENSE"
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/kv-zalo/LICENSE"
 }

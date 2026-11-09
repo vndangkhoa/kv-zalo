@@ -56,8 +56,8 @@ jobs:
       - name: Build all 1-click setup packages (Omarchy & Ubuntu)
         run: |
           ./packaging/build-linux-release.sh --version "${{ steps.meta.outputs.version }}"
-          ./dist/${{ steps.meta.outputs.tag }}/olaz-setup-linux-x86_64.run --check
-          dpkg-deb -I ./dist/${{ steps.meta.outputs.tag }}/olaz_${{ steps.meta.outputs.version }}_amd64.deb
+          ./dist/${{ steps.meta.outputs.tag }}/kv-zalo-setup-linux-x86_64.run --check
+          dpkg-deb -I ./dist/${{ steps.meta.outputs.tag }}/kv-zalo_${{ steps.meta.outputs.version }}_amd64.deb
 
       - name: Publish GitHub Release
         env:
@@ -67,13 +67,13 @@ jobs:
           VER="${{ steps.meta.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<EOF
-          ## Olaz ${TAG} — Pure-Rust VoIP Calls, Native Parity & Power Features for Omarchy & Ubuntu
+          ## KV Zalo ${TAG} — Pure-Rust VoIP Calls, Call Recorder, Anti-Recall & Multi-Account for Omarchy & Ubuntu
 
-          100% pure-Rust + GTK3 + WebKit2GTK 4.1 desktop client for Zalo on Linux:
-          - **Pure-Rust 1:1 & Group VoIP Calls**: Opus 16 kHz audio, H.264 camera & screen sharing, Zavi/SRTP encryption, and native incoming/in-call/device windows.
-          - **Native Storage & Addon Parity**: \`ZDB4.0\` (\`db-cross-v4\`), \`zwalker\`, \`file-utilities\`, \`zfile\`, and file-manager \`Ctrl+C\` image clipboard paste.
+          100% pure-Rust + GTK3 + WebKit2GTK 4.1 desktop client & zero-persistence web relay for Zalo:
+          - **Pure-Rust 1:1 & Group VoIP Calls + Call Recorder**: Opus 16 kHz audio, stereo WAV/Ogg-Opus call recording, H.264 camera & screen sharing, Zavi/SRTP encryption, and native incoming/in-call/device windows.
+          - **Default Anti-Recall ("Giữ thu hồi") & Multi-Account Sidebar**: Preserves recalled messages with per-bubble \`...\` toggle, and native \`#main-tab\` sidebar account switcher + \`+\` Add Account button.
           - **Power Features**: Multi-account \`--profile\`, SOCKS5/HTTP \`--proxy\`, \`zalo://\` deep links, privacy receipt blocker, scheduler & auto-reply, local HTTP REST API (\`--api\`), stdio \`--mcp\` server, and \`--check-update\` / \`--update\`.
-          - **Media & Desktop UX**: Inline GStreamer HTTP 206 video playback, \`MediaViewer\` photo & JXL preview, Stickers, E2EE, system tray, and autostart with start-in-tray.
+          - **Zero-Persistence Self-Hosted Web (\`kv-zalo-web\`)**: Hardened \`--read-only\` Docker / systemd relay storing 100% of state in the browser.
 
           ### 🚀 1-Command Terminal Install (Omarchy & Ubuntu)
           \`\`\`bash
@@ -81,24 +81,24 @@ jobs:
           \`\`\`
 
           ### 📦 1-Click Offline / Graphical Setup Packages
-          - **Universal 1-Click Installer (Omarchy + Ubuntu)**: \`olaz-setup-linux-x86_64.run\`
+          - **Universal 1-Click Installer (Omarchy + Ubuntu)**: \`kv-zalo-setup-linux-x86_64.run\`
             \`\`\`bash
-            chmod +x olaz-setup-linux-x86_64.run && ./olaz-setup-linux-x86_64.run
+            chmod +x kv-zalo-setup-linux-x86_64.run && ./kv-zalo-setup-linux-x86_64.run
             \`\`\`
-          - **Ubuntu 22.04 LTS / 24.04 LTS+ / Debian / Linux Mint / Pop!_OS**: \`olaz_${VER}_amd64.deb\`
-            - Double-click in Software Install, or run: \`sudo apt install ./olaz_${VER}_amd64.deb\`
-          - **Omarchy / Arch Linux / CachyOS / EndeavourOS**: \`olaz-${VER}-1-x86_64.pkg.tar.zst\`
-            - Run: \`sudo pacman -U ./olaz-${VER}-1-x86_64.pkg.tar.zst\`
-          - **Portable Rootless Tarball (\`~/.local\`)**: \`olaz-${VER}-linux-x86_64.tar.gz\`
+          - **Ubuntu 22.04 LTS / 24.04 LTS+ / Debian / Linux Mint / Pop!_OS**: \`kv-zalo_${VER}_amd64.deb\`
+            - Double-click in Software Install, or run: \`sudo apt install ./kv-zalo_${VER}_amd64.deb\`
+          - **Omarchy / Arch Linux / CachyOS / EndeavourOS**: \`kv-zalo-${VER}-1-x86_64.pkg.tar.zst\`
+            - Run: \`sudo pacman -U ./kv-zalo-${VER}-1-x86_64.pkg.tar.zst\`
+          - **Portable Rootless Tarball (\`~/.local\`)**: \`kv-zalo-${VER}-linux-x86_64.tar.gz\`
           EOF
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" \
-              --title "Olaz ${TAG} — 1-Click Setup for Omarchy & Ubuntu" \
+              --title "KV Zalo ${TAG} — 1-Click Setup for Omarchy & Ubuntu" \
               --notes-file "$NOTES_FILE"
             gh release upload "$TAG" dist/"$TAG"/* --clobber
           else
             gh release create "$TAG" dist/"$TAG"/* \
-              --title "Olaz ${TAG} — 1-Click Setup for Omarchy & Ubuntu" \
+              --title "KV Zalo ${TAG} — 1-Click Setup for Omarchy & Ubuntu" \
               --notes-file "$NOTES_FILE"
           fi

@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Olaz — 1-Click Linux Installer for Omarchy (Arch Linux) & Ubuntu / Debian
+# KV Zalo — 1-Click Linux Installer for Omarchy (Arch Linux) & Ubuntu / Debian
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/vndangkhoa/zalo-swift-re/main/packaging/install.sh | bash
-#   curl -fsSL https://git.khoavo.myds.me/vndangkhoa/zalo-swift-re/raw/branch/main/packaging/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/vndangkhoa/kv-zalo/main/packaging/install.sh | bash
+#   curl -fsSL https://git.khoavo.myds.me/vndangkhoa/kv-zalo/raw/branch/main/packaging/install.sh | bash
 #
 # Options:
 #   --user              Install portable build into ~/.local (no root required if runtime libs exist)
-#   --version <vX.Y.Z>  Install a specific release tag (default: v0.1.0 / latest)
-#   --launch            Launch Olaz immediately after installation
+#   --version <vX.Y.Z>  Install a specific release tag (default: v0.2.0 / latest)
+#   --launch            Launch KV Zalo immediately after installation
 set -euo pipefail
 
 DEFAULT_TAG="v0.2.0"
-RELEASE_TAG="${OLAZ_RELEASE_TAG:-}"
+RELEASE_TAG="${KVZALO_RELEASE_TAG:-${OLAZ_RELEASE_TAG:-}}"
 USER_MODE=0
 LAUNCH_AFTER=0
 PREFIX_DIR="${PREFIX:-$HOME/.local}"
@@ -38,7 +38,7 @@ while [ $# -gt 0 ]; do
       ;;
     -h|--help)
       cat <<'EOF'
-Olaz 1-Click Installer (Omarchy / Arch Linux & Ubuntu / Debian)
+KV Zalo 1-Click Installer (Omarchy / Arch Linux & Ubuntu / Debian)
 
 Usage:
   install.sh [options]
@@ -46,8 +46,8 @@ Usage:
 Options:
   --user              Install into ~/.local without root package manager
   --prefix <dir>      Custom user prefix (implies --user, default: ~/.local)
-  --version <tag>     Release tag to install (e.g. v0.1.0)
-  --launch            Start Olaz after installation completes
+  --version <tag>     Release tag to install (e.g. v0.2.0)
+  --launch            Start KV Zalo after installation completes
   -h, --help          Show this help message
 EOF
       exit 0
@@ -108,8 +108,9 @@ resolve_latest_tag() {
   local tmp_json
   tmp_json="$(mktemp)"
   for api_url in \
-    "https://api.github.com/repos/vndangkhoa/zalo-swift-re/releases/latest" \
-    "https://git.khoavo.myds.me/api/v1/repos/vndangkhoa/zalo-swift-re/releases/latest"
+    "https://api.github.com/repos/vndangkhoa/kv-zalo/releases/latest" \
+    "https://git.khoavo.myds.me/api/v1/repos/vndangkhoa/kv-zalo/releases/latest" \
+    "https://git.khoavo.vndns.net/api/v1/repos/vndangkhoa/kv-zalo/releases/latest"
   do
     if fetch_to "$api_url" "$tmp_json" 2>/dev/null; then
       local found
@@ -129,9 +130,10 @@ TAG="$(resolve_latest_tag)"
 VER="${TAG#v}"
 
 MIRROR_BASES=(
-  "https://github.com/vndangkhoa/zalo-swift-re/releases/download/${TAG}"
-  "https://git.khoavo.myds.me/vndangkhoa/zalo-swift-re/releases/download/${TAG}"
-  "https://gitlab.khoavo.myds.me/vndangkhoa/zalo-swift-re/-/releases/${TAG}/downloads"
+  "https://github.com/vndangkhoa/kv-zalo/releases/download/${TAG}"
+  "https://git.khoavo.myds.me/vndangkhoa/kv-zalo/releases/download/${TAG}"
+  "https://git.khoavo.vndns.net/vndangkhoa/kv-zalo/releases/download/${TAG}"
+  "https://gitlab.khoavo.myds.me/vndangkhoa/kv-zalo/-/releases/${TAG}/downloads"
 )
 
 WORK_DIR="$(mktemp -d)"
@@ -215,28 +217,34 @@ if [ "$DISTRO_FAMILY" = "generic" ]; then
   fi
 fi
 
-echo "==> Installing Olaz ${TAG} (${ARCH_UNAME}, detected platform: ${DISTRO_FAMILY})..."
+echo "==> Installing KV Zalo ${TAG} (${ARCH_UNAME}, detected platform: ${DISTRO_FAMILY})..."
 
 install_portable_tarball() {
-  local tar_name="olaz-${VER}-linux-${ARCH_UNAME}.tar.gz"
+  local tar_name="kv-zalo-${VER}-linux-${ARCH_UNAME}.tar.gz"
+  local stage_prefix="kv-zalo"
   local tar_path
   if ! tar_path="$(download_asset "$tar_name")"; then
-    echo "Error: Could not download ${tar_name} for ${TAG}." >&2
-    exit 1
+    tar_name="olaz-${VER}-linux-${ARCH_UNAME}.tar.gz"
+    stage_prefix="olaz"
+    if ! tar_path="$(download_asset "$tar_name")"; then
+      echo "Error: Could not download kv-zalo-${VER}-linux-${ARCH_UNAME}.tar.gz for ${TAG}." >&2
+      exit 1
+    fi
   fi
   verify_checksum_if_available "$tar_path"
   tar -xzf "$tar_path" -C "$WORK_DIR"
-  local stage_dir="$WORK_DIR/olaz-${VER}-linux-${ARCH_UNAME}"
+  local stage_dir="$WORK_DIR/${stage_prefix}-${VER}-linux-${ARCH_UNAME}"
   PREFIX="$PREFIX_DIR" "$stage_dir/install-user.sh"
 }
 
 if [ "$USER_MODE" -eq 1 ]; then
   install_portable_tarball
 elif [ "$DISTRO_FAMILY" = "arch" ] && command -v pacman >/dev/null 2>&1; then
-  PKG_NAME="olaz-${VER}-1-${ARCH_UNAME}.pkg.tar.zst"
-  if PKG_PATH="$(download_asset "$PKG_NAME")"; then
+  PKG_NAME="kv-zalo-${VER}-1-${ARCH_UNAME}.pkg.tar.zst"
+  PKG_PATH=""
+  if PKG_PATH="$(download_asset "$PKG_NAME")" || PKG_PATH="$(download_asset "olaz-${VER}-1-${ARCH_UNAME}.pkg.tar.zst")"; then
     verify_checksum_if_available "$PKG_PATH"
-    echo "==> Installing native Omarchy / Arch package (${PKG_NAME}) via pacman..."
+    echo "==> Installing native Omarchy / Arch package ($(basename -- "$PKG_PATH")) via pacman..."
     run_privileged pacman -Sy --needed --noconfirm \
       webkit2gtk-4.1 gtk3 gst-plugins-base gst-plugins-good opus libpulse ffmpeg xdg-desktop-portal 7zip hicolor-icon-theme
     run_privileged pacman -U --noconfirm "$PKG_PATH"
@@ -245,11 +253,12 @@ elif [ "$DISTRO_FAMILY" = "arch" ] && command -v pacman >/dev/null 2>&1; then
     install_portable_tarball
   fi
 elif [ "$DISTRO_FAMILY" = "debian" ] && command -v apt-get >/dev/null 2>&1; then
-  DEB_NAME="olaz_${VER}_${DEB_ARCH}.deb"
-  if DEB_PATH="$(download_asset "$DEB_NAME")"; then
+  DEB_NAME="kv-zalo_${VER}_${DEB_ARCH}.deb"
+  DEB_PATH=""
+  if DEB_PATH="$(download_asset "$DEB_NAME")" || DEB_PATH="$(download_asset "olaz_${VER}_${DEB_ARCH}.deb")"; then
     verify_checksum_if_available "$DEB_PATH"
     chmod 0644 "$DEB_PATH"
-    echo "==> Installing native Ubuntu / Debian package (${DEB_NAME}) via apt..."
+    echo "==> Installing native Ubuntu / Debian package ($(basename -- "$DEB_PATH")) via apt..."
     run_privileged apt-get update
     run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y "$DEB_PATH"
   else
@@ -261,13 +270,13 @@ else
   install_portable_tarball
 fi
 
-OLAZ_BIN="$(command -v olaz 2>/dev/null || printf '%s/bin/olaz' "$PREFIX_DIR")"
+KVZALO_BIN="$(command -v kv-zalo 2>/dev/null || command -v olaz 2>/dev/null || printf '%s/bin/kv-zalo' "$PREFIX_DIR")"
 echo ""
-echo "==> Olaz ${TAG} is installed and ready!"
-echo "    Binary:   ${OLAZ_BIN}"
-echo "    Launcher: Search 'Olaz' in your app launcher (Omarchy Super+Space / Ubuntu Activities)"
+echo "==> KV Zalo ${TAG} is installed and ready!"
+echo "    Binary:   ${KVZALO_BIN}"
+echo "    Launcher: Search 'KV Zalo' in your app launcher (Omarchy Super+Space / Ubuntu Activities)"
 
-if [ "$LAUNCH_AFTER" -eq 1 ] && [ -x "$OLAZ_BIN" ]; then
-  nohup "$OLAZ_BIN" >/dev/null 2>&1 &
-  echo "==> Launched Olaz!"
+if [ "$LAUNCH_AFTER" -eq 1 ] && [ -x "$KVZALO_BIN" ]; then
+  nohup "$KVZALO_BIN" >/dev/null 2>&1 &
+  echo "==> Launched KV Zalo!"
 fi

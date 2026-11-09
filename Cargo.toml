@@ -13,8 +13,8 @@ default-members = ["crates/olaz-app"]
 version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-only"
-authors = ["Olaz Contributors"]
-repository = "https://github.com/vndangkhoa/zalo-swift-re"
+authors = ["KV Apps & Olaz Contributors"]
+repository = "https://github.com/vndangkhoa/kv-zalo"
 
 [workspace.dependencies]
 # Internal crates

@@ -266,23 +266,23 @@ impl CliConfig {
 fn print_help() {
     println!(
         "\
-Olaz {version} — Native Linux client for Zalo (Omarchy & Ubuntu)
+KV Zalo {version} — Native Linux client for Zalo (Omarchy & Ubuntu)
 
 USAGE:
-    olaz [OPTIONS] [zalo://...]
+    kv-zalo [OPTIONS] [zalo://...]
 
 OPTIONS:
     -h, --help                         Print this help information and exit
     -V, --version                      Print version and exit
         --minimized, --tray, --hidden  Launch hidden in the system tray (used by XDG autostart)
         --profile <SLUG>               Launch an isolated Zalo account profile (`[A-Za-z0-9_-]+`, default: `default`)
-        --data-dir <PATH>              Override Olaz root data directory (default: `~/.local/share/olaz`)
+        --data-dir <PATH>              Override root data directory (default: `~/.local/share/olaz`)
         --proxy <URL>                  Route HTTP/WebSocket/DoH/WebView traffic via `socks5://`, `socks5h://`, `http://`, or `https://`
         --api, --api-port <PORT>       Start local loopback HTTP REST & MCP server on `127.0.0.1:<PORT>` (default: `{default_api_port}`)
         --mcp                          Run Model Context Protocol (MCP) JSON-RPC 2.0 server over `stdio`, bridging to the active GUI instance
-        --check-update                 Check GitHub / Forgejo Releases for a newer Olaz version and exit
+        --check-update                 Check GitHub / Forgejo Releases for a newer KV Zalo version and exit
         --update                       Check for updates and download & SHA-256-verify the latest release package
-        --demo                         Launch Olaz UI in offline mock/demo mode (`?demo=1`)
+        --demo                         Launch KV Zalo UI in offline mock/demo mode (`?demo=1`)
         --engine-probe [PAGE] [SECS]   Boot headless Zalo renderer + debug window (`login` or `main`, default: `main` 20s)
 
 ENVIRONMENT:
@@ -336,7 +336,7 @@ async fn run_cli_update_check(platform: &ZaloPlatform, download: bool) -> Result
     println!("Release URL     : {}", info.html_url);
 
     if !info.has_update {
-        println!("Olaz is up to date.");
+        println!("KV Zalo is up to date.");
         return Ok(());
     }
 
@@ -391,7 +391,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         CliAction::Version => {
-            println!("olaz {}", env!("CARGO_PKG_VERSION"));
+            println!("kv-zalo {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
         CliAction::Mcp
@@ -500,8 +500,8 @@ fn main() -> Result<()> {
     configure_linux_webview_env();
     init_gst_media_proxy_listener();
 
-    glib::set_prgname(Some("olaz"));
-    glib::set_application_name("Olaz");
+    glib::set_prgname(Some("kv-zalo"));
+    glib::set_application_name("KV Zalo");
 
     let tokio_rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
