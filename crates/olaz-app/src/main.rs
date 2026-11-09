@@ -4,6 +4,7 @@
 //! GTK3 + `webkit2gtk-4.1`, `ZaloRuntimeManager`, `OfficialClientHost`, `ZaloMainProcess`,
 //! `OlazAppWindow`, and the `--engine-probe` diagnostic mode (`EngineProbe.swift` port).
 
+pub mod call_ui;
 mod client_host;
 mod main_process;
 mod ui_window;

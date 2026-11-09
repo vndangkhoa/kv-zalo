@@ -17,6 +17,7 @@
 //!   `FailedDraftStore` UTF-16 <-> UTF-8 mention shifting, `FileCard::may_execute`, and `fold_vietnamese`.
 
 pub mod autostart;
+pub mod call;
 pub mod call_stub;
 pub mod engine;
 pub mod instance;
