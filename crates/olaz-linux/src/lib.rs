@@ -16,6 +16,8 @@
 //! - [`engine`]: Rich `ZaloEngineState`, `zstate` reducer, `merge_chat`, `ComposerDraft` /
 //!   `FailedDraftStore` UTF-16 <-> UTF-8 mention shifting, `FileCard::may_execute`, and `fold_vietnamese`.
 
+pub mod api_mcp;
+pub mod automation;
 pub mod autostart;
 pub mod call_stub;
 pub mod engine;
@@ -23,16 +25,44 @@ pub mod instance;
 pub mod notifications;
 pub mod omarchy;
 pub mod portals;
+pub mod privacy;
 pub mod tray;
+pub mod updater;
 
+pub use api_mcp::{
+    dispatch_control_rpc, handle_http_rest_request, handle_mcp_jsonrpc, make_instance_rpc_handler,
+    mcp_tools_catalog, resolve_api_token, run_local_api_server, run_mcp_io, run_mcp_stdio,
+    spawn_local_api_server, spawn_local_api_server_with_token, EngineControlBackend,
+    LocalApiServerHandle, OlazControlBackend, SocketRpcBackend, StartCallCallback,
+    DEFAULT_API_PORT, MCP_PROTOCOL_VERSION,
+};
+pub use automation::{
+    dispatch_due_scheduled_once, parse_schedule_time_ms, spawn_automation_loop, unix_now_ms,
+    AutoReplyEngine, AutoReplyRule, AutomationLoopHandle, MatchMode, ScheduleStatus,
+    ScheduledMessage, SchedulerEngine, SendMessageCallback, AUTOREPLY_RULES_FILENAME,
+    DEFAULT_AUTOMATION_TICK, SCHEDULED_MESSAGES_FILENAME,
+};
 pub use autostart::{
     format_autostart_desktop_entry, format_desktop_exec_arg, parse_existing_desktop_entry,
     reload_user_systemd_nonblocking, resolve_olaz_executable_path, AutostartManager,
     AutostartState, AUTOSTART_DESKTOP_FILENAME, AUTOSTART_STATE_FILENAME,
 };
 pub use instance::{
-    acquire_or_notify_primary, instance_socket_path, AcquireInstanceOutcome, InstanceEvent,
-    SingleInstanceGuard,
+    acquire_or_notify_for_profile, acquire_or_notify_in_dir, acquire_or_notify_primary,
+    default_instance_base_dir, instance_socket_path, instance_socket_path_for_profile,
+    instance_socket_path_in_dir, sanitize_instance_profile, send_instance_rpc,
+    send_instance_rpc_in_dir, send_instance_rpc_to_socket, send_instance_rpc_to_socket_async,
+    AcquireInstanceOutcome, AcquireProfileInstanceOutcome, InstanceEvent, InstanceRpcHandle,
+    ProfileInstanceEvent, RpcHandler, SingleInstanceGuard,
+};
+pub use privacy::{PrivacyConfig, PRIVACY_CONFIG_FILENAME};
+pub use updater::{
+    check_for_updates, check_for_updates_from_urls, compute_sha256_hex,
+    download_and_verify_artifact, download_release, install_release, is_newer_semver,
+    parse_release_manifest, parse_sha256sums_for_asset, select_platform_asset_score,
+    stage_portable_release, validate_asset_name, verify_sha256_bytes, DeferredPortableInstall,
+    DownloadLimits, DownloadRequest, InstallTarget, ReleaseSource, ReleaseUpdateInfo,
+    CURRENT_OLAZ_VERSION, DEFAULT_REPO_SLUG, FORGEJO_LATEST_RELEASE_URL, GITHUB_LATEST_RELEASE_URL,
 };
 
 pub use call_stub::{

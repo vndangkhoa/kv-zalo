@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::{bail, Context};
 use dashmap::DashMap;
 use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
 use hickory_resolver::error::ResolveErrorKind;
@@ -24,6 +25,7 @@ use hickory_resolver::TokioAsyncResolver;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde::Deserialize;
 use thiserror::Error;
+use tracing::warn;
 
 /// Strict allowlist of Zalo domains eligible for DoH fallback (`MediaLoader.dohHostSuffixes`).
 pub const ZALO_CDN_SUFFIXES: [&str; 7] = [
@@ -114,8 +116,31 @@ struct DohJsonAnswer {
     data: String,
 }
 
+/// Validates and constructs an upstream `reqwest::Proxy` for `socks5://`, `socks5h://`,
+/// `http://`, or `https://` URLs. Returns `Ok(None)` when `raw` is empty/whitespace.
+pub fn parse_upstream_proxy(raw: &str) -> anyhow::Result<Option<(String, reqwest::Proxy)>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let parsed =
+        url::Url::parse(trimmed).with_context(|| format!("invalid proxy URL `{trimmed}`"))?;
+    match parsed.scheme() {
+        "socks5" | "socks5h" | "http" | "https" => {}
+        other => bail!(
+            "unsupported proxy scheme `{other}` in `{trimmed}` (expected socks5, socks5h, http, or https)"
+        ),
+    }
+    if parsed.host_str().map_or(true, str::is_empty) {
+        bail!("proxy URL `{trimmed}` is missing a host");
+    }
+    let proxy = reqwest::Proxy::all(trimmed)
+        .with_context(|| format!("failed to build reqwest::Proxy for `{trimmed}`"))?;
+    Ok(Some((trimmed.to_owned(), proxy)))
+}
+
 impl DefaultDnsBackend {
-    fn new() -> Self {
+    fn new(proxy: Option<reqwest::Proxy>) -> Self {
         let mut name_servers = NameServerConfigGroup::google_https();
         name_servers.merge(NameServerConfigGroup::cloudflare_https());
         let config = ResolverConfig::from_parts(None, Vec::new(), name_servers);
@@ -126,6 +151,8 @@ impl DefaultDnsBackend {
 
         // Dedicated rustls+webpki HTTPS client pinned directly to 8.8.8.8 / 8.8.4.4 / 1.1.1.1 / 1.0.0.1
         // with proper TLS SNI (`dns.google` / `cloudflare-dns.com`), immune to broken ISP DNS.
+        // When an upstream SOCKS5/HTTP proxy is configured (`OLAZ_PROXY`), route DoH HTTPS queries
+        // through the proxy instead.
         let google_addrs = [
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 443),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 443),
@@ -134,13 +161,18 @@ impl DefaultDnsBackend {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)), 443),
         ];
-        let json_doh_client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .use_rustls_tls()
-            .timeout(Duration::from_secs(5))
-            .resolve_to_addrs("dns.google", &google_addrs)
-            .resolve_to_addrs("cloudflare-dns.com", &cloudflare_addrs)
-            .build()
-            .ok();
+            .timeout(Duration::from_secs(5));
+        if let Some(p) = proxy {
+            builder = builder.proxy(p);
+        } else {
+            builder = builder
+                .no_proxy()
+                .resolve_to_addrs("dns.google", &google_addrs)
+                .resolve_to_addrs("cloudflare-dns.com", &cloudflare_addrs);
+        }
+        let json_doh_client = builder.build().ok();
 
         Self {
             hickory,
@@ -262,6 +294,8 @@ impl DnsBackend for DefaultDnsBackend {
 #[derive(Clone)]
 pub struct ZaloDnsResolver {
     backend: Arc<dyn DnsBackend>,
+    uses_default_backend: bool,
+    proxy_url: Option<String>,
     dead_hosts: Arc<DashMap<String, Instant>>,
     system_ok: Arc<DashMap<String, Instant>>,
     doh_hosts: Arc<DashMap<String, Instant>>,
@@ -271,6 +305,7 @@ pub struct ZaloDnsResolver {
 impl std::fmt::Debug for ZaloDnsResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ZaloDnsResolver")
+            .field("proxy_url", &self.proxy_url)
             .field("dead_hosts_len", &self.dead_hosts.len())
             .field("system_ok_len", &self.system_ok.len())
             .field("doh_hosts_len", &self.doh_hosts.len())
@@ -286,20 +321,64 @@ impl Default for ZaloDnsResolver {
 }
 
 impl ZaloDnsResolver {
-    /// Creates a new `ZaloDnsResolver` backed by system DNS + Google/Cloudflare DoH.
+    /// Creates a new `ZaloDnsResolver` backed by system DNS + Google/Cloudflare DoH,
+    /// honoring `OLAZ_PROXY` when set.
     pub fn new() -> Self {
-        Self::with_backend(Arc::new(DefaultDnsBackend::new()), SYSTEM_DNS_TIMEOUT)
+        let (proxy_url, proxy) = match std::env::var("OLAZ_PROXY") {
+            Ok(raw) if !raw.trim().is_empty() => match parse_upstream_proxy(&raw) {
+                Ok(Some((u, p))) => (Some(u), Some(p)),
+                Ok(None) => (None, None),
+                Err(err) => {
+                    warn!("ignoring invalid OLAZ_PROXY in ZaloDnsResolver::new: {err}");
+                    (None, None)
+                }
+            },
+            _ => (None, None),
+        };
+        Self {
+            backend: Arc::new(DefaultDnsBackend::new(proxy)),
+            uses_default_backend: true,
+            proxy_url,
+            dead_hosts: Arc::new(DashMap::new()),
+            system_ok: Arc::new(DashMap::new()),
+            doh_hosts: Arc::new(DashMap::new()),
+            system_timeout: SYSTEM_DNS_TIMEOUT,
+        }
     }
 
     /// Creates a `ZaloDnsResolver` with a custom [`DnsBackend`] and system lookup timeout.
     pub fn with_backend(backend: Arc<dyn DnsBackend>, system_timeout: Duration) -> Self {
         Self {
             backend,
+            uses_default_backend: false,
+            proxy_url: None,
             dead_hosts: Arc::new(DashMap::new()),
             system_ok: Arc::new(DashMap::new()),
             doh_hosts: Arc::new(DashMap::new()),
             system_timeout,
         }
+    }
+
+    /// Configures (or clears when `None`) the upstream SOCKS5/HTTP(S) proxy URL on the DoH client.
+    pub fn with_proxy_url(mut self, proxy_url: Option<&str>) -> anyhow::Result<Self> {
+        let parsed = match proxy_url {
+            Some(raw) => parse_upstream_proxy(raw)?,
+            None => None,
+        };
+        let (url_opt, proxy_opt) = match parsed {
+            Some((u, p)) => (Some(u), Some(p)),
+            None => (None, None),
+        };
+        self.proxy_url = url_opt;
+        if self.uses_default_backend {
+            self.backend = Arc::new(DefaultDnsBackend::new(proxy_opt));
+        }
+        Ok(self)
+    }
+
+    /// Returns the active upstream proxy URL configured on this resolver, if any.
+    pub fn proxy_url(&self) -> Option<&str> {
+        self.proxy_url.as_deref()
     }
 
     /// Returns `true` if `host` is currently cached as an authoritative NXDOMAIN dead host.
