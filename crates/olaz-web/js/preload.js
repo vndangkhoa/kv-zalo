@@ -428,7 +428,17 @@
           }
         })
         .join('/');
-      return '/__zfile/@slot/' + ACTIVE_SLOT + '/' + encodedSegs + suffix;
+      const zfilePath = '/__zfile/@slot/' + ACTIVE_SLOT + '/' + encodedSegs + suffix;
+      if (
+        (!globalScope.navigator ||
+          !globalScope.navigator.serviceWorker ||
+          !globalScope.navigator.serviceWorker.controller) &&
+        typeof globalScope.__olazResolveVfsBlobUrl === 'function'
+      ) {
+        const blobUrl = globalScope.__olazResolveVfsBlobUrl(zfilePath);
+        if (blobUrl) return blobUrl;
+      }
+      return zfilePath;
     }
     return raw;
   }
@@ -446,6 +456,27 @@
             : input && typeof input.url === 'string'
               ? input.url
               : '';
+      if (
+        (reqUrlStr.startsWith('/__zfile/') ||
+          (globalScope.location && reqUrlStr.startsWith(globalScope.location.origin + '/__zfile/'))) &&
+        (!globalScope.navigator ||
+          !globalScope.navigator.serviceWorker ||
+          !globalScope.navigator.serviceWorker.controller) &&
+        typeof globalScope.__olazResolveVfsZfile === 'function' &&
+        typeof Response === 'function'
+      ) {
+        const localHit = globalScope.__olazResolveVfsZfile(reqUrlStr);
+        if (localHit) {
+          return new Response(localHit.bytes, {
+            status: 200,
+            headers: {
+              'Content-Type': localHit.mime,
+              'Content-Length': String(localHit.bytes.byteLength),
+              'Cache-Control': 'no-store',
+            },
+          });
+        }
+      }
       const targetUrl = parseZaloTargetUrl(reqUrlStr);
       if (!targetUrl) {
         return NativeFetch(input, init);
@@ -1162,6 +1193,57 @@
   const hostStoresRam = new Map(); // storeName -> plain JS object
   const keychainRam = new Map(); // accountKeyName -> Uint8Array(32)
   const vfsEntriesRam = new Map(); // normalizedPath -> { path, isDir, size, mtimeMs, data: Uint8Array, mime }
+  const vfsBlobUrlCache = new Map(); // normalizedPath -> { mtimeMs, url }
+
+  function guessMimeFromExt(p) {
+    const ext = String(p || '').split('.').pop().toLowerCase();
+    if (ext === 'png') return 'image/png';
+    if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
+    if (ext === 'webp') return 'image/webp';
+    if (ext === 'gif') return 'image/gif';
+    if (ext === 'svg') return 'image/svg+xml';
+    if (ext === 'mp4' || ext === 'm4v') return 'video/mp4';
+    if (ext === 'webm') return 'video/webm';
+    if (ext === 'mp3') return 'audio/mpeg';
+    if (ext === 'ogg' || ext === 'opus') return 'audio/ogg';
+    if (ext === 'wav') return 'audio/wav';
+    return 'application/octet-stream';
+  }
+
+  globalScope.__olazResolveVfsZfile = function (urlStr) {
+    try {
+      const u = new URL(urlStr, (globalScope.location && globalScope.location.origin) || 'http://localhost');
+      if (!u.pathname.startsWith('/__zfile/')) return null;
+      let rest = u.pathname.slice('/__zfile/'.length);
+      if (rest.startsWith('@slot/')) {
+        const sl = rest.indexOf('/', 6);
+        rest = sl >= 0 ? rest.slice(sl + 1) : '';
+      }
+      const decoded = '/' + rest.split('/').filter(Boolean).map((s) => decodeURIComponent(s)).join('/');
+      const entry = vfsEntriesRam.get(decoded);
+      if (!entry || entry.isDir || !entry.data) return null;
+      const bytes = core.hasNoiseTrailer(entry.data) ? core.denoiseBuffer(entry.data) : entry.data;
+      return { bytes, mime: entry.mime || guessMimeFromExt(decoded), mtimeMs: entry.mtimeMs || 0, path: decoded };
+    } catch {
+      return null;
+    }
+  };
+
+  globalScope.__olazResolveVfsBlobUrl = function (zfilePath) {
+    if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function' || typeof Blob === 'undefined') {
+      return null;
+    }
+    const hit = globalScope.__olazResolveVfsZfile(zfilePath);
+    if (!hit) return null;
+    const prev = vfsBlobUrlCache.get(hit.path);
+    if (prev && prev.mtimeMs === hit.mtimeMs) return prev.url;
+    if (prev && typeof URL.revokeObjectURL === 'function') {
+      try { URL.revokeObjectURL(prev.url); } catch {}
+    }
+    const blobUrl = URL.createObjectURL(new Blob([hit.bytes], { type: hit.mime }));
+    vfsBlobUrlCache.set(hit.path, { mtimeMs: hit.mtimeMs, url: blobUrl });
+    return blobUrl;
+  };
   let hostImei = '';
   const privacyState = {
     antiRecall: true,
@@ -1250,12 +1332,29 @@
     } catch {}
   }
 
-  // ---- SubtleCrypto AES-256-GCM Optional Local Browser PIN Vault ----
+  // ---- SubtleCrypto (with pure-JS LAN HTTP fallback) AES-256-GCM Browser PIN Vault ----
+
+  function pbkdf2HmacSha256Sync(passwordBytes, saltBytes, iterations) {
+    // 1-block (32-byte) PBKDF2-HMAC-SHA256 matching WebCrypto `{ name: 'PBKDF2', hash: 'SHA-256', length: 256 }`
+    const saltBlock = new Uint8Array(saltBytes.length + 4);
+    saltBlock.set(saltBytes, 0);
+    saltBlock[saltBytes.length + 3] = 1;
+    let u = core.hmacBytes('sha256', passwordBytes, saltBlock);
+    const acc = core.cloneU8(u);
+    for (let i = 1; i < iterations; i++) {
+      u = core.hmacBytes('sha256', passwordBytes, u);
+      for (let j = 0; j < 32; j++) acc[j] ^= u[j];
+    }
+    return acc;
+  }
 
   async function deriveVaultKeyFromPin(pinStr, saltBytes) {
-    const subtle = window.crypto && window.crypto.subtle;
-    if (!subtle) throw new Error('SubtleCrypto is required for PIN Vault Lock');
     const pinBytes = new TextEncoder().encode(String(pinStr));
+    const subtle = globalScope.crypto && globalScope.crypto.subtle;
+    if (!subtle) {
+      // Plain LAN HTTP (`http://192.168.x.x:<port>/`) fallback with identical AES-256-GCM wire format
+      return { __rawAes256Key: pbkdf2HmacSha256Sync(pinBytes, saltBytes, Math.min(PBKDF2_ITERATIONS, 100000)) };
+    }
     const baseKey = await subtle.importKey('raw', pinBytes, 'PBKDF2', false, ['deriveKey']);
     return subtle.deriveKey(
       {
@@ -1271,15 +1370,41 @@
     );
   }
 
+  async function aesGcmEncryptCompat(cryptoKey, iv, pt) {
+    if (cryptoKey && cryptoKey.__rawAes256Key) {
+      const { ciphertext, tag } = core.gcmEncryptRaw(
+        256,
+        cryptoKey.__rawAes256Key,
+        iv,
+        new Uint8Array(0),
+        pt
+      );
+      return core.concatU8([ciphertext, tag]);
+    }
+    const ctBuf = await globalScope.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, pt);
+    return new Uint8Array(ctBuf);
+  }
+
+  async function aesGcmDecryptCompat(cryptoKey, iv, ctWithTag) {
+    if (cryptoKey && cryptoKey.__rawAes256Key) {
+      if (ctWithTag.byteLength < 16) throw new Error('Invalid AES-GCM ciphertext');
+      const body = ctWithTag.subarray(0, ctWithTag.byteLength - 16);
+      const tag = ctWithTag.subarray(ctWithTag.byteLength - 16);
+      return core.gcmDecryptRaw(256, cryptoKey.__rawAes256Key, iv, new Uint8Array(0), body, tag);
+    }
+    const ptBuf = await globalScope.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, cryptoKey, ctWithTag);
+    return new Uint8Array(ptBuf);
+  }
+
   async function sealWithVaultKey(cryptoKey, valueObj) {
     if (!cryptoKey) return valueObj;
     const iv = core.csprngBytes(12);
     const pt = new TextEncoder().encode(JSON.stringify(valueObj));
-    const ctBuf = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, pt);
+    const ctBytes = await aesGcmEncryptCompat(cryptoKey, iv, pt);
     return {
       __sealedVaultV1: 1,
       iv: core.bytesToBase64(iv, false),
-      ct: core.bytesToBase64(new Uint8Array(ctBuf), false),
+      ct: core.bytesToBase64(ctBytes, false),
     };
   }
 
@@ -1290,8 +1415,8 @@
     if (!cryptoKey) throw new Error('Vault is locked');
     const iv = core.decodeBase64Forgiving(maybeSealed.iv);
     const ct = core.decodeBase64Forgiving(maybeSealed.ct);
-    const ptBuf = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, cryptoKey, ct);
-    return JSON.parse(new TextDecoder().decode(new Uint8Array(ptBuf)));
+    const ptBytes = await aesGcmDecryptCompat(cryptoKey, iv, ct);
+    return JSON.parse(new TextDecoder().decode(ptBytes));
   }
 
   function getVaultMeta() {
@@ -1309,8 +1434,8 @@
     const key = await deriveVaultKeyFromPin(pinStr, salt);
     const iv = core.decodeBase64Forgiving(meta.ivB64);
     const ct = core.decodeBase64Forgiving(meta.verifierB64);
-    const ptBuf = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
-    const txt = new TextDecoder().decode(new Uint8Array(ptBuf));
+    const ptBytes = await aesGcmDecryptCompat(key, iv, ct);
+    const txt = new TextDecoder().decode(ptBytes);
     if (txt !== 'olaz-vault-ok-v1:' + ACTIVE_SLOT) {
       throw new Error('Invalid PIN');
     }
@@ -1326,14 +1451,14 @@
       const iv = core.csprngBytes(12);
       const key = await deriveVaultKeyFromPin(newPinStr, salt);
       const verifierPt = new TextEncoder().encode('olaz-vault-ok-v1:' + ACTIVE_SLOT);
-      const verifierCt = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, verifierPt);
+      const verifierCt = await aesGcmEncryptCompat(key, iv, verifierPt);
       rawLsSet(
         VAULT_META_KEY,
         JSON.stringify({
           v: 1,
           saltB64: core.bytesToBase64(salt, false),
           ivB64: core.bytesToBase64(iv, false),
-          verifierB64: core.bytesToBase64(new Uint8Array(verifierCt), false),
+          verifierB64: core.bytesToBase64(verifierCt, false),
         })
       );
       activeVaultCryptoKey = key;

@@ -1248,7 +1248,7 @@ async fn security_auth_gate_and_ssrf_allowlist_rejections() {
         .unwrap();
     assert_eq!(unauth_html.status().as_u16(), 401);
     let unlock_body = unauth_html.text().await.unwrap();
-    assert!(unlock_body.contains("Unlock Olaz Web Relay"));
+    assert!(unlock_body.contains("Unlock KV Zalo Web"));
 
     let unauth_relay = client
         .post(format!("{base_url}/__olaz/http"))
@@ -1767,6 +1767,15 @@ async fn browser_preload_multi_account_pin_vault_sw_and_cli_smoke() {
         assert.equal(swResponse.headers.get('content-range'), 'bytes 10-49/200');
         const denoisedSlice = new Uint8Array(await swResponse.arrayBuffer());
         assert.deepEqual(Array.from(denoisedSlice), Array.from(rawVideo.subarray(10, 50)));
+
+        // 6b. Verify plain-LAN-HTTP fallback (`http://192.168.x.x:<port>/` with no ServiceWorker controller)
+        const lanHit = win.__olazResolveVfsZfile('/__zfile/@slot/acc_2/olaz-vfs/userData/ZaloDownloads/noised.mp4');
+        assert.ok(lanHit && lanHit.bytes, 'expected in-RAM VFS resolver hit on plain LAN HTTP');
+        assert.equal(lanHit.mime, 'video/mp4');
+        assert.deepEqual(Array.from(lanHit.bytes), Array.from(rawVideo));
+        const lanFetchResp = await win.fetch('zfile:///olaz-vfs/userData/ZaloDownloads/noised.mp4');
+        assert.equal(lanFetchResp.status, 200);
+        assert.deepEqual(Array.from(new Uint8Array(await lanFetchResp.arrayBuffer())), Array.from(rawVideo));
 
         // 7. Verify SubtleCrypto PBKDF2-SHA256 (`600,000` iterations) + non-extractable AES-256-GCM key derivation
         const salt = crypto.getRandomValues(new Uint8Array(16));

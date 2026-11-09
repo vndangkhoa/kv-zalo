@@ -177,7 +177,7 @@ pub const UNLOCK_PAGE_HTML: &str = r#"<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Olaz Web — Unlock Edge Relay</title>
+  <title>KV Zalo Web — Unlock Edge Relay</title>
   <style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
@@ -217,7 +217,7 @@ pub const UNLOCK_PAGE_HTML: &str = r#"<!DOCTYPE html>
 <body>
   <form class="card" id="gate-form">
     <span class="badge">Zero Server Persistence</span>
-    <h1>Unlock Olaz Web Relay</h1>
+    <h1>Unlock KV Zalo Web Relay</h1>
     <p>Enter your server access token to issue a memory-only gate cookie. Your Zalo session, keys, and messages remain 100% inside your browser.</p>
     <input id="token-input" type="password" name="token" placeholder="Server access token" autocomplete="current-password" required autofocus>
     <button type="submit">Unlock Relay</button>

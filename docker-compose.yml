@@ -1,48 +1,25 @@
 # ==============================================================================
-# KV Zalo Web (`kv-zalo-web`) — Turnkey Zero-Server-Persistence Docker Compose
+# KV Zalo Web (`kv-zalo-web`) — Zero-Server-Persistence Docker Compose
 # ==============================================================================
 #
 # Quick start:
-#   KVZALO_WEB_TOKEN="your-secret-passphrase" docker compose up -d --build
+#   docker compose up -d
+#   # Optional shared edge passphrase:
+#   KVZALO_WEB_TOKEN="your-secret-passphrase" docker compose up -d
 #
-# How zero-persistence is enforced:
-#   1. `kv-zalo-asar-init` runs once at startup to fetch & SHA-256 verify the
-#      official VNG `app.asar` client bundle into the `kv_zalo_bundle` volume, then exits.
-#   2. `kv-zalo-web` runs with `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`,
-#      `core: 0`, and mounts `kv_zalo_bundle` strictly `:ro` (read-only) — zero writable
-#      disks or volumes exist inside the running server container. All login cookies,
-#      keys, and chat history live exclusively in your browser (IndexedDB/OPFS).
+# Zero-persistence guarantee:
+#   `kv-zalo-web` runs with `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`,
+#   `core: 0`, and ZERO volumes or writable directories. All login cookies (`zpw_sek`),
+#   vault keys, OPFS files, and chat history stay 100% inside your browser.
 # ==============================================================================
 
 services:
-  kv-zalo-asar-init:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: kv-zalo:latest
-    user: "0:0"
-    entrypoint: ["/bin/sh", "-ec"]
-    command:
-      - |
-        if [ ! -s /bundle/current/Contents/Resources/app.asar ]; then
-          /usr/local/bin/kv-zalo-web --fetch-asar /bundle
-          chmod -R a+rX /bundle
-        fi
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=1536m
-    volumes:
-      - kv_zalo_bundle:/bundle
-    restart: "no"
-
   kv-zalo-web:
-    image: kv-zalo:latest
+    image: vndangkhoa/kv-zalo:latest
     container_name: kv-zalo-web
     build:
       context: .
       dockerfile: Dockerfile
-    depends_on:
-      kv-zalo-asar-init:
-        condition: service_completed_successfully
     read_only: true
     user: "65532:65532"
     cap_drop:
@@ -53,14 +30,9 @@ services:
       core: 0
     environment:
       KVZALO_WEB_LISTEN: "0.0.0.0:8080"
-      KVZALO_ASAR_PATH: "/opt/kv-zalo-bundle/current/Contents/Resources/app.asar"
+      KVZALO_ASAR_PATH: "/opt/kv-zalo/app.asar"
       KVZALO_WEB_TOKEN: "${KVZALO_WEB_TOKEN:-${OLAZ_WEB_TOKEN:-}}"
       RUST_LOG: "${RUST_LOG:-info}"
     ports:
       - "${KVZALO_WEB_BIND:-${OLAZ_WEB_BIND:-127.0.0.1:8080}}:8080"
-    volumes:
-      - kv_zalo_bundle:/opt/kv-zalo-bundle:ro
     restart: unless-stopped
-
-volumes:
-  kv_zalo_bundle:
