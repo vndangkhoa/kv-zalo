@@ -1395,7 +1395,7 @@ fn is_real_zfile_fs(fstype: &str, dev: &str) -> bool {
     ALLOW.contains(&fstype)
 }
 
-fn statvfs_disk_entry(dir: &str) -> Option<Value> {
+fn statvfs_disk_entry(dir: &str, fstype: &str) -> Option<Value> {
     let cdir = CString::new(dir).ok()?;
     let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(cdir.as_ptr(), &mut vfs) } != 0 {
@@ -1408,10 +1408,13 @@ fn statvfs_disk_entry(dir: &str) -> Option<Value> {
     };
     let blocks = vfs.f_blocks as u64;
     let bfree = vfs.f_bfree as u64;
+    let bavail = vfs.f_bavail as u64;
     let total = blocks.saturating_mul(frsize);
     if total == 0 {
         return None;
     }
+    let free = bfree.saturating_mul(frsize);
+    let available = bavail.saturating_mul(frsize);
     let used = blocks.saturating_sub(bfree).saturating_mul(frsize);
     let is_external =
         dir.starts_with("/media/") || dir.starts_with("/run/media/") || dir.starts_with("/mnt/");
@@ -1419,9 +1422,14 @@ fn statvfs_disk_entry(dir: &str) -> Option<Value> {
         "name": dir,
         "label": dir,
         "path": dir,
+        "filesystemType": fstype,
         "isExternal": is_external,
         "totalSpace": total,
         "usedSpace": used,
+        "total": total,
+        "used": used,
+        "free": free,
+        "available": available,
     }))
 }
 
@@ -1443,7 +1451,7 @@ pub fn zfile_get_disk_info() -> BridgeResult {
             if seen.contains(&dir) || !is_real_zfile_fs(fstype, &dev) {
                 continue;
             }
-            if let Some(entry) = statvfs_disk_entry(&dir) {
+            if let Some(entry) = statvfs_disk_entry(&dir, fstype) {
                 seen.insert(dir.clone());
                 out.insert(dir, entry);
             }
@@ -1451,7 +1459,7 @@ pub fn zfile_get_disk_info() -> BridgeResult {
     }
 
     if !out.contains_key("/") {
-        if let Some(root_entry) = statvfs_disk_entry("/") {
+        if let Some(root_entry) = statvfs_disk_entry("/", "ext4") {
             out.insert("/".to_string(), root_entry);
         }
     }

@@ -18,6 +18,9 @@ use gtk::prelude::*;
 use olaz_core::{
     wire, CryptoBridge, FsBridge, KeychainCipher, LinuxSecretBackend, SafeStorage, ZaloPlatform,
 };
+use olaz_linux::call::{
+    enumerate_audio_devices, init_global_voip_log, CallEngineConfig, OlazCallEngine,
+};
 use olaz_linux::{
     pick_open_dialog, pick_save_file_with_dir, AutostartManager, FileCard, IncomingVoipCall,
     LinuxCallCoordinator, LinuxNotifier, NotificationEvent, NotificationIcon, NotificationPolicy,
@@ -31,6 +34,7 @@ use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Map, Value};
 use tokio::sync::oneshot;
 
+use crate::call_ui::CallUiController;
 use crate::client_host::{HostPage, OfficialClientHost, PageEvent, ZaloBridge, ZaloWebRuntime, ZALO_APP_SCHEME};
 
 // ============================================================================
@@ -639,6 +643,8 @@ pub struct ZaloMainProcess {
     notifier: LinuxNotifier,
     autostart: Arc<AutostartManager>,
     call_coordinator: Rc<RefCell<LinuxCallCoordinator>>,
+    call_ui: Rc<CallUiController>,
+    call_engine: Arc<OlazCallEngine>,
     shared_worker: Rc<SharedWorkerRouter>,
     window_state: Arc<MainWindowState>,
     tokio_handle: tokio::runtime::Handle,
@@ -703,6 +709,24 @@ impl ZaloMainProcess {
             !platform.is_isolated_root(),
         ));
         let call_coordinator = Rc::new(RefCell::new(LinuxCallCoordinator::new()));
+        init_global_voip_log(&platform.user_data().join("logs").join("voip"));
+        let (call_ui, call_ui_sink) = CallUiController::create_with_event_sink(None);
+        let (call_ipc_tx, mut call_ipc_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(&'static str, Vec<Value>)>();
+        let call_update_tx = call_ipc_tx.clone();
+        let call_signal_tx = call_ipc_tx;
+        let call_engine = OlazCallEngine::new(CallEngineConfig::new(
+            move |cmd, data| {
+                let _ = call_update_tx.send(("call-update", vec![json!(cmd), data]));
+            },
+            move |cmd, data| {
+                let _ = call_signal_tx.send(("call-send-signal", vec![json!(cmd), data]));
+            },
+            move |ev| {
+                (call_ui_sink)(ev);
+            },
+        ));
+        call_ui.bind_engine(Arc::clone(&call_engine));
         let shared_worker = SharedWorkerRouter::new();
         let last_kickout_notice = Arc::new(Mutex::new(None));
 
@@ -796,6 +820,8 @@ impl ZaloMainProcess {
             notifier: notifier.clone(),
             autostart,
             call_coordinator,
+            call_ui,
+            call_engine,
             shared_worker,
             window_state: Arc::new(MainWindowState::default()),
             tokio_handle,
@@ -849,6 +875,19 @@ impl ZaloMainProcess {
             }
         });
 
+        // Forward VoIP `OlazCallEngine` `call-update` and `call-send-signal` messages onto the main renderer bridge.
+        let mp_weak_call = Rc::downgrade(&mp);
+        glib::MainContext::default().spawn_local(async move {
+            while let Some((channel, payload)) = call_ipc_rx.recv().await {
+                let Some(this) = mp_weak_call.upgrade() else {
+                    break;
+                };
+                if let Some(host) = this.host() {
+                    host.bridge().send(channel, payload);
+                }
+            }
+        });
+
         mp
     }
 
@@ -875,6 +914,15 @@ impl ZaloMainProcess {
 
     pub fn call_coordinator(&self) -> &Rc<RefCell<LinuxCallCoordinator>> {
         &self.call_coordinator
+    }
+
+    pub fn call_engine(&self) -> &Arc<OlazCallEngine> {
+        &self.call_engine
+    }
+
+    #[allow(dead_code)]
+    pub fn call_ui(&self) -> &Rc<CallUiController> {
+        &self.call_ui
     }
 
     pub fn shared_worker(&self) -> &Rc<SharedWorkerRouter> {
@@ -1080,6 +1128,7 @@ impl ZaloMainProcess {
         *self.viewer_key.borrow_mut() = None;
         self.downloads.reset();
         self.call_coordinator.borrow_mut().clear_incoming();
+        self.call_engine.stop();
         self.stop_shared_worker();
         self.shared_worker.reset_session();
     }
@@ -1682,8 +1731,92 @@ impl ZaloMainProcess {
             Err("EPERM: child_process is not available".to_string())
         });
 
-        // Voice / video calls (`$zcall`) Phase 1 graceful Linux stub
-        bridge.acknowledge_channels(&["call-send-to-native", "call-init"]);
+        // Voice / video / group calls (`$zcall` -> `OlazCallEngine` + `CallUiController`)
+        {
+            let engine = Arc::clone(&self.call_engine);
+            bridge.handle_channel("call-init", move |_args| {
+                let engine = Arc::clone(&engine);
+                async move {
+                    engine.announce_native_ready();
+                    Ok(wire::undefined())
+                }
+            });
+        }
+        {
+            let engine = Arc::clone(&self.call_engine);
+            bridge.handle_channel("call-send-to-native", move |args| {
+                let engine = Arc::clone(&engine);
+                async move {
+                    engine.handle_ipc_args(&Value::Array(args));
+                    Ok(wire::undefined())
+                }
+            });
+        }
+        {
+            let engine = Arc::clone(&self.call_engine);
+            bridge.handle_channel("call-request", move |args| {
+                let engine = Arc::clone(&engine);
+                async move {
+                    let cmd = args.first().and_then(Value::as_str).unwrap_or("");
+                    if cmd == "listDevice" {
+                        let devs = engine
+                            .active_media_driver()
+                            .map(|m| m.list_devices())
+                            .unwrap_or_else(enumerate_audio_devices);
+                        return Ok(serde_json::to_value(devs).unwrap_or_else(|_| json!({})));
+                    }
+                    Ok(Value::Null)
+                }
+            });
+        }
+
+        // `zwalker-*` storage garbage-collector IPC channels (offloaded onto Tokio blocking pool)
+        for ch in [
+            "zwalker-collect-dir-stats",
+            "zwalker-update-file-stats",
+            "zwalker-del-unmarked-files",
+            "zwalker-stat-unmarked-files",
+            "zwalker-delete-empty-folders",
+        ] {
+            let fsb = self.fs_bridge.clone();
+            let rt_handle = self.tokio_handle.clone();
+            let ch_owned = ch.to_string();
+            bridge.handle_channel(ch, move |args| {
+                let fsb = fsb.clone();
+                let rt_handle = rt_handle.clone();
+                let ch_owned = ch_owned.clone();
+                async move {
+                    let (tx, rx) = oneshot::channel();
+                    rt_handle.spawn_blocking(move || {
+                        let out = fsb.dispatch_zwalker_ipc(&ch_owned, &args);
+                        let _ = tx.send(out);
+                    });
+                    rx.await.map_err(|e| format!("EIO: {e}"))?
+                }
+            });
+        }
+
+        // Synchronous JPEG clipboard encoder (`nativeImage.toJPEG(quality)` in `bundle_patcher.rs`)
+        bridge.handle_channel_sync("olaz-clipboard-image-jpeg", |args| {
+            if !glib::MainContext::default().is_owner() {
+                return Ok(Value::Null);
+            }
+            let quality = args
+                .first()
+                .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.round() as u64)))
+                .unwrap_or(85)
+                .clamp(1, 100);
+            let cb = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
+            let Some(pixbuf) = load_clipboard_pixbuf(&cb) else {
+                return Ok(Value::Null);
+            };
+            let q_str = quality.to_string();
+            match pixbuf.save_to_bufferv("jpeg", &[("quality", &q_str)]) {
+                Ok(jpeg_bytes) if !jpeg_bytes.is_empty() => Ok(wire::encode_bytes(&jpeg_bytes)),
+                _ => Ok(Value::Null),
+            }
+        });
+
         bridge.handle_channel_sync("request-compressed-log-file", |_| {
             Ok(json!({
                 "status": 2,
@@ -2262,11 +2395,16 @@ impl ZaloMainProcess {
                 if cb.wait_is_text_available() {
                     formats.push("text/plain");
                 }
-                if cb.wait_is_image_available() {
+                let has_img = cb.wait_is_image_available();
+                let has_uris = cb.wait_is_uris_available();
+                if has_img {
                     formats.push("image/png");
                 }
-                if cb.wait_is_uris_available() {
+                if has_uris {
                     formats.push("text/uri-list");
+                    if !has_img && load_clipboard_pixbuf_from_uris(&cb).is_some() {
+                        formats.push("image/png");
+                    }
                 }
             }
             Ok(json!(formats))
@@ -2276,7 +2414,7 @@ impl ZaloMainProcess {
                 return Ok(Value::Null);
             }
             let cb = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
-            let Some(pixbuf) = cb.wait_for_image() else {
+            let Some(pixbuf) = load_clipboard_pixbuf(&cb) else {
                 return Ok(Value::Null);
             };
             match pixbuf.save_to_bufferv("png", &[]) {
@@ -2330,7 +2468,7 @@ impl ZaloMainProcess {
             Ok(wire::undefined())
         });
 
-        // 2c. `$znode.nativelibs.zfileAddon.*` (`canRead`, `canWrite`, `canReadAndWrite`, `getDiskInfo`, `getInfo`, `copyFolder`, `cancelCopy`)
+        // 2c. `$znode.nativelibs.zfileAddon.*` (`canRead`, `canWrite`, `canReadAndWrite`, `copyFolder`, `cancelCopy`; `getDiskInfo` & `getInfo` registered in async `fs_bridge` table below)
         for path in [
             "$znode.nativelibs.zfileAddon.canRead",
             "$znode.nativelibs.zfileAddon.canWrite",
@@ -2354,26 +2492,6 @@ impl ZaloMainProcess {
                 Ok(json!(ok))
             });
         }
-        bridge.register_async("$znode.nativelibs.zfileAddon.getDiskInfo", |_| async move {
-            Ok(json!({
-                "free": 50_000_000_000_u64,
-                "total": 200_000_000_000_u64,
-                "available": 50_000_000_000_u64,
-            }))
-        });
-        bridge.register_async("$znode.nativelibs.zfileAddon.getInfo", |args| async move {
-            let Some(raw) = args.first().and_then(Value::as_str) else {
-                return Ok(Value::Null);
-            };
-            match std::fs::metadata(raw) {
-                Ok(meta) => Ok(json!({
-                    "size": meta.len(),
-                    "isDirectory": meta.is_dir(),
-                    "isFile": meta.is_file(),
-                })),
-                Err(_) => Ok(Value::Null),
-            }
-        });
         {
             let p = Arc::clone(&platform);
             let rt_handle = self.tokio_handle.clone();
@@ -2455,6 +2573,15 @@ impl ZaloMainProcess {
             "$znode.fs.copyFileSync",
             "$znode.fsExtra.copySync",
             "$znode.nativelibs.fileUtilsAddon.getDiskUsage",
+            "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeSync",
+            "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeTreeSync",
+            "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeByGlobSync",
+            "$znode.nativelibs.fileUtilitiesAddon.detectHardlinksSync",
+            "$znode.nativelibs.fileUtilitiesAddon.detectFilesystemSync",
+            "$znode.nativelibs.fileUtilitiesAddon.cancelJob",
+            "$znode.nativelibs.dbUtilsAddon.decompressAndDecryptDb_V2",
+            "$znode.nativelibs.dbUtilsAddon.decompressAndDecryptDb",
+            "$znode.nativelibs.dbUtilsAddon.parseBinNet",
         ] {
             let fsb = self.fs_bridge.clone();
             let path_owned = path.to_string();
@@ -2497,7 +2624,13 @@ impl ZaloMainProcess {
             "$znode.fsExtra.copy",
             "$znode.fs.link",
             "$znode.fsPromise.link",
+            "$znode.nativelibs.zfileAddon.getDiskInfo",
+            "$znode.nativelibs.zfileAddon.getInfo",
+            "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeAsync",
+            "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeTreeAsync",
+            "$znode.nativelibs.fileUtilitiesAddon.getDirectorySizeByGlobAsync",
             "$znode.nativelibs.fileUtilitiesAddon.detectHardlinksAsync",
+            "$znode.nativelibs.fileUtilitiesAddon.detectFilesystemAsync",
             "$zFileManager.saveSentryConfig",
             "$zFileManager.getViewerkey",
             "$zFileManager.writeRecentId",
@@ -3072,6 +3205,36 @@ fn gtk_save_dialog_fallback(
     } else {
         None
     }
+}
+
+fn load_clipboard_pixbuf_from_uris(cb: &gtk::Clipboard) -> Option<gdk::gdk_pixbuf::Pixbuf> {
+    const MAX_CLIPBOARD_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+    for uri in cb.wait_for_uris() {
+        let Ok(parsed) = url::Url::parse(uri.as_str()) else {
+            continue;
+        };
+        if parsed.scheme() != "file" {
+            continue;
+        }
+        let Ok(path) = parsed.to_file_path() else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+            continue;
+        }
+        if let Ok(pixbuf) = gdk::gdk_pixbuf::Pixbuf::from_file(&path) {
+            return Some(pixbuf);
+        }
+    }
+    None
+}
+
+fn load_clipboard_pixbuf(cb: &gtk::Clipboard) -> Option<gdk::gdk_pixbuf::Pixbuf> {
+    cb.wait_for_image()
+        .or_else(|| load_clipboard_pixbuf_from_uris(cb))
 }
 
 fn read_clipboard_paths_or_staged_png(platform: &ZaloPlatform) -> Value {
