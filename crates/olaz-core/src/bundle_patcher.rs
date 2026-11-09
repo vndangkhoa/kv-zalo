@@ -13,30 +13,39 @@ use serde_json::{json, Value};
 
 use crate::platform::ZaloPlatform;
 
-/// Raw `Sources/Olaz/Resources/bridge-table.json` embedded at compile time.
-pub const BRIDGE_TABLE_JSON: &str = include_str!("../../../Sources/Olaz/Resources/bridge-table.json");
+/// Raw `bridge-table.json` embedded at compile time from `crates/olaz-core/assets/`.
+pub const BRIDGE_TABLE_JSON: &str = include_str!("../assets/bridge-table.json");
 
-// All 19 `Sources/Olaz/HostScripts/*.js` embedded at compile time.
-pub const SCRIPT_NETWORK_SHIM: &str = include_str!("../../../Sources/Olaz/HostScripts/network-shim.js");
-pub const SCRIPT_LOCAL_MODULES: &str = include_str!("../../../Sources/Olaz/HostScripts/local-modules.js");
-pub const SCRIPT_BRIDGE: &str = include_str!("../../../Sources/Olaz/HostScripts/bridge.js");
-pub const SCRIPT_STATE_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/state-adapter.js");
-pub const SCRIPT_CHAT_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/chat-adapter.js");
-pub const SCRIPT_MEDIA_STORE_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/media-store-adapter.js");
-pub const SCRIPT_CARD_ACTIONS_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/card-actions-adapter.js");
-pub const SCRIPT_STICKER_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/sticker-adapter.js");
-pub const SCRIPT_COMPOSER_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/composer-adapter.js");
-pub const SCRIPT_MESSAGE_ACTIONS_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/message-actions-adapter.js");
-pub const SCRIPT_TRANSFER_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/transfer-adapter.js");
-pub const SCRIPT_CONVERSATIONS_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/conversations-adapter.js");
+// All 19 `crates/olaz-core/assets/host_scripts/*.js` embedded at compile time.
+pub const SCRIPT_NETWORK_SHIM: &str = include_str!("../assets/host_scripts/network-shim.js");
+pub const SCRIPT_LOCAL_MODULES: &str = include_str!("../assets/host_scripts/local-modules.js");
+pub const SCRIPT_BRIDGE: &str = include_str!("../assets/host_scripts/bridge.js");
+pub const SCRIPT_STATE_ADAPTER: &str = include_str!("../assets/host_scripts/state-adapter.js");
+pub const SCRIPT_CHAT_ADAPTER: &str = include_str!("../assets/host_scripts/chat-adapter.js");
+pub const SCRIPT_MEDIA_STORE_ADAPTER: &str =
+    include_str!("../assets/host_scripts/media-store-adapter.js");
+pub const SCRIPT_CARD_ACTIONS_ADAPTER: &str =
+    include_str!("../assets/host_scripts/card-actions-adapter.js");
+pub const SCRIPT_STICKER_ADAPTER: &str = include_str!("../assets/host_scripts/sticker-adapter.js");
+pub const SCRIPT_COMPOSER_ADAPTER: &str =
+    include_str!("../assets/host_scripts/composer-adapter.js");
+pub const SCRIPT_MESSAGE_ACTIONS_ADAPTER: &str =
+    include_str!("../assets/host_scripts/message-actions-adapter.js");
+pub const SCRIPT_TRANSFER_ADAPTER: &str =
+    include_str!("../assets/host_scripts/transfer-adapter.js");
+pub const SCRIPT_CONVERSATIONS_ADAPTER: &str =
+    include_str!("../assets/host_scripts/conversations-adapter.js");
 pub const SCRIPT_CONVERSATION_ACTIONS_ADAPTER: &str =
-    include_str!("../../../Sources/Olaz/HostScripts/conversation-actions-adapter.js");
-pub const SCRIPT_CONTACTS_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/contacts-adapter.js");
-pub const SCRIPT_GROUP_CREATE_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/group-create-adapter.js");
-pub const SCRIPT_NOTIFICATION_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/notification-adapter.js");
-pub const SCRIPT_ZCLOUD_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/zcloud-adapter.js");
-pub const SCRIPT_POLL_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/poll-adapter.js");
-pub const SCRIPT_CALL_ADAPTER: &str = include_str!("../../../Sources/Olaz/HostScripts/call-adapter.js");
+    include_str!("../assets/host_scripts/conversation-actions-adapter.js");
+pub const SCRIPT_CONTACTS_ADAPTER: &str =
+    include_str!("../assets/host_scripts/contacts-adapter.js");
+pub const SCRIPT_GROUP_CREATE_ADAPTER: &str =
+    include_str!("../assets/host_scripts/group-create-adapter.js");
+pub const SCRIPT_NOTIFICATION_ADAPTER: &str =
+    include_str!("../assets/host_scripts/notification-adapter.js");
+pub const SCRIPT_ZCLOUD_ADAPTER: &str = include_str!("../assets/host_scripts/zcloud-adapter.js");
+pub const SCRIPT_POLL_ADAPTER: &str = include_str!("../assets/host_scripts/poll-adapter.js");
+pub const SCRIPT_CALL_ADAPTER: &str = include_str!("../assets/host_scripts/call-adapter.js");
 
 /// `ConsoleHandler.script` from `OfficialClientHost.swift:470-477`.
 pub const CONSOLE_HANDLER_SCRIPT: &str = r#"(() => {

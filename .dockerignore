@@ -1,4 +1,10 @@
 target/
+dist/
+macos/
+docs/
+packaging/
+pkgbuild/
+bin/
 .git/
 .github/
 .claude/
@@ -7,5 +13,4 @@ target/
 *.pkg.tar*
 *.deb
 *.AppImage
-pkgbuild/src/
-pkgbuild/pkg/
+*.run

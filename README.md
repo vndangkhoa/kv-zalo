@@ -1,290 +1,121 @@
-# zalo-swift-re — Olaz
+# Olaz (`zalo-swift-re`)
 
-**A reverse-engineered, native desktop client for [Zalo](https://zalo.me) — written in Swift for macOS and in Rust for Linux (Omarchy & Ubuntu).**
+**A reverse-engineered, native desktop & zero-persistence web client for [Zalo](https://zalo.me) — written in Rust for Linux (Omarchy & Ubuntu) and self-hosted Web, with the original Swift reference client under `macos/`.**
 
-Olaz runs the **official Zalo PC renderer** (`app.asar`) inside the OS native WebKit engine (`WKWebView` on macOS,
-`WebKit2GTK 4.1` on Linux) and supplies in native Swift / Rust everything that Electron's preload and main process
-used to provide. It does **not** re-implement Zalo's wire protocol:
-- **macOS (`Sources/`)**: puts a native SwiftUI interface (Liquid Glass, sidebar + labels, native media viewer) on top
-  of a headless `WKWebView` hosting Zalo's official client state.
-- **Linux (`crates/`)**: mounts the official Zalo PC interface directly in a frameless GTK3 + `webkit2gtk-4.1` window
-  with on-the-fly Linux UI/window/clipboard/call bundle patches, embedded GStreamer/FFmpeg inline voice-note & video
-  playback (`libgstolazauto.so`), Secret Service (`org.freedesktop.secrets`) vault, StatusNotifierItem tray, and XDG
-  Desktop Portals across **Omarchy** (Arch Linux + Hyprland/Wayland) and **Ubuntu 22.04 LTS / 24.04 LTS+**.
+Olaz runs the **official Zalo PC renderer** (`app.asar`) inside a native WebKit host (or browser tab in `olaz-web` mode) and supplies in Rust / Swift everything that Electron's preload and main process provide — without re-implementing Zalo's wire protocol:
+- **Linux Desktop (`crates/olaz-app`, `olaz-linux`, `olaz-core`, `olaz-net`)**: frameless GTK3 + `webkit2gtk-4.1` desktop client with pure-Rust 1:1 & group VoIP calls + call recorder, default-enabled anti-recall (**"Giữ thu hồi"**), single-window multi-account switcher (`#main-tab`), GStreamer/FFmpeg media playback, Secret Service vault, StatusNotifierItem tray, local REST API, and stdio MCP server.
+- **Zero-Persistence Self-Hosted Web (`crates/olaz-web`)**: stateless HTTP/Range/WebSocket relay (`Dockerfile` + `docker-compose.yml` running `--read-only`) where 100% of crypto, vault keys, cookies (`zpw_sek`), OPFS files, and chat state live exclusively in the user's browser.
+- **macOS Reference (`macos/`)**: Swift 6 + SwiftUI Liquid Glass client hosting `app.asar` inside `WKWebView`.
 
-Zalo PC does not need to be installed. On first launch Olaz downloads the official Zalo PC installer from VNG,
-verifies its integrity (Apple code signature on macOS; pinned SHA-256 on Linux), and stores `app.asar` locally
-(`~/Library/Application Support/Olaz/ZaloRuntime/` on macOS; `~/.local/share/olaz/ZaloRuntime/` on Linux).
-See [`ZaloRuntime/ZaloRuntimeInstaller.swift`](Sources/Olaz/ZaloRuntime/ZaloRuntimeInstaller.swift) and
-[`crates/olaz-core/src/installer.rs`](crates/olaz-core/src/installer.rs).
+Zalo PC does not need to be installed. On first launch Olaz downloads the official Zalo PC bundle from VNG, verifies its SHA-256 / code signature, and caches `app.asar` locally (`~/.local/share/olaz/ZaloRuntime/` on Linux).
 
 > [!IMPORTANT]
 > **Unofficial project, not affiliated with or endorsed by VNG Corporation.** "Zalo" is a trademark of VNG.
 > This is an interoperability and reverse-engineering research project. Using an unofficial client may
 > conflict with Zalo's terms of service, so use it at your own risk with your own account.
 
-## Features
+---
 
-- **Real QR login** (trusted-device QR → scan with Zalo on your phone → confirm), session restore on relaunch
-- **Chat**: history and load older, send text / reply / mentions, reactions, typing, read state, realtime updates
-- **Composer "+"**: photos / video, files, screenshot (Zalo's own `ZaloCap`), my contact card, reminders
-- **Message actions**: forward, copy, recall, delete with undo, pin bar, star
-- **Voice / video calls** through Zalo's own `ZaloCall` helper
-- **E2EE conversations**, including E2EE video playback
-- **Phone → PC message sync** with a native progress UI
-- Contacts and friend requests, My Cloud, polls, stickers, labels, hidden chats (PIN), stranger folder,
-  shared-media browser, quick switcher, native notifications
+## Repository Layout
 
-## Requirements
-
-- **macOS**: macOS 26 or later, Xcode 27 (Swift 6 toolchain)
-- **Linux**: Omarchy (Arch Linux + Hyprland/Wayland) or Ubuntu 22.04 LTS / 24.04 LTS+ (Wayland or X11), Rust 1.80+
-- A Zalo account and the Zalo app on your phone (for QR login)
-- About 340 MB of download on first launch (Zalo PC's code, fetched from VNG)
-
-Zalo allows **one desktop (PC) session per account**. If the official Zalo PC is also running, quit it while
-using Olaz.
-
-## Build & run (macOS — Swift)
-
-```bash
-git clone https://github.com/qnguyen3/zalo-swift-re.git
-cd zalo-swift-re
-
-swift test                     # crypto parity (vs Node), asar reader, JSC/libsignal and host-script tests
-./scripts/make-app.sh debug    # → build/Olaz.app (ad-hoc signed, JIT entitlement)
-open build/Olaz.app            # real QR login — scan with Zalo on your phone
-```
-
-A new PC session has no message history except My Cloud, because Zalo keeps history on the phone. Use
-**Đồng bộ tin nhắn từ điện thoại** (confirm on the phone) to import it.
-
-## Install & build (Linux — Rust: Omarchy & Ubuntu)
-
-### 1-Click Install (Prebuilt Releases — Omarchy & Ubuntu)
-
-- **1-Line Terminal Installer** (auto-detects **Omarchy / Arch Linux** `pacman` or **Ubuntu / Debian** `apt`, verifies `SHA256SUMS.txt`, and installs desktop launcher + icons):
-  ```bash
-  # GitHub:
-  curl -fsSL https://raw.githubusercontent.com/vndangkhoa/zalo-swift-re/main/packaging/install.sh | bash
-
-  # Forgejo mirror:
-  curl -fsSL https://git.khoavo.myds.me/vndangkhoa/zalo-swift-re/raw/branch/main/packaging/install.sh | bash
-  ```
-  *(Pass `... | bash -s -- --user` to install into `~/.local` without `sudo`, or `--launch` to start Olaz right away.)*
-
-- **1-Click Setup Files** ([GitHub Releases](https://github.com/vndangkhoa/zalo-swift-re/releases) · [Forgejo Releases](https://git.khoavo.myds.me/vndangkhoa/zalo-swift-re/releases) · [GitLab Releases](https://gitlab.khoavo.myds.me/vndangkhoa/zalo-swift-re/-/releases)):
-  - **Universal 1-Click Offline Setup (Omarchy + Ubuntu)**: `olaz-setup-linux-x86_64.run`
-    ```bash
-    chmod +x olaz-setup-linux-x86_64.run && ./olaz-setup-linux-x86_64.run
-    ```
-  - **Ubuntu 22.04 LTS / 24.04 LTS+ / Debian / Linux Mint / Pop!\_OS**: double-click `olaz_0.2.0_amd64.deb` in Software Install, or run:
-    ```bash
-    sudo apt install ./olaz_0.2.0_amd64.deb
-    ```
-  - **Omarchy / Arch Linux / CachyOS / EndeavourOS**:
-    ```bash
-    sudo pacman -U ./olaz-0.2.0-1-x86_64.pkg.tar.zst
-    ```
-
-### Build from source — Omarchy / Arch Linux
-
-1. **Install build & runtime packages** (already present on most Omarchy setups; `libgstolazauto.so` also embeds
-   fallback audio/video sinks and FFmpeg MP4/AAC/MP3/H.264 demuxing when `gst-plugins-good` / `gst-libav` are absent):
-   ```bash
-   sudo pacman -S --needed rust pkgconf webkit2gtk-4.1 gtk3 gstreamer gst-plugins-base opus libpulse ffmpeg xdg-desktop-portal 7zip
-   ```
-
-2. **Option A — Build & install to `~/.local` (no `sudo` needed for install)**:
-   ```bash
-   ./bin/build
-   ./bin/install --user        # installs ~/.local/bin/olaz + desktop launcher + hicolor icons
-   ~/.local/bin/olaz
-   ```
-
-3. **Option B — Build & install a native Arch `pacman` package (`pkgbuild/PKGBUILD`)**:
-   ```bash
-   ./bin/install               # runs `makepkg -fsi` inside pkgbuild/
-   ```
-
-### Ubuntu 22.04 LTS / 24.04 LTS+ (and Debian / Pop!\_OS / Linux Mint)
-
-1. **Install system dependencies**:
-   ```bash
-   ./packaging/ubuntu-deps.sh
-   ```
-   *(If Rust is not installed yet, install `rustup` via <https://rustup.rs>.)*
-
-2. **Option A — Build & install to `~/.local`**:
-   ```bash
-   ./bin/build
-   ./bin/install --user
-   ~/.local/bin/olaz
-   ```
-
-3. **Option B — Build & install native Linux release packages (`.deb`, `.pkg.tar.zst`, `.run`, `.tar.gz`)**:
-   ```bash
-   ./packaging/build-linux-release.sh
-   sudo apt install ./dist/v0.2.0/olaz_0.2.0_amd64.deb
-   ```
-
-### Linux CLI options (Multi-Account, Call Recorder, Anti-Recall, Self-Host Web, Proxy, REST/MCP)
-
-```bash
-# In-window Multi-Account Workspace: press Ctrl+Shift+N (or Tray → "Mở tài khoản khác") to add accounts,
-# switch instantly with Ctrl+1..9 / Ctrl+Tab, or run a separate OS window per profile:
-olaz --profile work                        # launch isolated secondary Zalo window
-olaz --proxy socks5h://127.0.0.1:1080      # route traffic & DoH over SOCKS5 / HTTP proxy
-olaz --api                                 # enable local loopback REST API on 127.0.0.1:17890 (or --api-port <PORT>)
-olaz --mcp                                 # run JSON-RPC 2.0 MCP stdio server bridged to running instance
-olaz --check-update                        # check GitHub & Forgejo releases (use --update to verify SHA-256 & download)
-
-# Zero-Server-Persistence Self-Hosted Web Mode (`olaz-web` — saves 0 user data on server, 100% in browser):
-cargo build --release -p olaz-web
-./target/release/olaz-web --listen 127.0.0.1:8080 --token "<secret>"
-```
-
-- **Call Recorder (Linux VoIP)**: Click the Record button in the call bar (right-click when idle to choose crash-safe stereo **WAV** or **Ogg/Opus**); saves `0600` files to `~/.local/share/olaz/recordings/` (or `<profile>/recordings/`).
-- **View Recalled ("Thu hồi") Messages**: Toggle **"Giữ tin nhắn thu hồi (Xem tin thu hồi)"** under the System Tray **"Quyền riêng tư"** menu (or via `POST /api/v1/privacy` / MCP `zalo_set_privacy` with `{"anti_recall": true}`).
-- **Self-Hosted Web Multi-Account & PIN Lock**: Open `https://<your-host>/?profile=work` for isolated browser-stored accounts, and optionally set a local `SubtleCrypto` `AES-256-GCM` PIN lock from the corner pill. See [`Dockerfile`](Dockerfile) (`--read-only`) and [`packaging/olaz-web.service`](packaging/olaz-web.service).
-
-### Linux tests & developer harness
-
-```bash
-./bin/test                                 # workspace unit + Node crypto parity + ASAR + DoH + portal tests
-./target/release/olaz --demo               # offline Setup / Liquid Glass preview mode
-./target/release/olaz --engine-probe [login|main] [seconds]
-RUST_LOG=olaz=debug,olaz_app=debug OLAZ_TRACE_WORKERS=1 ./target/release/olaz
-```
-
-### Release (maintainers)
-
-```bash
-xcrun notarytool store-credentials "olaz-notary" --apple-id <apple-id> --team-id <team-id>   # once
-./scripts/release.sh           # → dist/Olaz-1.0.dmg + dist/Olaz-1.0.zip (Developer ID, hardened runtime, notarized, stapled)
-OLAZ_VERSION=1.1 ./scripts/release.sh
-```
-
-The script signs `build/Olaz.app` with the "Developer ID Application" identity in your keychain, notarizes and
-staples the app, then wraps it in a drag-to-Applications DMG that is signed, notarized and stapled as well.
-Credentials stay in your keychain. Users still fetch the pinned Zalo runtime from VNG on first launch.
-
-### Pinned Zalo version
-
-The Zalo version is pinned in `ZaloRuntime.pinned` (version, DMG URL, SHA-256). To move Olaz to a newer Zalo,
-test against it and bump the pin. Installed runtimes are upgraded in the background and switched at the next launch.
-If the pinned DMG disappears from VNG's CDN, a fresh install falls back to whatever `zalo.me/download/zalo-pc` offers
-(still signature-checked). `OLAZ_ZALO_DMG=pinned OLAZ_NETWORK_TESTS=1 swift test --filter ZaloRuntimeTests` runs the
-install end to end.
-
-### Developer harness
-
-Prints every bridge/IPC call, console line and network request:
-
-```bash
-.build/debug/Olaz --engine-probe [login|main] [seconds]
-OLAZ_TRACE_WORKERS=1 OLAZ_DEBUG_RESPONSES=1 OLAZ_QR_OUT=/tmp/qr.png …
-```
-
-* Engine diagnostics: `~/Library/Application Support/Olaz/logs/engine.log` (shapes only, no message content or tokens).
-* Dev evaluation channel (debug builds only, off by default): `defaults write app.olaz.mac OlazDevEval -bool YES`.
-
-## Architecture
-
-```
-SwiftUI (Liquid Glass)                     Views/, Shell/, App/
-        │  @Observable ZaloEngine           ZaloRuntime/ZaloEngine.swift (+ feature extensions)
-        ▼
-OfficialClientHost  ── WKWebView, headless
-  ├─ zalo-app:// scheme → pc-dist served straight out of Zalo's app.asar      (AsarArchive, ZaloRuntimeInstaller)
-  ├─ HostScripts/network-shim.js → XHR/fetch/WebSocket proxied to URLSession   (NetworkProxy)
-  ├─ HostScripts/bridge.js       → $z* preload globals, Electron IPC emulation (ZaloBridge)
-  ├─ HostScripts/local-modules.js→ Node path/os/crypto objects, electron-store
-  ├─ HostScripts/state-adapter.js→ official state → Swift (QR via DI container, Redux store)
-  └─ HostScripts/*-adapter.js    → per-feature adapters over the official services (chat, composer, calls, …)
-        │
-ZaloMainProcess  ── Swift stand-in for Electron main.js: IPC channel handlers,
-                    cookies (zpw_sek), zsafe-storage, keychain cipher, page hand-off
-```
-
-* **Bridge table**: `Resources/bridge-table.json` maps all 450 table-driven preload members
-  to their IPC channel + type, generated from the official `preload-render.js`.
-  Semantics per channel: [`reanalysis/bridge-spec.md`](reanalysis/bridge-spec.md).
-* **Node parity**: `$znode.crypto` is reproduced on CommonCrypto/CryptoKit and verified
-  byte-for-byte against Node (`Tests/OlazTests/RuntimeTests.swift`). The official
-  client uses it to encrypt `zcid` and request params.
-* **Storage**: forced to IndexedDB (no native sqlite3): `fail_sqlite3=true`,
-  `canIUseSQLite→false`, `isMigrateFullDone→false`, as the spec prescribes.
-* **JSBridge/**: standalone JavaScriptCore runtime + WebCrypto shim + libsignal E2EE
-  module, for JS-only pieces that run outside the renderer.
-
-### Linux Rust Workspace (`crates/`)
-
-```
-OlazAppWindow (GTK3 frameless + webkit2gtk-4.1)            crates/olaz-app/
-  ├─ OfficialClientHost  ── mounts official Zalo PC UI directly (`login.html` → `index.html`)
-  │    ├─ zalo-app:// & zfile:// schemes with HTTP 206 byte-range slicing
-  │    ├─ Loopback HTTP 206 GStreamer media proxy + WebKit bubblewrap sandbox paths
-  │    ├─ Secondary frameless `popup-viewer.html` (MediaViewer) & `child.html` windows
-  │    └─ On-the-fly Linux renderer bundle patches (`WIN32` controls, `Ctrl+V` PNG paste, call logs)
-  └─ ZaloMainProcess     ── Rust Electron main-process & IPC implementation (`$zwindow`, `$znode`, `$znoti`, …)
-        │
-  ├─ crates/olaz-core/   ── Zero-copy `mmap` AsarArchive, pinned DMG installer (`7zz`/`7z` + SHA-256),
-  │                         Node-parity `$znode.crypto`, `zsafe-storage`, `ZDB4.0` (`db-cross-v4`),
-  │                         `zwalker`, `file-utilities`, `org.freedesktop.secrets` vault
-  ├─ crates/olaz-net/    ── `reqwest` (SOCKS5/HTTP `--proxy`) + `tokio-tungstenite` proxy, `0600` cookie jar (`zpw_sek`),
-  │                         DoH (`1.1.1.1` / `8.8.8.8`) for `*.zadn.vn`, streaming AES-GCM / AES-CTR media
-  ├─ crates/olaz-linux/  ── Pure-Rust 1:1 & group SFU VoIP engine (`call/`: Opus 16 kHz, stereo WAV/Opus call recorder,
-  │                         H.264 camera & screen share, Zavi/SRTP, `zcall-ui`), embedded `libgstolazauto.so`, `ksni` tray +
-  │                         privacy receipt blocker & anti-recall, scheduler & auto-reply, REST/MCP, `xdg-desktop-portal`
-  └─ crates/olaz-web/    ── Stateless zero-server-persistence self-hosted web relay (`olaz-web`) + browser-only preload,
-                            synchronous TypedArray `$znode.crypto`/vault/cookie engine, `?profile=<slot>` & WebCrypto PIN lock
-```
-
-## Status
-
-| Area | State |
+| Path | Purpose |
 |---|---|
-| Official renderer in WKWebView, from the Zalo PC code Olaz fetches from VNG (no Zalo PC install needed) | ✅ |
-| Electron main-process emulation (450-member IPC table) | ✅ login + main client paths |
-| Network via Swift: cookies, UA `ZaloPC-darwin-23v694`, CSP-safe sync bridge | ✅ |
-| Real QR login (trusted-device QR) → scan → confirm → session | ✅ verified end to end |
-| Session restore on relaunch (no QR) | ✅ |
-| Realtime WebSocket (`wsN-msg.chat.zalo.me`) | ✅ handshake + official sync commands |
-| Conversation list from official services, native SwiftUI | ✅ names, groups, members, unread |
-| Chat: open, history + load older, send text / reply, reactions, typing, read state, realtime | ✅ official chatbox controller + message loaders (`HostScripts/chat-adapter.js`) |
-| Native chat UI (bubbles, media, quotes, reactions, composer with IME-safe Return) | ✅ `Views/ChatView.swift`, `MessageBubble.swift`, `ChatComposer.swift` |
-| Composer "+": photos / video, files, screenshot, my contact card, reminder | ✅ official toolbar paths (`HostScripts/composer-adapter.js`, `ZaloEngine+Composer.swift`) |
-| Message actions: forward, copy, recall, delete + undo, pin bar, star | ✅ `HostScripts/message-actions-adapter.js` |
-| Voice / video calls | ✅ official `ZaloCall` helper (`CallBridge.swift`, `HostScripts/call-adapter.js`) |
-| Phone → PC message sync, native Liquid Glass progress UI | ✅ official sync-v2 state machine (`HostScripts/transfer-adapter.js`, `Views/TransferView.swift`) |
-| Hidden shared-worker window (Electron `sharedWorkerManager` port) | ✅ `ZaloRuntime/SharedWorkerRouter.swift` |
-| CDN media when system DNS fails `*.zadn.vn` | ✅ DNS-over-HTTPS fallback with pinned-SNI TLS (`ZaloRuntime/MediaLoader.swift`), Zalo hosts only |
-| Create group | 🧪 implemented over the official `createGroupV2` path, not yet verified against a live account |
-| Native SQLite backend (Zalo 26.10 migrates new sessions to SQLite) | ⏳ host stays on IndexedDB via the official "migration disabled" branch |
+| `crates/olaz-core/` | `mmap` ASAR reader, pinned VNG runtime installer, Node-parity `$znode.crypto`, `ZDB4.0` (`db-cross-v4`), `zwalker`, `file-utilities`, keyring vault, profile registry, and embedded `assets/` (`bridge-table.json` + `host_scripts/*.js`) |
+| `crates/olaz-net/` | `reqwest` (SOCKS5/HTTP `--proxy`) + `tokio-tungstenite` network proxy, `0600` cookie jar, DoH (`*.zadn.vn`), streaming `AES-GCM` / `AES-CTR` media |
+| `crates/olaz-linux/` | Pure-Rust VoIP engine (`call/`: Opus 16 kHz, stereo WAV / Ogg-Opus call recorder, H.264 camera & screen share, Zavi/SRTP), `libgstolazauto.so`, `ksni` tray, privacy & anti-recall settings, scheduler/auto-reply, REST & MCP |
+| `crates/olaz-app/` | Native GTK3 + `webkit2gtk-4.1` multi-account desktop app (`olaz`) |
+| `crates/olaz-web/` | Zero-server-persistence self-hosted web relay (`olaz-web`) & browser-only preload runtime |
+| `bin/` | Developer helper scripts (`./bin/build`, `./bin/install`, `./bin/test`) |
+| `packaging/` | 1-click Linux installer (`install.sh`), `.deb`/`.pkg.tar.zst`/`.run` builder, Flatpak manifest, `olaz-web.service` |
+| `pkgbuild/` | Arch Linux / Omarchy `PKGBUILD`, `.desktop` launcher, and hicolor SVG icon |
+| `Dockerfile`, `docker-compose.yml` | Hardened `--read-only` zero-persistence container deployment for `olaz-web` |
+| `docs/` | [`REVERSE-ENGINEERING-NOTES.md`](docs/REVERSE-ENGINEERING-NOTES.md) and [`reanalysis/`](docs/reanalysis/) IPC bridge specification |
+| `macos/` | Self-contained macOS Swift 6 / SwiftUI client (`Package.swift`, `Sources/`, `Tests/`, `Assets/`, `scripts/`) |
 
-## Reverse-engineering notes
+---
 
-* [REVERSE-ENGINEERING-NOTES.md](REVERSE-ENGINEERING-NOTES.md): how the original Zalo PC app (Electron 22) is
-  packaged and structured, and why the renderer can be hosted outside Electron.
-* [reanalysis/bridge-spec.md](reanalysis/bridge-spec.md): the preload bridge (`window.$z*`), IPC channels and
-  their semantics, written as a spec for a Swift/WKWebView host.
-* [reanalysis/bridge-table.json](reanalysis/bridge-table.json): machine-readable channel table.
-* Comments at the top of each `HostScripts/*-adapter.js` document the official code paths each feature drives.
+## 1. Linux Desktop (`olaz` — Omarchy & Ubuntu)
 
-## What is (and isn't) in this repo
+### Key Features
+- **Multi-Account Workspace**: Add accounts straight from Zalo's left `#main-tab` blue sidebar (`+` button or `Ctrl+Shift+N`), switch in `0 ms` (`Ctrl+1..9` / `Ctrl+Tab`), with isolated cookies, IndexedDB, keyring secrets, and unread badges.
+- **Anti-Recall ("Giữ thu hồi") — Enabled by Default**: Preserves recalled text, quotes, and cached media with a `Đã thu hồi` badge; toggle anytime from any chat bubble's **`...` → `Giữ thu hồi`** menu or the System Tray.
+- **Pure-Rust VoIP Calls & Call Recorder**: 1:1 & group calls with in-call **Record** button (`● REC MM:SS`, stereo WAV or Ogg/Opus) and configurable save folder under **Cài đặt → Cài đặt cuộc gọi → Ghi âm cuộc gọi**.
+- **Power Tools**: Outbound typing/seen/delivered receipt blockers, message scheduler, Vietnamese accent-folded auto-reply, SOCKS5/HTTP `--proxy`, local loopback REST API (`--api`), and stdio MCP server (`--mcp`).
 
-* **The Zalo runtime is not included.** Each user's Olaz downloads it from VNG and checks VNG's signature.
-* **Zalo's brand assets, UI string table and other files from the official bundle are not included.** They're
-  gitignored (see [.gitignore](.gitignore)). To regenerate them for research, extract them from your own copy of
-  Zalo PC.
-* **One third-party file is vendored**: [`Sources/Olaz/JSModules/vendor/libsignal-protocol.js`](Sources/Olaz/JSModules/vendor/libsignal-protocol.js),
-  VNG's fork of [signalapp/libsignal-protocol-javascript](https://github.com/signalapp/libsignal-protocol-javascript),
-  taken from Zalo PC 26.10.20 (`pc-dist/libs/libsignal-protocol.static.js`). Upstream is licensed **GPL-3.0**, so
-  this build is redistributed under GPL-3.0. Only the standalone `JSBridge` E2EE module and its tests use it. The live
-  client runs the copy inside the `app.asar` it downloads.
+### 1-Click Install (Prebuilt Releases)
+
+```bash
+# GitHub:
+curl -fsSL https://raw.githubusercontent.com/vndangkhoa/zalo-swift-re/main/packaging/install.sh | bash
+
+# Forgejo mirror:
+curl -fsSL https://git.khoavo.myds.me/vndangkhoa/zalo-swift-re/raw/branch/main/packaging/install.sh | bash
+```
+*(Pass `... | bash -s -- --user` to install into `~/.local` without `sudo`, or download `.deb` / `.pkg.tar.zst` / `.run` packages from [GitHub Releases](https://github.com/vndangkhoa/zalo-swift-re/releases) · [Forgejo Releases](https://git.khoavo.myds.me/vndangkhoa/zalo-swift-re/releases) · [GitLab Releases](https://gitlab.khoavo.myds.me/vndangkhoa/zalo-swift-re/-/releases).)*
+
+### Build from Source (Linux)
+
+```bash
+# Omarchy / Arch Linux dependencies:
+sudo pacman -S --needed rust pkgconf webkit2gtk-4.1 gtk3 gstreamer gst-plugins-base opus libpulse ffmpeg xdg-desktop-portal 7zip
+
+# Ubuntu 22.04 / 24.04 LTS+ dependencies:
+./packaging/ubuntu-deps.sh
+
+# Build & install into ~/.local (no sudo required):
+./bin/build
+./bin/install --user
+~/.local/bin/olaz
+```
+
+### Linux CLI & Tests
+
+```bash
+olaz --profile work                        # launch isolated standalone profile window
+olaz --proxy socks5h://127.0.0.1:1080      # route traffic & DoH over SOCKS5 / HTTP proxy
+olaz --api                                 # enable loopback REST API on 127.0.0.1:17890
+olaz --mcp                                 # run JSON-RPC 2.0 MCP stdio server
+olaz --check-update                        # check GitHub & Forgejo releases (--update to install)
+
+./bin/test                                 # run all 133 workspace unit, Node parity & E2E tests
+```
+
+---
+
+## 2. Self-Hosted Zero-Persistence Web (`olaz-web`)
+
+`olaz-web` lets you host Zalo in any modern HTTPS browser while storing **zero user data on the server**:
+- `$znode.crypto`, `SafeStorage`, `KeychainCipher`, `BrowserCookieJar` (`zpw_sek`), IndexedDB, and virtual OPFS files run **100% inside the browser**.
+- The Rust server runs with a **read-only filesystem** (`--read-only` / `ReadOnlyPaths=/`), acting purely as an allowlisted stateless HTTP/Range/WebSocket pass-through to `*.zalo.me` / `*.zadn.vn`.
+- Supports multi-account tabs via `?profile=work` / `?profile=personal` and optional local `SubtleCrypto` `PBKDF2-SHA256` → `AES-256-GCM` PIN lock.
+
+```bash
+# Turnkey read-only Docker Compose stack (auto-fetches & SHA-256 verifies app.asar once):
+OLAZ_WEB_TOKEN="replace-with-strong-secret" docker compose up -d --build
+```
+See [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml), and [`packaging/olaz-web.service`](packaging/olaz-web.service).
+
+---
+
+## 3. macOS Reference Client (`macos/`)
+
+Requires macOS 26+ and Xcode 27 (Swift 6 toolchain):
+
+```bash
+cd macos
+swift test                     # crypto parity (vs Node), ASAR reader, JSC/libsignal & host-script tests
+./scripts/make-app.sh debug    # → macos/build/Olaz.app
+open build/Olaz.app
+```
+
+---
+
+## Documentation & Reverse-Engineering Notes
+
+- [`docs/REVERSE-ENGINEERING-NOTES.md`](docs/REVERSE-ENGINEERING-NOTES.md): how official Zalo PC (Electron 22) is structured and hosted outside Electron.
+- [`docs/reanalysis/bridge-spec.md`](docs/reanalysis/bridge-spec.md) & [`docs/reanalysis/bridge-table.json`](docs/reanalysis/bridge-table.json): preload bridge (`window.$z*`) and 450-channel IPC specification.
+- Vendored GPL-3.0 third-party file (used only by standalone macOS `JSBridge` tests): [`macos/Sources/Olaz/JSModules/vendor/libsignal-protocol.js`](macos/Sources/Olaz/JSModules/vendor/libsignal-protocol.js).
 
 ## License
 
 Olaz is free software, licensed under the [GNU General Public License v3.0](LICENSE).
-Copyright © 2026 Quan Nguyen.

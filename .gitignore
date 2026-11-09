@@ -1,30 +1,33 @@
-# macOS
+# OS & editor files
 .DS_Store
+.claude/
+.gemini/
+.vscode/
+.idea/
 
-# SwiftPM / Xcode build output
+# Rust / Cargo & Linux packaging outputs
+/target/
+/dist/
+/pkgbuild/pkg/
+/pkgbuild/src/
+/pkgbuild/*.pkg.tar.*
+*.deb
+*.AppImage
+*.run
+
+# Legacy macOS SwiftPM / Xcode build outputs (`macos/`)
 .build/
 build/
+macos/.build/
+macos/build/
+macos/dist/
 DerivedData/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
 .swiftpm/
-
-# Rust / Cargo build output
-/target/
-/pkgbuild/pkg/
-/pkgbuild/src/
-/pkgbuild/*.pkg.tar.*
-
-# Editor / local tool config (may contain secrets)
-.claude/
-.vscode/
-.idea/
-
-# Release artifacts (scripts/release.sh)
-dist/
 *.dmg
 
-# Signing / notarization material — never commit
+# Signing / notarization / local environment secrets — never commit
 *.p12
 *.cer
 *.certSigningRequest
@@ -41,16 +44,11 @@ AuthKey_*.p8
 # ── Third-party Zalo (VNG) content ──────────────────────────────────────────
 # Olaz downloads the official Zalo PC runtime from VNG at first launch; none of
 # VNG's files are redistributed here. Regenerate these locally from Zalo PC if
-# you need them for reverse-engineering (see REVERSE-ENGINEERING-NOTES.md).
-
-# Extracted official Zalo app bundle (app.asar)
-reanalysis/app_extracted/
-# Zalo's Vietnamese UI string table, parsed from pc-dist/lazy/lang-vi.js
-reanalysis/lang_vi.json
-# Zalo brand assets / default avatar extracted from the official app
-Assets/zalo-logo.png
-Assets/zalo-wordmark.svg
-Assets/zalo.icns
-Assets/avatar-default.png
-# Copied from pc-dist/emoji/ (unused by Olaz)
-Sources/Olaz/Resources/sg_emo.json
+# you need them for reverse-engineering (see docs/REVERSE-ENGINEERING-NOTES.md).
+docs/reanalysis/app_extracted/
+docs/reanalysis/lang_vi.json
+macos/Assets/zalo-logo.png
+macos/Assets/zalo-wordmark.svg
+macos/Assets/zalo.icns
+macos/Assets/avatar-default.png
+macos/Sources/Olaz/Resources/sg_emo.json
