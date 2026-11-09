@@ -4,6 +4,8 @@
 //! Port of `Sources/Olaz/ZaloRuntime/FileSystemBridge.swift` and
 //! `FileManagerBridge` (`Sources/Olaz/ZaloRuntime/BridgeImplementation.swift:84-175`).
 
+use std::collections::HashSet;
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -18,6 +20,54 @@ use thiserror::Error;
 use crate::crypto::CryptoBridge;
 use crate::platform::ZaloPlatform;
 use crate::wire;
+
+/// Standard JSON return type for synchronous and asynchronous host bridge handlers.
+pub type BridgeResult = Result<Value, String>;
+
+/// Sandbox path capability interface shared across native module ports (`file_utilities`,
+/// `zwalker`, `db_cross`, `fs_bridge`).
+pub trait PlatformPaths: Send + Sync {
+    fn user_data(&self) -> &Path;
+    fn temp_dir(&self) -> &Path;
+    fn is_writable(&self, path: &Path) -> bool;
+    fn is_readable(&self, path: &Path) -> bool;
+}
+
+impl PlatformPaths for ZaloPlatform {
+    fn user_data(&self) -> &Path {
+        ZaloPlatform::user_data(self)
+    }
+
+    fn temp_dir(&self) -> &Path {
+        ZaloPlatform::temp_dir(self)
+    }
+
+    fn is_writable(&self, path: &Path) -> bool {
+        ZaloPlatform::is_writable(self, path)
+    }
+
+    fn is_readable(&self, path: &Path) -> bool {
+        ZaloPlatform::is_readable(self, path)
+    }
+}
+
+impl<T: PlatformPaths + ?Sized> PlatformPaths for Arc<T> {
+    fn user_data(&self) -> &Path {
+        (**self).user_data()
+    }
+
+    fn temp_dir(&self) -> &Path {
+        (**self).temp_dir()
+    }
+
+    fn is_writable(&self, path: &Path) -> bool {
+        (**self).is_writable(path)
+    }
+
+    fn is_readable(&self, path: &Path) -> bool {
+        (**self).is_readable(path)
+    }
+}
 
 const ZALO_NOISE_SIGN: [u8; 6] = [0x07, 0x7a, 0x41, 0x6c, 0x4f, 0x07];
 const ZALO_NOISE_XOR_KEY: u8 = 0x93;
@@ -600,27 +650,57 @@ impl FsBridge {
                     .map_err(|e| e.to_string())?;
                 Ok(wire::undefined())
             }
-            "$znode.nativelibs.fileUtilsAddon.getDiskUsage" => {
-                let total: i64 = 64 * 1024 * 1024 * 1024;
-                let avail: i64 = 32 * 1024 * 1024 * 1024;
-                Ok(json!({
-                    "total": total,
-                    "free": avail,
-                    "available": avail,
-                    "used": total - avail,
-                }))
+            "$znode.nativelibs.fileUtilsAddon.getDiskUsage" => file_utils_get_disk_usage(args),
+            "$znode.nativelibs.zfileAddon.getDiskInfo" => zfile_get_disk_info(),
+            "$znode.nativelibs.zfileAddon.getInfo" => zfile_get_info(args),
+            "$znode.nativelibs.zfileAddon.canRead" => {
+                let ok = arg_str(args, 0).is_some_and(|raw| !raw.is_empty() && Path::new(raw).exists());
+                Ok(Value::Bool(ok))
             }
-            "$znode.nativelibs.fileUtilitiesAddon.detectHardlinksAsync" => {
-                let links =
-                    self.detect_hardlinks_sync(&arg_path(args, 0), &arg_path(args, 1), 200_000);
-                Ok(json!(links))
+            "$znode.nativelibs.zfileAddon.canWrite"
+            | "$znode.nativelibs.zfileAddon.canReadAndWrite" => {
+                let ok = arg_str(args, 0).is_some_and(|raw| {
+                    if raw.is_empty() {
+                        return false;
+                    }
+                    let target = Path::new(raw);
+                    self.platform.is_writable(target)
+                        || target
+                            .parent()
+                            .is_some_and(|par| par.exists() && self.platform.is_writable(par))
+                });
+                Ok(Value::Bool(ok))
+            }
+            p if p.starts_with("$znode.nativelibs.fileUtilitiesAddon.") => {
+                let method = &p["$znode.nativelibs.fileUtilitiesAddon.".len()..];
+                crate::file_utilities::dispatch_file_utilities_sync(&*self.platform, method, args)
+            }
+            p if p.starts_with("$znode.nativelibs.dbUtilsAddon.") => {
+                let method = &p["$znode.nativelibs.dbUtilsAddon.".len()..];
+                crate::db_cross::dispatch_db_utils_sync(&*self.platform, method, args)
             }
             _ => self.dispatch_file_manager_sync(path, args),
         }
     }
 
+    /// Dispatches `zwalker-*` IPC channels against this bridge's confined platform paths.
+    pub fn dispatch_zwalker_ipc(&self, channel: &str, args: &[Value]) -> BridgeResult {
+        crate::zwalker::handle_zwalker_ipc(&*self.platform, channel, args)
+    }
+
     /// Dispatches asynchronous bridge calls on a background blocking thread.
     pub async fn dispatch_async(&self, path: &str, args: &[Value]) -> Result<Value, String> {
+        if let Some(method) = path.strip_prefix("$znode.nativelibs.fileUtilitiesAddon.") {
+            return crate::file_utilities::dispatch_file_utilities_async(
+                &*self.platform,
+                method,
+                args,
+            )
+            .await;
+        }
+        if let Some(method) = path.strip_prefix("$znode.nativelibs.dbUtilsAddon.") {
+            return crate::db_cross::dispatch_db_utils_async(&*self.platform, method, args).await;
+        }
         let this = self.clone();
         let path_owned = path.to_string();
         let args_owned = args.to_vec();
@@ -918,20 +998,30 @@ impl FsBridge {
                 noise_file_sync(&src, &dest, checksum).map_err(|e| e.to_string())?;
                 Ok(json!({ "savePath": dest.to_string_lossy() }))
             }
-            "$zFileManager.generateVideoThumbnail" => {
-                let src = arg_path(args, 0);
+            "$zFileManager.generateVideoThumbnail"
+            | "$znode.nativelibs.mp4thumbAddon.getThumbnail" => {
+                let src_raw = arg_str(args, 0).unwrap_or("").trim();
+                let src = Path::new(src_raw);
                 let dest = arg_path(args, 1);
                 let max_w = args
                     .get(2)
                     .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
-                    .unwrap_or(480)
+                    .unwrap_or(640)
                     .clamp(16, 4096) as u32;
                 let max_h = args
                     .get(3)
                     .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
-                    .unwrap_or(480)
+                    .unwrap_or(if path == "$znode.nativelibs.mp4thumbAddon.getThumbnail" {
+                        max_w as u64
+                    } else {
+                        640
+                    })
                     .clamp(16, 4096) as u32;
-                if src.as_os_str().is_empty() || dest.as_os_str().is_empty() || !src.is_file() {
+                let is_remote = is_remote_http_url(src_raw);
+                if src_raw.is_empty()
+                    || dest.as_os_str().is_empty()
+                    || (!is_remote && !src.is_file())
+                {
                     return Ok(Value::String(String::new()));
                 }
                 self.require_writable(&dest).map_err(|e| e.to_string())?;
@@ -941,7 +1031,7 @@ impl FsBridge {
                         .map_err(|e| FsError::from_io(e, parent).to_string())?;
                 }
                 match generate_video_thumbnail_sync(
-                    &src,
+                    src,
                     &dest,
                     max_w,
                     max_h,
@@ -1203,9 +1293,244 @@ pub fn copy_with_noise_mode(
     }
 }
 
-/// Generates a scaled JPEG thumbnail at `dest` from a local video file `src` (handling
-/// Zalo `fileNoise` inputs transparently) using `ffmpeg`. Returns `Ok(true)` if `dest`
-/// was written and is non-empty, or `Ok(false)` when `ffmpeg` is unavailable or fails.
+fn is_remote_http_url(raw: &str) -> bool {
+    raw.starts_with("http://") || raw.starts_with("https://")
+}
+
+/// Real `libc::statvfs` implementation of `$znode.nativelibs.fileUtilsAddon.getDiskUsage`.
+pub fn file_utils_get_disk_usage(args: &[Value]) -> BridgeResult {
+    if args.len() != 1 {
+        return Err("DISKUSAGE_WRONG_NUMBER_OF_ARGS".to_string());
+    }
+    let Some(path_str) = args[0].as_str() else {
+        return Err(
+            "DISKUSAGE_INVALID_ARG_TYPE:  The \"path\" argument must be one of type string"
+                .to_string(),
+        );
+    };
+    let cpath = CString::new(path_str)
+        .map_err(|_| "DISKUSAGE_RUNTIME_ERROR: Get diskusage failed".to_string())?;
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(cpath.as_ptr(), &mut vfs) } != 0 {
+        return Err("DISKUSAGE_RUNTIME_ERROR: Get diskusage failed".to_string());
+    }
+    let frsize = if vfs.f_frsize > 0 {
+        vfs.f_frsize as u64
+    } else {
+        vfs.f_bsize as u64
+    };
+    let available = (vfs.f_bavail as u64).saturating_mul(frsize);
+    let free = (vfs.f_bfree as u64).saturating_mul(frsize);
+    let total = (vfs.f_blocks as u64).saturating_mul(frsize);
+    Ok(json!({
+        "available": available,
+        "free": free,
+        "total": total,
+    }))
+}
+
+fn unescape_mount_field(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && (b'0'..=b'7').contains(&bytes[i + 1])
+            && (b'0'..=b'7').contains(&bytes[i + 2])
+            && (b'0'..=b'7').contains(&bytes[i + 3])
+        {
+            let val = ((bytes[i + 1] - b'0') << 6)
+                | ((bytes[i + 2] - b'0') << 3)
+                | (bytes[i + 3] - b'0');
+            out.push(val);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn is_real_zfile_fs(fstype: &str, dev: &str) -> bool {
+    const PSEUDO: &[&str] = &[
+        "proc",
+        "sysfs",
+        "tmpfs",
+        "devtmpfs",
+        "devpts",
+        "cgroup",
+        "cgroup2",
+        "overlay",
+        "squashfs",
+        "mqueue",
+        "debugfs",
+        "tracefs",
+        "securityfs",
+        "pstore",
+        "bpf",
+        "configfs",
+        "hugetlbfs",
+        "autofs",
+        "fusectl",
+        "binfmt_misc",
+        "ramfs",
+        "nsfs",
+        "rpc_pipefs",
+        "fuse.gvfsd-fuse",
+        "fuse.portal",
+        "efivarfs",
+    ];
+    if PSEUDO.contains(&fstype) {
+        return false;
+    }
+    if dev.starts_with("/dev/") {
+        return true;
+    }
+    const ALLOW: &[&str] = &[
+        "ext2", "ext3", "ext4", "btrfs", "xfs", "vfat", "exfat", "ntfs", "ntfs3", "fuseblk",
+        "f2fs", "zfs", "jfs", "reiserfs",
+    ];
+    ALLOW.contains(&fstype)
+}
+
+fn statvfs_disk_entry(dir: &str) -> Option<Value> {
+    let cdir = CString::new(dir).ok()?;
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(cdir.as_ptr(), &mut vfs) } != 0 {
+        return None;
+    }
+    let frsize = if vfs.f_frsize != 0 {
+        vfs.f_frsize as u64
+    } else {
+        vfs.f_bsize as u64
+    };
+    let blocks = vfs.f_blocks as u64;
+    let bfree = vfs.f_bfree as u64;
+    let total = blocks.saturating_mul(frsize);
+    if total == 0 {
+        return None;
+    }
+    let used = blocks.saturating_sub(bfree).saturating_mul(frsize);
+    let is_external =
+        dir.starts_with("/media/") || dir.starts_with("/run/media/") || dir.starts_with("/mnt/");
+    Some(json!({
+        "name": dir,
+        "label": dir,
+        "path": dir,
+        "isExternal": is_external,
+        "totalSpace": total,
+        "usedSpace": used,
+    }))
+}
+
+/// Real `/proc/mounts` + `libc::statvfs` implementation of `$znode.nativelibs.zfileAddon.getDiskInfo`.
+pub fn zfile_get_disk_info() -> BridgeResult {
+    let mut out = Map::new();
+    let mut seen = HashSet::new();
+
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        for line in mounts.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(raw_dev), Some(raw_dir), Some(fstype)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let dev = unescape_mount_field(raw_dev);
+            let dir = unescape_mount_field(raw_dir);
+            if seen.contains(&dir) || !is_real_zfile_fs(fstype, &dev) {
+                continue;
+            }
+            if let Some(entry) = statvfs_disk_entry(&dir) {
+                seen.insert(dir.clone());
+                out.insert(dir, entry);
+            }
+        }
+    }
+
+    if !out.contains_key("/") {
+        if let Some(root_entry) = statvfs_disk_entry("/") {
+            out.insert("/".to_string(), root_entry);
+        }
+    }
+
+    Ok(Value::Object(out))
+}
+
+fn walk_regular_files_recursive(dir: &Path) -> (u64, u64) {
+    let mut total_size = 0u64;
+    let mut file_count = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&cur) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            let ft = meta.file_type();
+            if ft.is_dir() {
+                stack.push(p);
+            } else if ft.is_file() {
+                total_size = total_size.saturating_add(meta.len());
+                file_count += 1;
+            }
+        }
+    }
+    (total_size, file_count)
+}
+
+/// Implementation of `$znode.nativelibs.zfileAddon.getInfo(path, isFolder?)`.
+pub fn zfile_get_info(args: &[Value]) -> BridgeResult {
+    let raw = arg_str(args, 0).unwrap_or("");
+    let is_folder = args.get(1).and_then(Value::as_bool).unwrap_or(false);
+    if raw.is_empty() {
+        return Err("ENOENT: no such file or directory, stat ''".to_string());
+    }
+    let path = Path::new(raw);
+    let meta = std::fs::metadata(path)
+        .map_err(|_| format!("ENOENT: no such file or directory, stat '{raw}'"))?;
+    let is_dir = meta.is_dir();
+    let is_file = meta.is_file();
+    let last_write_time = wire::WireStats::from(&meta).mtime_ms;
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| raw.to_string());
+
+    if is_folder {
+        let (size, file_count) = if is_dir {
+            walk_regular_files_recursive(path)
+        } else {
+            (0, 0)
+        };
+        Ok(json!({
+            "size": size,
+            "isDirectory": is_dir,
+            "isFile": is_file,
+            "name": name,
+            "lastWriteTime": last_write_time,
+            "fileCount": file_count,
+        }))
+    } else {
+        Ok(json!({
+            "size": meta.len(),
+            "isDirectory": is_dir,
+            "isFile": is_file,
+            "name": name,
+            "lastWriteTime": last_write_time,
+        }))
+    }
+}
+
+/// Generates a scaled JPEG thumbnail at `dest` from a local video file or `http(s)://` URL `src`
+/// (handling Zalo `fileNoise` inputs transparently on local files) using `ffmpeg`. Returns
+/// `Ok(true)` if `dest` was written and is non-empty, or `Ok(false)` when `ffmpeg` is
+/// unavailable or fails.
 pub fn generate_video_thumbnail_sync(
     src: &Path,
     dest: &Path,
@@ -1213,19 +1538,25 @@ pub fn generate_video_thumbnail_sync(
     max_height: u32,
     temp_dir: &Path,
 ) -> Result<bool, FsError> {
-    let (_, noise_sig) = inspect_file_noise(src, true)?;
-    let _ = std::fs::create_dir_all(temp_dir);
+    let src_lossy = src.to_string_lossy();
+    let is_remote = is_remote_http_url(&src_lossy);
 
     let mut denoised_guard: Option<NamedTempFile> = None;
-    let effective_src: PathBuf = if noise_sig.is_some() {
-        let tmp_in =
-            NamedTempFile::new_in(temp_dir).map_err(|e| FsError::from_io(e, temp_dir))?;
-        denoise_file_sync(src, tmp_in.path(), "")?;
-        let p = tmp_in.path().to_path_buf();
-        denoised_guard = Some(tmp_in);
-        p
+    let effective_input: std::ffi::OsString = if is_remote {
+        src.as_os_str().to_os_string()
     } else {
-        src.to_path_buf()
+        let (_, noise_sig) = inspect_file_noise(src, true)?;
+        let _ = std::fs::create_dir_all(temp_dir);
+        if noise_sig.is_some() {
+            let tmp_in =
+                NamedTempFile::new_in(temp_dir).map_err(|e| FsError::from_io(e, temp_dir))?;
+            denoise_file_sync(src, tmp_in.path(), "")?;
+            let os = tmp_in.path().as_os_str().to_os_string();
+            denoised_guard = Some(tmp_in);
+            os
+        } else {
+            src.as_os_str().to_os_string()
+        }
     };
 
     let parent = dest.parent().ok_or_else(|| FsError::eacces(dest))?;
@@ -1233,8 +1564,10 @@ pub fn generate_video_thumbnail_sync(
     let tmp_out = NamedTempFile::new_in(parent).map_err(|e| FsError::from_io(e, parent))?;
     let tmp_out_path = tmp_out.path().to_path_buf();
 
+    let mw = max_width.max(2);
+    let mh = max_height.max(2);
     let vf = format!(
-        "scale='min({max_width},iw)':'min({max_height},ih)':force_original_aspect_ratio=decrease"
+        "scale='min({mw},iw)':'min({mh},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
     );
 
     let run_ffmpeg = |seek_arg: &str| -> bool {
@@ -1248,14 +1581,14 @@ pub fn generate_video_thumbnail_sync(
                 seek_arg,
             ])
             .arg("-i")
-            .arg(&effective_src)
+            .arg(&effective_input)
             .args([
                 "-frames:v",
                 "1",
                 "-vf",
                 &vf,
                 "-q:v",
-                "4",
+                "3",
                 "-f",
                 "image2",
                 "-y",
