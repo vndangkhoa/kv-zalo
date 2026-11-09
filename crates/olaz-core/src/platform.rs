@@ -26,7 +26,7 @@ const MAX_SYMLINK_HOPS: usize = 40;
 pub struct ClientIdentity {
     /// `type` query parameter of the official macOS client (`"23"`).
     pub client_type: String,
-    /// `client_version` query parameter of the official macOS client (`"694"`).
+    /// `client_version` query parameter of the official macOS client (`"695"`).
     pub client_version: String,
 }
 
@@ -34,13 +34,13 @@ impl Default for ClientIdentity {
     fn default() -> Self {
         Self {
             client_type: "23".to_string(),
-            client_version: "694".to_string(),
+            client_version: "695".to_string(),
         }
     }
 }
 
 impl ClientIdentity {
-    /// Builds the official desktop User-Agent string (`"ZaloPC-darwin-23v694"`).
+    /// Builds the official desktop User-Agent string (`"ZaloPC-darwin-23v695"`).
     ///
     /// The renderer derives the device ID from `md5(navigator.userAgent)`, so this exact
     /// format must be preserved on Linux as well.
@@ -857,7 +857,7 @@ impl ZaloPlatform {
 
 impl Default for ZaloPlatform {
     fn default() -> Self {
-        Self::new("26.10.20")
+        Self::new("26.11.10")
     }
 }
 

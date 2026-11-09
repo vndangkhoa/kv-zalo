@@ -23,5 +23,8 @@ pub use bundle::{
     transform_bundle_asset, transform_zalo_html, web_bridge_spec_script, BundleProvider,
     ServedAsset, BOOT_HTML, CRYPTO_SYNC_JS, PRELOAD_JS, SW_JS,
 };
-pub use relay::{PrefixedTcpStream, StatelessRelay, DEFAULT_WS_ORIGIN, ZALO_USER_AGENT};
+pub use relay::{
+    PrefixedTcpStream, StatelessRelay, DEFAULT_WS_ORIGIN, ZALO_APP_VERSION, ZALO_CLIENT_TYPE,
+    ZALO_CLIENT_VERSION, ZALO_USER_AGENT,
+};
 pub use server::{start_web_server, WebServerConfig, WebServerHandle};

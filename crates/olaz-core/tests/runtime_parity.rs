@@ -339,12 +339,12 @@ fn crypto_swift_reference_vectors() {
 
     // Device ID MD5 vector verified against `node`
     let expected_ua_md5 = run_node_json(
-        r#"console.log(JSON.stringify(require('crypto').createHash('md5').update('ZaloPC-darwin-23v694').digest('hex')));"#,
+        r#"console.log(JSON.stringify(require('crypto').createHash('md5').update('ZaloPC-darwin-23v695').digest('hex')));"#,
     );
     let md5 = crypto
         .dispatch_sync(
             "$znode.crypto.hash",
-            &[json!("ZaloPC-darwin-23v694"), json!("md5"), json!("utf8"), json!("hex")],
+            &[json!("ZaloPC-darwin-23v695"), json!("md5"), json!("utf8"), json!("hex")],
         )
         .unwrap();
     assert_eq!(md5, expected_ua_md5);
@@ -1113,8 +1113,8 @@ async fn platform_identity_imei_stores_adapter_and_symlink_confinement() {
     let outside_file = outside.join("passwd.txt");
     std::fs::write(&outside_file, b"do-not-overwrite").unwrap();
 
-    let platform = Arc::new(ZaloPlatform::with_root(&root, "26.10.20"));
-    assert_eq!(ClientIdentity::default().user_agent(), "ZaloPC-darwin-23v694");
+    let platform = Arc::new(ZaloPlatform::with_root(&root, "26.11.10"));
+    assert_eq!(ClientIdentity::default().user_agent(), "ZaloPC-darwin-23v695");
 
     // Persistent IMEI across platform reloads
     let imei1 = platform.imei();
@@ -1405,14 +1405,14 @@ fn main_startup_sync_global_id_patch_matches_swift_tests() {
 
 #[tokio::test]
 async fn runtime_installer_pinned_sha256_promotion_and_7z_extract() {
-    assert_eq!(ZaloRelease::PINNED.version, "26.10.20");
+    assert_eq!(ZaloRelease::PINNED.version, "26.11.10");
     assert_eq!(
         ZaloRelease::PINNED.url,
-        "https://res-download-pc.zadn.vn/mac/ZaloSetup-universal-26.10.20.dmg"
+        "https://res-download-pc.zadn.vn/mac/ZaloSetup-universal-26.11.10.dmg"
     );
     assert_eq!(
         ZaloRelease::PINNED.sha256.as_deref(),
-        Some("a45d30b7f7b060f76b87722ef419b8f41d23a2913cdef084dcb0955dde8d85a0")
+        Some("eff7e9c887a1164ae078e919f950b5552ffc3d846f8a63bd12ce88171ba79092")
     );
     assert_eq!(
         ZaloRuntimeManager::version_from_installer_name("ZaloSetup-universal-26.10.20.dmg")

@@ -32,8 +32,17 @@ use tokio_tungstenite::{client_async_tls_with_config, Connector, WebSocketStream
 
 use crate::allowlist::{AllowlistError, AllowlistValidator};
 
+/// Official Zalo PC macOS client type (`"23"`).
+pub const ZALO_CLIENT_TYPE: &str = "23";
+
+/// Official Zalo PC macOS client version (`"695"`, matching Zalo PC `26.11.10`).
+pub const ZALO_CLIENT_VERSION: &str = "695";
+
+/// Official Zalo PC macOS app version (`"26.11.10"`).
+pub const ZALO_APP_VERSION: &str = "26.11.10";
+
 /// Official Zalo PC macOS User-Agent enforced on all relayed HTTP, media, and WS requests.
-pub const ZALO_USER_AGENT: &str = "ZaloPC-darwin-23v694";
+pub const ZALO_USER_AGENT: &str = "ZaloPC-darwin-23v695";
 
 /// Default Electron `Origin` header sent on Zalo WebSocket upgrades.
 pub const DEFAULT_WS_ORIGIN: &str = "file://";

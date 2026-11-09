@@ -2791,7 +2791,7 @@ fn inject_common_preamble_and_meta(ucm: &UserContentManager, platform: &ZaloPlat
     ));
 
     let ver_json =
-        serde_json::to_string(&platform.app_version()).unwrap_or_else(|_| "\"26.10.20\"".into());
+        serde_json::to_string(&platform.app_version()).unwrap_or_else(|_| "\"26.11.10\"".into());
     let proxy_base_json = std::env::var("OLAZ_GST_MEDIA_PROXY_BASE")
         .ok()
         .filter(|s| !s.is_empty())

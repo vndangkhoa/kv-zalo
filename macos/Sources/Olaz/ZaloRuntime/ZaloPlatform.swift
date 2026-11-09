@@ -14,7 +14,7 @@ final class ZaloPlatform {
     struct ClientIdentity {
         /// `type` query parameter of the macOS client.
         var clientType = "23"
-        var clientVersion = "694"
+        var clientVersion = "695"
     }
 
     let appVersion: String

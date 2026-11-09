@@ -952,7 +952,7 @@ async fn stateless_http_media_and_ws_relay_e2e_on_readonly_filesystem() {
         json!({ "ok": true, "stateless": true, "persistence": "browser-only" })
     );
 
-    // 3b. Root redirect preserves `?profile=<slot>`
+    // 3b. Root redirect preserves `?profile=<slot>` and injects full `ZaloMainProcess.pageQuery`
     let root_redir = client
         .get(format!("{base_url}/?profile=work_acc"))
         .send()
@@ -966,7 +966,7 @@ async fn stateless_http_media_and_ws_relay_e2e_on_readonly_filesystem() {
             .unwrap()
             .to_str()
             .unwrap(),
-        "/login.html?fail_sqlite3=true&profile=work_acc"
+        "/login.html?type=23&client_version=695&app_version=26.11.10&about_version=&new_install=0&fail_sqlite3=true&mode_lang=&profile=work_acc"
     );
 
     // 3c. Transformed `login.html`, `dal-worker`, `preload.js`, `sw.js`
@@ -1081,7 +1081,7 @@ async fn stateless_http_media_and_ws_relay_e2e_on_readonly_filesystem() {
         assert_eq!(
             rec.http_user_agents[0].as_deref(),
             Some(ZALO_USER_AGENT),
-            "must inject ZaloPC-darwin-23v694"
+            "must inject ZaloPC-darwin-23v695"
         );
         assert_eq!(rec.http_user_agents[1].as_deref(), Some(ZALO_USER_AGENT));
         assert_eq!(
@@ -1769,6 +1769,10 @@ async fn browser_preload_multi_account_pin_vault_sw_and_cli_smoke() {
 
       const rawUnprefixedOpen = IDBFactory.prototype.open;
 
+      // Pre-poison `zpw_type` / `zpw_ver` in slot localStorage to prove `<head>` heals stale `'null'`!
+      ls._m.set('olaz:acc_2:zpw_type', 'null');
+      ls._m.set('olaz:acc_2:zpw_ver', 'null');
+
       vm.runInNewContext(fs.readFileSync(input.cryptoJs, 'utf8'), win, { filename: 'crypto_sync.js' });
       vm.runInNewContext(input.bridgeTableScript, win, { filename: 'bridge_table.js' });
       vm.runInNewContext(fs.readFileSync(input.preloadJs, 'utf8'), win, { filename: 'preload.js' });
@@ -1776,9 +1780,19 @@ async fn browser_preload_multi_account_pin_vault_sw_and_cli_smoke() {
       (async () => {
         await win.__olazBootReady;
 
-        // 1. Verify navigator.userAgent override
-        assert.equal(win.navigator.userAgent, 'ZaloPC-darwin-23v694');
+        // 1. Verify navigator.userAgent override + pageQuery / localStorage client_version healing
+        assert.equal(win.navigator.userAgent, 'ZaloPC-darwin-23v695');
         assert.equal(win.__olazActiveProfile, 'acc_2');
+        assert.equal(win.localStorage.getItem('zpw_type'), '23');
+        assert.equal(win.localStorage.getItem('zpw_ver'), '695');
+        assert.equal(win.localStorage.getItem('app_ver'), '26.11.10');
+        const healedSearch = new URLSearchParams(win.location.search);
+        assert.equal(healedSearch.get('type'), '23');
+        assert.equal(healedSearch.get('client_version'), '695');
+        assert.equal(healedSearch.get('app_version'), '26.11.10');
+        assert.equal(healedSearch.get('new_install'), '0');
+        assert.equal(healedSearch.get('fail_sqlite3'), 'true');
+        assert.equal(healedSearch.get('profile'), 'acc_2');
 
         // 2. Verify all 41+ `$z*` globals installed
         for (const g of win.__zaloBridgeSpec.globals) {

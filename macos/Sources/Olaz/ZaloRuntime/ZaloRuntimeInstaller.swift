@@ -27,9 +27,9 @@ enum ZaloRuntime {
     /// The Zalo PC release this Olaz build is tested with. Bumping it (version, DMG URL, DMG checksum) is how Olaz moves
     /// to a newer Zalo: an older runtime is upgraded in the background and swapped in at the next launch.
     static let pinned = Release(
-        version: "26.10.20",
-        url: URL(string: "https://res-download-pc.zadn.vn/mac/ZaloSetup-universal-26.10.20.dmg")!,
-        sha256: "a45d30b7f7b060f76b87722ef419b8f41d23a2913cdef084dcb0955dde8d85a0")
+        version: "26.11.10",
+        url: URL(string: "https://res-download-pc.zadn.vn/mac/ZaloSetup-universal-26.11.10.dmg")!,
+        sha256: "eff7e9c887a1164ae078e919f950b5552ffc3d846f8a63bd12ce88171ba79092")
 
     /// The download button of zalo.me/pc: redirects a Mac browser to the current DMG. Used when the pinned one is gone.
     static let latestLink = URL(string: "https://zalo.me/download/zalo-pc")!

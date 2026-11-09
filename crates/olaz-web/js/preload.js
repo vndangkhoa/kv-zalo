@@ -59,8 +59,10 @@ function bootstrapSessionRuntime(globalScope) {
 
   const IS_WINDOW = typeof window !== 'undefined' && typeof document !== 'undefined';
   const IS_WORKER = !IS_WINDOW && typeof self !== 'undefined';
-  const ZALO_USER_AGENT = 'ZaloPC-darwin-23v694';
-  const ZALO_APP_VERSION = '26.10.20';
+  const ZALO_CLIENT_TYPE = '23';
+  const ZALO_CLIENT_VERSION = '695';
+  const ZALO_APP_VERSION = '26.11.10';
+  const ZALO_USER_AGENT = 'ZaloPC-darwin-' + ZALO_CLIENT_TYPE + 'v' + ZALO_CLIENT_VERSION;
   const PBKDF2_ITERATIONS = 600000;
   const ZALO_RELAY_SUFFIXES = [
     'zalo.me',
@@ -207,7 +209,7 @@ function bootstrapSessionRuntime(globalScope) {
     saveKnownProfiles(loadKnownProfiles());
   }
 
-  // Override `navigator.userAgent` -> `ZaloPC-darwin-23v694` so `md5(navigator.userAgent)` in `z_uuid` matches upstream!
+  // Override `navigator.userAgent` -> `ZaloPC-darwin-23v695` so `md5(navigator.userAgent)` in `z_uuid` matches upstream!
   try {
     if (globalScope.navigator) {
       const navProto = Object.getPrototypeOf(globalScope.navigator);
@@ -280,6 +282,97 @@ function bootstrapSessionRuntime(globalScope) {
     };
   }
 
+  function buildZaloPageQuery(extraParams) {
+    const q = new URLSearchParams();
+    q.set('type', ZALO_CLIENT_TYPE);
+    q.set('client_version', ZALO_CLIENT_VERSION);
+    q.set('app_version', ZALO_APP_VERSION);
+    q.set('about_version', '');
+    q.set('new_install', '0');
+    q.set('fail_sqlite3', 'true');
+    q.set('mode_lang', '');
+    if (extraParams && typeof extraParams === 'object') {
+      for (const [k, v] of Object.entries(extraParams)) {
+        if (v !== undefined && v !== null) {
+          q.set(k, String(v));
+        }
+      }
+    }
+    if (ACTIVE_SLOT !== 'default') {
+      q.set('profile', ACTIVE_SLOT);
+    }
+    return q;
+  }
+
+  function seedZaloClientIdentity() {
+    globalScope.__zaloRuntime = {
+      appVersion: ZALO_APP_VERSION,
+      clientType: ZALO_CLIENT_TYPE,
+      clientVersion: ZALO_CLIENT_VERSION,
+    };
+    if (!IS_WINDOW) return;
+    try {
+      if (window.localStorage) {
+        window.localStorage.setItem('zpw_type', ZALO_CLIENT_TYPE);
+        window.localStorage.setItem('zpw_ver', ZALO_CLIENT_VERSION);
+        window.localStorage.setItem('app_ver', ZALO_APP_VERSION);
+      }
+    } catch {}
+
+    try {
+      const loc = globalScope.location;
+      if (
+        loc &&
+        typeof loc.pathname === 'string' &&
+        loc.pathname !== '/boot.html' &&
+        /\.html$/i.test(loc.pathname)
+      ) {
+        const q = new URLSearchParams(loc.search || '');
+        let mutated = false;
+        const syncExactParam = (k, expected) => {
+          if (q.get(k) !== expected) {
+            q.set(k, expected);
+            mutated = true;
+          }
+        };
+        const syncDefaultParam = (k, fallback) => {
+          const cur = q.get(k);
+          if (cur === null || cur === 'null' || cur === 'undefined') {
+            q.set(k, fallback);
+            mutated = true;
+          }
+        };
+        syncExactParam('type', ZALO_CLIENT_TYPE);
+        syncExactParam('client_version', ZALO_CLIENT_VERSION);
+        syncExactParam('app_version', ZALO_APP_VERSION);
+        syncDefaultParam('about_version', '');
+        syncDefaultParam('new_install', '0');
+        syncDefaultParam('fail_sqlite3', 'true');
+        syncDefaultParam('mode_lang', '');
+        if (ACTIVE_SLOT !== 'default' && q.get('profile') !== ACTIVE_SLOT) {
+          q.set('profile', ACTIVE_SLOT);
+          mutated = true;
+        }
+        if (mutated) {
+          const nextSearch = '?' + q.toString();
+          const nextRel = loc.pathname + nextSearch + (loc.hash || '');
+          if (globalScope.history && typeof globalScope.history.replaceState === 'function') {
+            globalScope.history.replaceState(globalScope.history.state || null, '', nextRel);
+          } else {
+            try {
+              loc.search = nextSearch;
+              if (typeof loc.origin === 'string') {
+                loc.href = loc.origin + nextRel;
+              }
+            } catch {}
+          }
+        }
+      }
+    } catch {}
+  }
+
+  seedZaloClientIdentity();
+
   function appendProfileParam(rawUrl) {
     if (ACTIVE_SLOT === 'default' || typeof rawUrl !== 'string') return rawUrl;
     if (/^(blob:|data:|javascript:|about:)/i.test(rawUrl)) return rawUrl;
@@ -296,13 +389,35 @@ function bootstrapSessionRuntime(globalScope) {
     }
   }
 
+  function appendWorkerRuntimeParams(rawUrl) {
+    if (typeof rawUrl !== 'string') return rawUrl;
+    if (/^(blob:|data:|javascript:|about:)/i.test(rawUrl)) return rawUrl;
+    try {
+      const base = globalScope.location ? globalScope.location.href : 'http://localhost/';
+      const u = new URL(rawUrl, base);
+      if (globalScope.location && u.origin !== globalScope.location.origin) return rawUrl;
+      u.searchParams.set('type', ZALO_CLIENT_TYPE);
+      u.searchParams.set('client_version', ZALO_CLIENT_VERSION);
+      u.searchParams.set('app_version', ZALO_APP_VERSION);
+      if (!u.searchParams.has('fail_sqlite3')) {
+        u.searchParams.set('fail_sqlite3', 'true');
+      }
+      if (ACTIVE_SLOT !== 'default' && !u.searchParams.has('profile')) {
+        u.searchParams.set('profile', ACTIVE_SLOT);
+      }
+      return u.pathname + u.search + u.hash;
+    } catch {
+      return rawUrl;
+    }
+  }
+
   if (NativeWorker) {
     const WrappedWorker = function (scriptURL, options) {
       const nextUrl =
         typeof scriptURL === 'string'
-          ? appendProfileParam(scriptURL)
+          ? appendWorkerRuntimeParams(scriptURL)
           : scriptURL instanceof URL
-            ? appendProfileParam(scriptURL.href)
+            ? appendWorkerRuntimeParams(scriptURL.href)
             : scriptURL;
       return options !== undefined ? new NativeWorker(nextUrl, options) : new NativeWorker(nextUrl);
     };
@@ -1960,10 +2075,7 @@ function bootstrapSessionRuntime(globalScope) {
       const ifr = document.createElement('iframe');
       ifr.style.cssText = 'position:fixed;width:0;height:0;border:0;visibility:hidden;pointer-events:none;';
       ifr.setAttribute('aria-hidden', 'true');
-      const q = new URLSearchParams();
-      q.set('is_main', 'false');
-      q.set('fail_sqlite3', 'true');
-      if (ACTIVE_SLOT !== 'default') q.set('profile', ACTIVE_SLOT);
+      const q = buildZaloPageQuery({ is_main: 'false' });
       ifr.src = '/shared-worker.html?' + q.toString();
       document.body.appendChild(ifr);
       sharedWorkerIframe = ifr;
@@ -2096,9 +2208,9 @@ function bootstrapSessionRuntime(globalScope) {
       case 'electron-store-get-data':
         return { defaultCwd: VFS_USER_DATA, appVersion: ZALO_APP_VERSION };
       case 'get-child-url':
-        return window.location.origin + appendProfileParam('/child.html');
+        return window.location.origin + '/child.html?' + buildZaloPageQuery().toString();
       case 'get-photo-viewer-url':
-        return window.location.origin + appendProfileParam('/popup-viewer.html');
+        return window.location.origin + '/popup-viewer.html?' + buildZaloPageQuery().toString();
       case 'get-resource-dir':
         return window.location.origin + '/';
 
@@ -2224,19 +2336,13 @@ function bootstrapSessionRuntime(globalScope) {
         return Array.isArray(arr) ? arr.map((w) => decodeBridgeWireResult(w)) : [];
       }
       case 'login-success': {
-        const q = new URLSearchParams();
-        q.set('is_main', 'true');
-        q.set('fail_sqlite3', 'true');
-        if (ACTIVE_SLOT !== 'default') q.set('profile', ACTIVE_SLOT);
+        const q = buildZaloPageQuery({ is_main: 'true', already_login: 'y' });
         window.location.assign('/index.html?' + q.toString());
         return undefined;
       }
       case 'login': {
         cookieJar.clearCookies();
-        const q = new URLSearchParams();
-        q.set('fail_sqlite3', 'true');
-        q.set('logout', '1');
-        if (ACTIVE_SLOT !== 'default') q.set('profile', ACTIVE_SLOT);
+        const q = buildZaloPageQuery({ logout: '1' });
         window.location.assign('/login.html?' + q.toString());
         return undefined;
       }
@@ -2414,13 +2520,11 @@ function bootstrapSessionRuntime(globalScope) {
       }
       case 'migratedb:signal_restart': {
         writeNamedStoreSync('database-config', readNamedStoreSync('database-config'));
-        const q = new URLSearchParams();
-        q.set('fail_sqlite3', 'true');
-        if (ACTIVE_SLOT !== 'default') q.set('profile', ACTIVE_SLOT);
         if (cookieJar.hasZpwSek()) {
-          q.set('is_main', 'true');
+          const q = buildZaloPageQuery({ is_main: 'true', already_login: 'y' });
           window.location.assign('/index.html?' + q.toString());
         } else {
+          const q = buildZaloPageQuery();
           window.location.assign('/login.html?' + q.toString());
         }
         return undefined;
@@ -3842,10 +3946,7 @@ function bootstrapSessionRuntime(globalScope) {
       } catch {}
     }
 
-    const q = new URLSearchParams();
-    q.set('fail_sqlite3', 'true');
-    q.set('logout', '1');
-    if (ACTIVE_SLOT !== 'default') q.set('profile', ACTIVE_SLOT);
+    const q = buildZaloPageQuery({ logout: '1' });
     window.location.replace('/login.html?' + q.toString());
   }
 
@@ -5532,6 +5633,27 @@ function bootstrapSessionRuntime(globalScope) {
       }
     }
 
+    for (const storeName of ['config', 'default']) {
+      const stObj = hostStoresRam.get(storeName);
+      if (stObj && typeof stObj === 'object') {
+        let fixed = false;
+        for (const key of ['sh_app_ver', 'appVersion']) {
+          if (
+            stObj[key] === '0.1.0' ||
+            stObj[key] === 'null' ||
+            stObj[key] === 'undefined' ||
+            stObj[key] === ''
+          ) {
+            stObj[key] = ZALO_APP_VERSION;
+            fixed = true;
+          }
+        }
+        if (fixed) {
+          writeNamedStoreSync(storeName, stObj);
+        }
+      }
+    }
+
     if (!hostImei) {
       hostImei = generateDefaultImei();
       idbPutKv('imei', hostImei);
@@ -5605,16 +5727,14 @@ function bootstrapSessionRuntime(globalScope) {
 
   window.__olazBootReady = (async () => {
     await hydrateBrowserVault();
+    seedZaloClientIdentity();
 
     // Smart client-side boot routing: if user visits `/login.html` with an active `zpw_sek`
     // in their browser vault (and didn't explicitly log out), go straight to `/index.html`!
     const pathname = window.location.pathname;
     const params = new URLSearchParams(window.location.search);
     if (pathname.endsWith('/login.html') && cookieJar.hasZpwSek() && params.get('logout') !== '1') {
-      const q = new URLSearchParams();
-      q.set('is_main', 'true');
-      q.set('fail_sqlite3', 'true');
-      if (ACTIVE_SLOT !== 'default') q.set('profile', ACTIVE_SLOT);
+      const q = buildZaloPageQuery({ is_main: 'true', already_login: 'y' });
       window.location.replace('/index.html?' + q.toString());
       return;
     }

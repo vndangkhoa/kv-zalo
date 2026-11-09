@@ -32,8 +32,8 @@ use url::Url;
 use crate::cookies::ZaloCookieJar;
 use crate::doh::{is_zalo_cdn, parse_upstream_proxy, ZaloDnsResolver};
 
-/// Default Zalo PC macOS User-Agent (`OfficialClientHost.userAgent(clientType: "23", clientVersion: "694")`).
-pub const DEFAULT_USER_AGENT: &str = "ZaloPC-darwin-23v694";
+/// Default Zalo PC macOS User-Agent (`OfficialClientHost.userAgent(clientType: "23", clientVersion: "695")`).
+pub const DEFAULT_USER_AGENT: &str = "ZaloPC-darwin-23v695";
 
 /// Origin header sent on WebSocket upgrades (`Electron` renderer loaded from `file://`).
 pub const WEBSOCKET_ORIGIN: &str = "file://";

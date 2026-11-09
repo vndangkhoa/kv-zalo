@@ -46,12 +46,12 @@ pub struct ZaloRelease {
 impl ZaloRelease {
     /// Pinned Zalo PC release tested with this Olaz build.
     pub const PINNED: Self = Self {
-        version: Cow::Borrowed("26.10.20"),
+        version: Cow::Borrowed("26.11.10"),
         url: Cow::Borrowed(
-            "https://res-download-pc.zadn.vn/mac/ZaloSetup-universal-26.10.20.dmg",
+            "https://res-download-pc.zadn.vn/mac/ZaloSetup-universal-26.11.10.dmg",
         ),
         sha256: Some(Cow::Borrowed(
-            "a45d30b7f7b060f76b87722ef419b8f41d23a2913cdef084dcb0955dde8d85a0",
+            "eff7e9c887a1164ae078e919f950b5552ffc3d846f8a63bd12ce88171ba79092",
         )),
     };
 

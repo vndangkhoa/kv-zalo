@@ -19,7 +19,7 @@ enum PinnedHTTPSClient {
         }
     }
 
-    static let userAgent = "ZaloPC-darwin-23v694"
+    static let userAgent = "ZaloPC-darwin-23v695"
 
     /// GET `url` by connecting to each address in turn until one yields a response.
     /// `timeout` is per address attempt.

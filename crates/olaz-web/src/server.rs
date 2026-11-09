@@ -35,7 +35,10 @@ use crate::bundle::{
     BOOT_HTML, CRYPTO_SYNC_JS, FAVICON_ICO, ICON_192_PNG, ICON_512_PNG, ICON_MASKABLE_512_PNG,
     LOGO_SVG, MOBILE_CSS, PRELOAD_JS, SW_JS,
 };
-use crate::relay::{write_json_response, PrefixedTcpStream, StatelessRelay};
+use crate::relay::{
+    write_json_response, PrefixedTcpStream, StatelessRelay, ZALO_APP_VERSION, ZALO_CLIENT_TYPE,
+    ZALO_CLIENT_VERSION,
+};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -513,9 +516,11 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> Re
         return Ok(());
     }
 
-    // 5. Root redirect (`GET /` -> `302 /login.html?fail_sqlite3=true[&profile=<slot>]`).
+    // 5. Root redirect (`GET /` -> `302 /login.html?type=23&client_version=695&...`).
     if (head.method == "GET" || head.method == "HEAD") && head.path == "/" {
-        let mut loc = "/login.html?fail_sqlite3=true".to_string();
+        let mut loc = format!(
+            "/login.html?type={ZALO_CLIENT_TYPE}&client_version={ZALO_CLIENT_VERSION}&app_version={ZALO_APP_VERSION}&about_version=&new_install=0&fail_sqlite3=true&mode_lang="
+        );
         if let Some(slot) = extract_query_param(&head.query, "profile") {
             let clean: String = slot
                 .chars()

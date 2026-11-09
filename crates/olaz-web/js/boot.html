@@ -110,11 +110,23 @@
       }
       const params = new URLSearchParams(location.search);
       const slot = window.__olazActiveProfile || params.get('profile') || 'default';
+      const rt = window.__zaloRuntime || {
+        clientType: '23',
+        clientVersion: '695',
+        appVersion: '26.11.10',
+      };
       const q = new URLSearchParams();
+      q.set('type', rt.clientType || '23');
+      q.set('client_version', rt.clientVersion || '695');
+      q.set('app_version', rt.appVersion || '26.11.10');
+      q.set('about_version', '');
+      q.set('new_install', '0');
       q.set('fail_sqlite3', 'true');
+      q.set('mode_lang', '');
       if (slot && slot !== 'default') q.set('profile', slot);
       if (window.__olazCookieJar && window.__olazCookieJar.hasZpwSek()) {
         q.set('is_main', 'true');
+        q.set('already_login', 'y');
         location.replace('/index.html?' + q.toString());
       } else {
         location.replace('/login.html?' + q.toString());
