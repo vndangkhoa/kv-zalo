@@ -30,7 +30,7 @@ use tracing::{debug, trace, warn};
 use url::Url;
 
 use crate::cookies::ZaloCookieJar;
-use crate::doh::{is_zalo_cdn, ZaloDnsResolver};
+use crate::doh::{is_zalo_cdn, parse_upstream_proxy, ZaloDnsResolver};
 
 /// Default Zalo PC macOS User-Agent (`OfficialClientHost.userAgent(clientType: "23", clientVersion: "694")`).
 pub const DEFAULT_USER_AGENT: &str = "ZaloPC-darwin-23v694";
@@ -126,6 +126,7 @@ pub struct NetworkProxy {
     jar: ZaloCookieJar,
     dns_resolver: Arc<ZaloDnsResolver>,
     user_agent: String,
+    proxy_url: Option<String>,
     rustls_config: Arc<rustls::ClientConfig>,
     sockets: Arc<DashMap<u64, ActiveSocket>>,
     response_observer: Arc<RwLock<Option<ResponseObserver>>>,
@@ -135,9 +136,43 @@ impl std::fmt::Debug for NetworkProxy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NetworkProxy")
             .field("user_agent", &self.user_agent)
+            .field("proxy_url", &self.proxy_url)
             .field("open_sockets", &self.sockets.len())
             .finish()
     }
+}
+
+fn build_proxy_http_client(
+    jar: &ZaloCookieJar,
+    dns_resolver: &Arc<ZaloDnsResolver>,
+    user_agent: &str,
+    proxy_url: Option<&str>,
+) -> Result<(reqwest::Client, Option<String>)> {
+    let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .cookie_provider(jar.inner())
+        .dns_resolver(Arc::clone(dns_resolver))
+        .user_agent(user_agent)
+        .timeout(DEFAULT_HTTP_TIMEOUT);
+
+    let normalized_proxy = match proxy_url {
+        Some(raw) => match parse_upstream_proxy(raw)? {
+            Some((u, proxy)) => {
+                builder = builder.proxy(proxy);
+                Some(u)
+            }
+            None => {
+                builder = builder.no_proxy();
+                None
+            }
+        },
+        None => None,
+    };
+
+    let client = builder
+        .build()
+        .context("failed to build NetworkProxy reqwest::Client")?;
+    Ok((client, normalized_proxy))
 }
 
 impl NetworkProxy {
@@ -146,7 +181,8 @@ impl NetworkProxy {
         Self::with_config(jar, Arc::new(ZaloDnsResolver::new()), DEFAULT_USER_AGENT)
     }
 
-    /// Constructs a `NetworkProxy` with custom [`ZaloDnsResolver`] and `user_agent`.
+    /// Constructs a `NetworkProxy` with custom [`ZaloDnsResolver`] and `user_agent`,
+    /// honoring `OLAZ_PROXY` (or `dns_resolver.proxy_url()`) when configured.
     pub fn with_config(
         jar: ZaloCookieJar,
         dns_resolver: Arc<ZaloDnsResolver>,
@@ -154,25 +190,39 @@ impl NetworkProxy {
     ) -> Result<Self> {
         let user_agent = user_agent.into();
         let rustls_config = build_rustls_client_config()?;
+        let env_proxy = std::env::var("OLAZ_PROXY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| dns_resolver.proxy_url().map(str::to_owned));
 
-        let client = reqwest::Client::builder()
-            .use_rustls_tls()
-            .cookie_provider(jar.inner())
-            .dns_resolver(Arc::clone(&dns_resolver))
-            .user_agent(&user_agent)
-            .timeout(DEFAULT_HTTP_TIMEOUT)
-            .build()
-            .context("failed to build NetworkProxy reqwest::Client")?;
+        let (client, proxy_url) =
+            build_proxy_http_client(&jar, &dns_resolver, &user_agent, env_proxy.as_deref())?;
 
         Ok(Self {
             client,
             jar,
             dns_resolver,
             user_agent,
+            proxy_url,
             rustls_config,
             sockets: Arc::new(DashMap::new()),
             response_observer: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Builder-style helper to attach (or clear when `None`) an upstream SOCKS5/HTTP(S) proxy URL.
+    pub fn with_proxy_url(mut self, proxy_url: Option<&str>) -> Result<Self> {
+        let explicit = proxy_url.unwrap_or("");
+        let (client, normalized) =
+            build_proxy_http_client(&self.jar, &self.dns_resolver, &self.user_agent, Some(explicit))?;
+        self.client = client;
+        self.proxy_url = normalized;
+        Ok(self)
+    }
+
+    /// Returns the active upstream proxy URL configured on this `NetworkProxy`, if any.
+    pub fn proxy_url(&self) -> Option<&str> {
+        self.proxy_url.as_deref()
     }
 
     /// Attaches or clears the HTTP response observer callback.
@@ -868,4 +918,97 @@ fn build_rustls_client_config() -> Result<Arc<rustls::ClientConfig>> {
         .with_no_client_auth();
 
     Ok(Arc::new(config))
+}
+
+#[cfg(test)]
+mod ctdozlite_proxy_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn dns_resolver_and_network_proxy_configure_upstream_proxy() {
+        let resolver = ZaloDnsResolver::new()
+            .with_proxy_url(Some("socks5h://127.0.0.1:1080"))
+            .expect("socks5h proxy accepted");
+        assert_eq!(resolver.proxy_url(), Some("socks5h://127.0.0.1:1080"));
+
+        let cleared = resolver.with_proxy_url(None).expect("clear proxy");
+        assert_eq!(cleared.proxy_url(), None);
+
+        assert!(ZaloDnsResolver::new()
+            .with_proxy_url(Some("ftp://127.0.0.1:21"))
+            .is_err());
+
+        let jar = ZaloCookieJar::new_in_memory();
+        let proxy = NetworkProxy::new(jar)
+            .expect("network proxy")
+            .with_proxy_url(Some("socks5://127.0.0.1:1080"))
+            .expect("attach socks5");
+        assert_eq!(proxy.proxy_url(), Some("socks5://127.0.0.1:1080"));
+    }
+
+    #[tokio::test]
+    async fn network_proxy_routes_http_through_configured_upstream_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock http proxy");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept proxy client");
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .await
+                .expect("read request line");
+            loop {
+                let mut hdr = String::new();
+                let n = reader.read_line(&mut hdr).await.expect("read header");
+                if n == 0 || hdr == "\r\n" {
+                    break;
+                }
+            }
+            let body = b"proxied-ok";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            write_half.write_all(resp.as_bytes()).await.unwrap();
+            write_half.write_all(body).await.unwrap();
+            write_half.flush().await.unwrap();
+            request_line
+        });
+
+        let jar = ZaloCookieJar::new_in_memory();
+        let proxy_url = format!("http://{addr}");
+        let net_proxy = NetworkProxy::new(jar)
+            .expect("new proxy")
+            .with_proxy_url(Some(&proxy_url))
+            .expect("configure http proxy");
+
+        let resp = net_proxy
+            .handle_request(
+                json!({
+                    "op": "http",
+                    "method": "GET",
+                    "url": "http://example.invalid/ping"
+                }),
+                WsEventSink::noop(),
+            )
+            .await
+            .expect("handle_request");
+
+        assert_eq!(resp.get("status").and_then(Value::as_u64), Some(200));
+        let b64 = resp.get("body").and_then(Value::as_str).unwrap_or("");
+        assert_eq!(STANDARD.decode(b64).unwrap(), b"proxied-ok");
+
+        let req_line = server.await.expect("proxy task");
+        assert!(
+            req_line.contains("http://example.invalid/ping"),
+            "expected absolute-URI HTTP proxy request line, got: {req_line}"
+        );
+    }
 }
