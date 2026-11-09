@@ -33,6 +33,7 @@ webkit2gtk.workspace = true
 javascriptcore-rs.workspace = true
 gtk.workspace = true
 gdk.workspace = true
+gdk-pixbuf.workspace = true
 glib.workspace = true
 gio.workspace = true
 soup.workspace = true

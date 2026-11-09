@@ -68,6 +68,10 @@ hex = "0.4"
 rand = "0.8"
 
 # Filesystem, archive & assets
+libc = "0.2"
+walkdir = "2.5"
+globset = "0.4"
+lzma-rs = "0.3"
 memmap2 = "0.9"
 directories = "5.0"
 tempfile = "3.14"
@@ -80,6 +84,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
     "json",
     "http2",
+    "socks",
 ] }
 reqwest_cookie_store = "0.8"
 cookie_store = "0.21"
@@ -96,6 +101,7 @@ ksni = "0.3"
 notify-rust = "4.11"
 zbus = { version = "5.3", default-features = false, features = ["tokio"] }
 rodio = { version = "0.20", default-features = false, features = ["symphonia-mp3"] }
+cpal = "0.15"
 notify = "7.0"
 
 # GTK3 + WebKit2GTK 4.1
@@ -103,6 +109,7 @@ webkit2gtk = { version = "2.0", features = ["v2_40"] }
 javascriptcore-rs = "1.1"
 gtk = "0.18"
 gdk = "0.18"
+gdk-pixbuf = "0.18"
 glib = "0.18"
 gio = "0.18"
 soup = { package = "soup3", version = "0.5" }
