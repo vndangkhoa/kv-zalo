@@ -4,6 +4,7 @@
 //! GTK3 + `webkit2gtk-4.1`, `ZaloRuntimeManager`, `OfficialClientHost`, `ZaloMainProcess`,
 //! `OlazAppWindow`, and the `--engine-probe` diagnostic mode (`EngineProbe.swift` port).
 
+mod account_session;
 pub mod call_ui;
 mod client_host;
 mod main_process;
@@ -14,9 +15,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use account_session::{link_shared_runtime_for_profile, resolve_instance_root_dir};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
-use client_host::{HostPage, OfficialClientHost, PageEvent, ZaloWebRuntime};
+use client_host::{
+    init_gst_media_proxy_listener, HostPage, OfficialClientHost, PageEvent, ZaloWebRuntime,
+};
 use main_process::ZaloMainProcess;
 use olaz_core::{ZaloPlatform, ZaloRuntimeManager};
 use olaz_linux::{
@@ -315,39 +319,6 @@ fn init_tracing(stderr_writer: bool) {
     }
 }
 
-/// Computes the shared root directory holding `olaz-instance.sock` / `olaz-instance-<slug>.sock`
-/// and the primary `ZaloRuntime` across both `"default"` and named `--profile <slug>` accounts.
-fn resolve_instance_root_dir(platform: &ZaloPlatform) -> PathBuf {
-    if platform.profile_slug() == "default" {
-        platform.base_dir().to_path_buf()
-    } else {
-        platform
-            .base_dir()
-            .parent()
-            .and_then(Path::parent)
-            .unwrap_or_else(|| platform.base_dir())
-            .to_path_buf()
-    }
-}
-
-/// Shares an already-installed `ZaloRuntime/current` from `instance_root_dir` into a secondary
-/// profile's `runtime_root` via symlink so secondary `--profile` accounts boot instantaneously.
-fn link_shared_runtime_for_profile(platform: &ZaloPlatform, instance_root_dir: &Path) {
-    if platform.profile_slug() == "default" {
-        return;
-    }
-    let dst_current = platform.runtime_root().join("current");
-    if dst_current.exists() {
-        return;
-    }
-    let src_current = instance_root_dir.join("ZaloRuntime").join("current");
-    if ZaloRuntimeManager::is_complete(&src_current) {
-        if std::fs::create_dir_all(platform.runtime_root()).is_ok() {
-            let _ = std::os::unix::fs::symlink(&src_current, &dst_current);
-        }
-    }
-}
-
 async fn run_cli_update_check(platform: &ZaloPlatform, download: bool) -> Result<()> {
     let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
@@ -524,8 +495,10 @@ fn main() -> Result<()> {
         }
     }
 
-    // Configure `WEBKIT_DISABLE_DMABUF_RENDERER=1` (Wayland) & `GDK_BACKEND=wayland,x11` BEFORE `gtk::init()`.
+    // Configure `WEBKIT_DISABLE_DMABUF_RENDERER=1` (Wayland), `GDK_BACKEND=wayland,x11`, and
+    // `OLAZ_GST_MEDIA_PROXY_BASE` BEFORE building the multi-threaded Tokio runtime or calling `gtk::init()`.
     configure_linux_webview_env();
+    init_gst_media_proxy_listener();
 
     glib::set_prgname(Some("olaz"));
     glib::set_application_name("Olaz");

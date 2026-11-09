@@ -10,6 +10,7 @@ pub mod file_utilities;
 pub mod fs_bridge;
 pub mod installer;
 pub mod platform;
+pub mod profiles;
 pub mod vault;
 pub mod wire;
 pub mod zwalker;
@@ -39,6 +40,9 @@ pub use fs_bridge::{
 };
 pub use installer::{resolve_host_doh, InstallProgress, ZaloRelease, ZaloRuntimeManager};
 pub use platform::{resolve_xdg_autostart_dir, ClientIdentity, ZaloPlatform};
+pub use profiles::{
+    ProfileMetadata, ProfileRegistry, PROFILES_REGISTRY_FILENAME, PROFILES_REGISTRY_VERSION,
+};
 pub use vault::{
     KeychainCipher, LinuxSecretBackend, MemorySecretBackend, SafeStorage, SecretBackend, VaultError,
 };

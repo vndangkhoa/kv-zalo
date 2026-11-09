@@ -18,10 +18,16 @@ pub const OPUS_VOIP_FRAME_SAMPLES: usize = 320;
 pub const OPUS_OK: c_int = 0;
 /// `OPUS_APPLICATION_VOIP` (`2048`).
 pub const OPUS_APPLICATION_VOIP: c_int = 2048;
+/// `OPUS_APPLICATION_AUDIO` (`2049`) for full-band/wideband mono & stereo call recording.
+pub const OPUS_APPLICATION_AUDIO: c_int = 2049;
 /// `OPUS_SET_BITRATE_REQUEST` (`4002`).
 pub const OPUS_SET_BITRATE_REQUEST: c_int = 4002;
+/// `OPUS_SET_VBR_REQUEST` (`4006`).
+pub const OPUS_SET_VBR_REQUEST: c_int = 4006;
 /// Default VoIP target bitrate (`24,000 bps`).
 pub const OPUS_VOIP_DEFAULT_BITRATE: c_int = 24_000;
+/// Default Ogg/Opus call recording VBR target bitrate (`48,000 bps`).
+pub const OPUS_RECORDING_DEFAULT_BITRATE: c_int = 48_000;
 
 #[repr(C)]
 struct OpusEncoderOpaque {
@@ -327,6 +333,209 @@ impl OpusVoipDecoder {
 }
 
 impl Drop for OpusVoipDecoder {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { (self.lib.decoder_destroy)(self.ptr) };
+            self.ptr = ptr::null_mut();
+        }
+    }
+}
+
+/// Multi-channel (`1` = mono, `2` = stereo) `16,000 Hz` `OPUS_APPLICATION_AUDIO` VBR encoder
+/// wrapping dynamically loaded `libopus.so.0` for RFC 7845 Ogg/Opus call recording.
+pub struct OpusPcmEncoder {
+    lib: &'static OpusLib,
+    ptr: *mut OpusEncoderOpaque,
+    channels: u8,
+    out_scratch: Vec<u8>,
+}
+
+// SAFETY: Each `OpusPcmEncoder` owns an independent `OpusEncoder*` state mutated only via `&mut self`.
+unsafe impl Send for OpusPcmEncoder {}
+
+impl OpusPcmEncoder {
+    /// Creates a `16,000 Hz` `OPUS_APPLICATION_AUDIO` VBR encoder with `channels` (`1` or `2`)
+    /// at the default `48,000 bps` recording bitrate.
+    pub fn new_recording_default(channels: u8) -> Result<Self, OpusError> {
+        Self::new(channels, OPUS_RECORDING_DEFAULT_BITRATE)
+    }
+
+    /// Creates a `16,000 Hz` `OPUS_APPLICATION_AUDIO` (`2049`) VBR encoder with `channels` (`1` or `2`)
+    /// and target `bitrate_bps`.
+    pub fn new(channels: u8, bitrate_bps: i32) -> Result<Self, OpusError> {
+        if channels != 1 && channels != 2 {
+            return Err(OpusError::CodecError {
+                func: "opus_encoder_create",
+                code: -1,
+                message: format!("unsupported Opus channel count {channels} (expected 1 or 2)"),
+            });
+        }
+        let lib = get_opus_lib()?;
+        let mut err: c_int = 0;
+        let ptr = unsafe {
+            (lib.encoder_create)(
+                OPUS_VOIP_SAMPLE_RATE,
+                channels as c_int,
+                OPUS_APPLICATION_AUDIO,
+                &mut err,
+            )
+        };
+        if err != OPUS_OK || ptr.is_null() {
+            return Err(OpusError::CodecError {
+                func: "opus_encoder_create",
+                code: err,
+                message: opus_err_string(lib, err),
+            });
+        }
+        let vbr_rc = unsafe { (lib.encoder_ctl)(ptr, OPUS_SET_VBR_REQUEST, 1 as c_int) };
+        if vbr_rc != OPUS_OK {
+            unsafe { (lib.encoder_destroy)(ptr) };
+            return Err(OpusError::CodecError {
+                func: "opus_encoder_ctl(OPUS_SET_VBR_REQUEST)",
+                code: vbr_rc,
+                message: opus_err_string(lib, vbr_rc),
+            });
+        }
+        let ctl_rc = unsafe { (lib.encoder_ctl)(ptr, OPUS_SET_BITRATE_REQUEST, bitrate_bps) };
+        if ctl_rc != OPUS_OK {
+            unsafe { (lib.encoder_destroy)(ptr) };
+            return Err(OpusError::CodecError {
+                func: "opus_encoder_ctl(OPUS_SET_BITRATE_REQUEST)",
+                code: ctl_rc,
+                message: opus_err_string(lib, ctl_rc),
+            });
+        }
+        Ok(Self {
+            lib,
+            ptr,
+            channels,
+            out_scratch: vec![0u8; 4000],
+        })
+    }
+
+    /// Configured channel count (`1` or `2`).
+    pub fn channels(&self) -> u8 {
+        self.channels
+    }
+
+    /// Encodes a 20ms interleaved PCM frame (`320 * channels` `i16` samples at `16,000 Hz`)
+    /// into a borrowed slice backed by internal scratch storage.
+    pub fn encode_20ms_slice(&mut self, interleaved_pcm: &[i16]) -> Result<&[u8], OpusError> {
+        let expected = OPUS_VOIP_FRAME_SAMPLES * (self.channels as usize);
+        if interleaved_pcm.len() != expected {
+            return Err(OpusError::InvalidFrameSamples {
+                expected,
+                actual: interleaved_pcm.len(),
+            });
+        }
+        let n = unsafe {
+            (self.lib.encode)(
+                self.ptr,
+                interleaved_pcm.as_ptr(),
+                OPUS_VOIP_FRAME_SAMPLES as c_int,
+                self.out_scratch.as_mut_ptr(),
+                self.out_scratch.len() as i32,
+            )
+        };
+        if n < 0 {
+            return Err(OpusError::CodecError {
+                func: "opus_encode",
+                code: n,
+                message: opus_err_string(self.lib, n),
+            });
+        }
+        Ok(&self.out_scratch[..(n as usize)])
+    }
+
+    /// Encodes a 20ms interleaved PCM frame (`320 * channels` `i16` samples at `16,000 Hz`)
+    /// into an owned Opus packet.
+    pub fn encode_20ms(&mut self, interleaved_pcm: &[i16]) -> Result<Vec<u8>, OpusError> {
+        Ok(self.encode_20ms_slice(interleaved_pcm)?.to_vec())
+    }
+}
+
+impl Drop for OpusPcmEncoder {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { (self.lib.encoder_destroy)(self.ptr) };
+            self.ptr = ptr::null_mut();
+        }
+    }
+}
+
+/// Multi-channel (`1` = mono, `2` = stereo) `16,000 Hz` Opus decoder wrapping `libopus.so.0`.
+pub struct OpusPcmDecoder {
+    lib: &'static OpusLib,
+    ptr: *mut OpusDecoderOpaque,
+    channels: u8,
+}
+
+// SAFETY: Each `OpusPcmDecoder` owns an independent `OpusDecoder*` state mutated only via `&mut self`.
+unsafe impl Send for OpusPcmDecoder {}
+
+impl OpusPcmDecoder {
+    /// Creates a `16,000 Hz` Opus decoder with `channels` (`1` or `2`).
+    pub fn new(channels: u8) -> Result<Self, OpusError> {
+        if channels != 1 && channels != 2 {
+            return Err(OpusError::CodecError {
+                func: "opus_decoder_create",
+                code: -1,
+                message: format!("unsupported Opus channel count {channels} (expected 1 or 2)"),
+            });
+        }
+        let lib = get_opus_lib()?;
+        let mut err: c_int = 0;
+        let ptr =
+            unsafe { (lib.decoder_create)(OPUS_VOIP_SAMPLE_RATE, channels as c_int, &mut err) };
+        if err != OPUS_OK || ptr.is_null() {
+            return Err(OpusError::CodecError {
+                func: "opus_decoder_create",
+                code: err,
+                message: opus_err_string(lib, err),
+            });
+        }
+        Ok(Self { lib, ptr, channels })
+    }
+
+    /// Configured channel count (`1` or `2`).
+    pub fn channels(&self) -> u8 {
+        self.channels
+    }
+
+    /// Decodes a 20ms Opus packet into `320 * channels` interleaved `i16` PCM samples at `16,000 Hz`.
+    pub fn decode_20ms(&mut self, packet: Option<&[u8]>, fec: bool) -> Result<Vec<i16>, OpusError> {
+        let total = OPUS_VOIP_FRAME_SAMPLES * (self.channels as usize);
+        let mut pcm = vec![0i16; total];
+        let (data_ptr, data_len) = match packet {
+            Some(b) if !b.is_empty() => (b.as_ptr(), b.len() as i32),
+            _ => (ptr::null(), 0),
+        };
+        let n = unsafe {
+            (self.lib.decode)(
+                self.ptr,
+                data_ptr,
+                data_len,
+                pcm.as_mut_ptr(),
+                OPUS_VOIP_FRAME_SAMPLES as c_int,
+                if fec { 1 } else { 0 },
+            )
+        };
+        if n < 0 {
+            return Err(OpusError::CodecError {
+                func: "opus_decode",
+                code: n,
+                message: opus_err_string(self.lib, n),
+            });
+        }
+        let decoded_interleaved = ((n as usize).min(OPUS_VOIP_FRAME_SAMPLES)) * (self.channels as usize);
+        for sample in &mut pcm[decoded_interleaved..] {
+            *sample = 0;
+        }
+        Ok(pcm)
+    }
+}
+
+impl Drop for OpusPcmDecoder {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             unsafe { (self.lib.decoder_destroy)(self.ptr) };

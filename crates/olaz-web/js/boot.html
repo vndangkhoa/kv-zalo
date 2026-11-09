@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Olaz Web — Bootstrapping Local Browser Vault</title>
+  <script src="/__olaz/crypto_sync.js"></script>
+  <script src="/__olaz/bridge_table.js"></script>
+  <script src="/__olaz/preload.js"></script>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #0f172a;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .boot-card {
+      text-align: center;
+      padding: 28px 36px;
+      border-radius: 16px;
+      background: rgba(30, 41, 59, 0.85);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      box-shadow: 0 20px 45px rgba(0, 0, 0, 0.45);
+    }
+    .spinner {
+      width: 32px;
+      height: 32px;
+      margin: 0 auto 14px;
+      border: 3px solid rgba(56, 189, 248, 0.25);
+      border-top-color: #38bdf8;
+      border-radius: 50%;
+      animation: spin 0.75s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .sub { font-size: 13px; color: #94a3b8; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div class="boot-card">
+    <div class="spinner"></div>
+    <div>Hydrating Local Browser Session…</div>
+    <div class="sub">Zero server persistence · 100% browser IndexedDB vault</div>
+  </div>
+  <script>
+    (async () => {
+      if (window.__olazBootReady) {
+        await window.__olazBootReady;
+      }
+      const params = new URLSearchParams(location.search);
+      const slot = window.__olazActiveProfile || params.get('profile') || 'default';
+      const q = new URLSearchParams();
+      q.set('fail_sqlite3', 'true');
+      if (slot && slot !== 'default') q.set('profile', slot);
+      if (window.__olazCookieJar && window.__olazCookieJar.hasZpwSek()) {
+        q.set('is_main', 'true');
+        location.replace('/index.html?' + q.toString());
+      } else {
+        location.replace('/login.html?' + q.toString());
+      }
+    })();
+  </script>
+</body>
+</html>

@@ -22,7 +22,7 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::crypto::aes256_cbc_pkcs7;
-use crate::platform::ZaloPlatform;
+use crate::platform::{sanitize_profile_slug, ZaloPlatform};
 use crate::wire;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -249,23 +249,86 @@ impl SecretBackend for MemorySecretBackend {
     }
 }
 
+impl<T: SecretBackend + ?Sized> SecretBackend for std::sync::Arc<T> {
+    fn get_secret<'a>(
+        &'a self,
+        service: &'a str,
+        account: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, VaultError>> {
+        (**self).get_secret(service, account)
+    }
+
+    fn set_secret<'a>(
+        &'a self,
+        service: &'a str,
+        account: &'a str,
+        secret: &'a [u8],
+    ) -> BoxFuture<'a, Result<(), VaultError>> {
+        (**self).set_secret(service, account, secret)
+    }
+}
+
 /// Production Linux [`SecretBackend`] backed by `oo7::Keyring` (`org.freedesktop.secrets`),
 /// with fallback to a `0600` local keyfile under `<base_dir>/keys/` **only** when D-Bus
 /// Secret Service is completely unavailable (e.g. headless environment without a keyring daemon).
 #[derive(Debug, Clone)]
 pub struct LinuxSecretBackend {
     keys_dir: PathBuf,
+    profile_slug: String,
+}
+
+fn normalize_vault_profile_slug(raw: &str) -> String {
+    sanitize_profile_slug(raw).unwrap_or_else(|_| "default".to_string())
+}
+
+fn format_profile_scoped_account(profile_slug: &str, account: &str) -> String {
+    if profile_slug.is_empty() || profile_slug == "default" {
+        return account.to_string();
+    }
+    let prefix = format!("profile.{profile_slug}.");
+    if account.starts_with(&prefix) {
+        account.to_string()
+    } else {
+        format!("{prefix}{account}")
+    }
 }
 
 impl LinuxSecretBackend {
-    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+    /// Creates a [`LinuxSecretBackend`] scoped to `profile_slug`.
+    ///
+    /// When `profile_slug == "default"`, D-Bus Secret Service `"account"` attributes remain
+    /// `"zprotocol.<id>"` (100% backward-compatible). For non-default profiles, attributes
+    /// are scoped as `"profile.<slug>.zprotocol.<id>"`.
+    pub fn with_profile(keys_dir: impl Into<PathBuf>, profile_slug: impl Into<String>) -> Self {
+        let raw_dir = keys_dir.into();
+        let resolved_keys_dir = if raw_dir.file_name().is_some_and(|n| n == "keys") {
+            raw_dir
+        } else {
+            raw_dir.join("keys")
+        };
+        let raw_slug = profile_slug.into();
         Self {
-            keys_dir: base_dir.into().join("keys"),
+            keys_dir: resolved_keys_dir,
+            profile_slug: normalize_vault_profile_slug(&raw_slug),
         }
     }
 
+    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+        Self::with_profile(base_dir, "default")
+    }
+
     pub fn from_platform(platform: &ZaloPlatform) -> Self {
-        Self::new(platform.base_dir())
+        Self::with_profile(platform.base_dir(), platform.profile_slug())
+    }
+
+    pub fn profile_slug(&self) -> &str {
+        &self.profile_slug
+    }
+
+    /// Formats `account` (`"zprotocol.<id>"`) with profile scoping:
+    /// `"zprotocol.<id>"` for `"default"` and `"profile.<slug>.zprotocol.<id>"` otherwise.
+    pub fn scoped_account(&self, account: &str) -> String {
+        format_profile_scoped_account(&self.profile_slug, account)
     }
 
     fn keyfile_path(&self, account: &str) -> PathBuf {
@@ -424,11 +487,12 @@ impl SecretBackend for LinuxSecretBackend {
         account: &'a str,
     ) -> BoxFuture<'a, Result<Option<Vec<u8>>, VaultError>> {
         Box::pin(async move {
+            let scoped = self.scoped_account(account);
             let keyring = match oo7::Keyring::new().await {
                 Ok(kr) => kr,
                 Err(err) if is_secret_service_unavailable(&err) => {
                     tracing::debug!(%err, "Secret Service unavailable; using 0600 local keyfile");
-                    return self.read_keyfile(account);
+                    return self.read_keyfile(&scoped);
                 }
                 Err(err) => return Err(map_oo7_active_error(err)),
             };
@@ -437,7 +501,7 @@ impl SecretBackend for LinuxSecretBackend {
             // Always unlock and verify unlocked before trusting an empty search result.
             ensure_keyring_unlocked(&keyring).await?;
 
-            let attrs = HashMap::from([("service", service), ("account", account)]);
+            let attrs = HashMap::from([("service", service), ("account", scoped.as_str())]);
             let items = keyring
                 .search_items(&attrs)
                 .await
@@ -451,7 +515,7 @@ impl SecretBackend for LinuxSecretBackend {
                 item.unlock().await.map_err(map_oo7_active_error)?;
                 if item.is_locked().await.map_err(map_oo7_active_error)? {
                     return Err(VaultError::Locked(format!(
-                        "Keyring item '{account}' remains locked after unlock request"
+                        "Keyring item '{scoped}' remains locked after unlock request"
                     )));
                 }
             }
@@ -468,19 +532,20 @@ impl SecretBackend for LinuxSecretBackend {
         secret: &'a [u8],
     ) -> BoxFuture<'a, Result<(), VaultError>> {
         Box::pin(async move {
+            let scoped = self.scoped_account(account);
             let keyring = match oo7::Keyring::new().await {
                 Ok(kr) => kr,
                 Err(err) if is_secret_service_unavailable(&err) => {
                     tracing::debug!(%err, "Secret Service unavailable; writing 0600 local keyfile");
-                    return self.write_keyfile(account, secret);
+                    return self.write_keyfile(&scoped, secret);
                 }
                 Err(err) => return Err(map_oo7_active_error(err)),
             };
 
             ensure_keyring_unlocked(&keyring).await?;
 
-            let attrs = HashMap::from([("service", service), ("account", account)]);
-            let label = format!("Olaz ({account})");
+            let attrs = HashMap::from([("service", service), ("account", scoped.as_str())]);
+            let label = format!("Olaz ({scoped})");
             keyring
                 .create_item(&label, &attrs, oo7::Secret::blob(secret), true)
                 .await
@@ -498,11 +563,18 @@ impl SecretBackend for LinuxSecretBackend {
 #[derive(Debug)]
 pub struct KeychainCipher<B: SecretBackend = LinuxSecretBackend> {
     backend: B,
+    profile_slug: String,
 }
 
 impl KeychainCipher<LinuxSecretBackend> {
+    pub fn with_profile(keys_dir: impl Into<PathBuf>, profile_slug: impl Into<String>) -> Self {
+        let slug = profile_slug.into();
+        let backend = LinuxSecretBackend::with_profile(keys_dir, slug.clone());
+        Self::new_with_profile(backend, slug)
+    }
+
     pub fn for_platform(platform: &ZaloPlatform) -> Self {
-        Self::new(LinuxSecretBackend::from_platform(platform))
+        Self::with_profile(platform.base_dir(), platform.profile_slug())
     }
 }
 
@@ -513,11 +585,31 @@ impl<B: SecretBackend> KeychainCipher<B> {
     pub const MIN_ENVELOPE_LEN: usize = 1 + 16 + 16 + 32; // 65 bytes
 
     pub fn new(backend: B) -> Self {
-        Self { backend }
+        Self::new_with_profile(backend, "default")
+    }
+
+    pub fn new_with_profile(backend: B, profile_slug: impl Into<String>) -> Self {
+        let raw_slug = profile_slug.into();
+        Self {
+            backend,
+            profile_slug: normalize_vault_profile_slug(&raw_slug),
+        }
     }
 
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+
+    pub fn profile_slug(&self) -> &str {
+        &self.profile_slug
+    }
+
+    /// Formats the D-Bus Secret Service `"account"` attribute for `identifier`:
+    /// `"zprotocol.<id>"` when `profile_slug == "default"`, and
+    /// `"profile.<slug>.zprotocol.<id>"` for non-default profiles.
+    pub fn account_for_identifier(&self, identifier: &str) -> String {
+        let base = format!("zprotocol.{}", identifier.to_ascii_lowercase());
+        format_profile_scoped_account(&self.profile_slug, &base)
     }
 
     /// Encrypts each plaintext item under the per-identifier 32-byte root key (minting and
@@ -632,7 +724,7 @@ impl<B: SecretBackend> KeychainCipher<B> {
     }
 
     async fn root_key(&self, identifier: &str, create: bool) -> Result<Vec<u8>, VaultError> {
-        let account = format!("zprotocol.{}", identifier.to_ascii_lowercase());
+        let account = self.account_for_identifier(identifier);
         // CRITICAL: Any error from `get_secret` (such as a locked keyring) propagates directly
         // without minting a new key so previously sealed credentials are never orphaned!
         if let Some(existing) = self.backend.get_secret(Self::SERVICE, &account).await? {

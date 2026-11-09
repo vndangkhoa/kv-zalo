@@ -128,15 +128,25 @@ A new PC session has no message history except My Cloud, because Zalo keeps hist
    sudo apt install ./dist/v0.2.0/olaz_0.2.0_amd64.deb
    ```
 
-### Linux CLI options (Multi-Account, Proxy, REST API, MCP, Updater)
+### Linux CLI options (Multi-Account, Call Recorder, Anti-Recall, Self-Host Web, Proxy, REST/MCP)
 
 ```bash
-olaz --profile work                        # launch isolated secondary Zalo account
+# In-window Multi-Account Workspace: press Ctrl+Shift+N (or Tray → "Mở tài khoản khác") to add accounts,
+# switch instantly with Ctrl+1..9 / Ctrl+Tab, or run a separate OS window per profile:
+olaz --profile work                        # launch isolated secondary Zalo window
 olaz --proxy socks5h://127.0.0.1:1080      # route traffic & DoH over SOCKS5 / HTTP proxy
 olaz --api                                 # enable local loopback REST API on 127.0.0.1:17890 (or --api-port <PORT>)
 olaz --mcp                                 # run JSON-RPC 2.0 MCP stdio server bridged to running instance
 olaz --check-update                        # check GitHub & Forgejo releases (use --update to verify SHA-256 & download)
+
+# Zero-Server-Persistence Self-Hosted Web Mode (`olaz-web` — saves 0 user data on server, 100% in browser):
+cargo build --release -p olaz-web
+./target/release/olaz-web --listen 127.0.0.1:8080 --token "<secret>"
 ```
+
+- **Call Recorder (Linux VoIP)**: Click the Record button in the call bar (right-click when idle to choose crash-safe stereo **WAV** or **Ogg/Opus**); saves `0600` files to `~/.local/share/olaz/recordings/` (or `<profile>/recordings/`).
+- **View Recalled ("Thu hồi") Messages**: Toggle **"Giữ tin nhắn thu hồi (Xem tin thu hồi)"** under the System Tray **"Quyền riêng tư"** menu (or via `POST /api/v1/privacy` / MCP `zalo_set_privacy` with `{"anti_recall": true}`).
+- **Self-Hosted Web Multi-Account & PIN Lock**: Open `https://<your-host>/?profile=work` for isolated browser-stored accounts, and optionally set a local `SubtleCrypto` `AES-256-GCM` PIN lock from the corner pill. See [`Dockerfile`](Dockerfile) (`--read-only`) and [`packaging/olaz-web.service`](packaging/olaz-web.service).
 
 ### Linux tests & developer harness
 
@@ -224,9 +234,11 @@ OlazAppWindow (GTK3 frameless + webkit2gtk-4.1)            crates/olaz-app/
   │                         `zwalker`, `file-utilities`, `org.freedesktop.secrets` vault
   ├─ crates/olaz-net/    ── `reqwest` (SOCKS5/HTTP `--proxy`) + `tokio-tungstenite` proxy, `0600` cookie jar (`zpw_sek`),
   │                         DoH (`1.1.1.1` / `8.8.8.8`) for `*.zadn.vn`, streaming AES-GCM / AES-CTR media
-  └─ crates/olaz-linux/  ── Pure-Rust 1:1 & group SFU VoIP engine (`call/`: Opus 16 kHz, H.264 camera & screen share,
-                            Zavi/SRTP, `zcall-ui`), embedded `libgstolazauto.so`, `ksni` tray + privacy receipt blocker,
-                            scheduler & auto-reply, local REST/MCP server, `xdg-desktop-portal`, Omarchy theme watcher
+  ├─ crates/olaz-linux/  ── Pure-Rust 1:1 & group SFU VoIP engine (`call/`: Opus 16 kHz, stereo WAV/Opus call recorder,
+  │                         H.264 camera & screen share, Zavi/SRTP, `zcall-ui`), embedded `libgstolazauto.so`, `ksni` tray +
+  │                         privacy receipt blocker & anti-recall, scheduler & auto-reply, REST/MCP, `xdg-desktop-portal`
+  └─ crates/olaz-web/    ── Stateless zero-server-persistence self-hosted web relay (`olaz-web`) + browser-only preload,
+                            synchronous TypedArray `$znode.crypto`/vault/cookie engine, `?profile=<slot>` & WebCrypto PIN lock
 ```
 
 ## Status

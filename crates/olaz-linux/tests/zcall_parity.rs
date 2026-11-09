@@ -13,28 +13,34 @@ use olaz_linux::call::zrtc::{
 };
 use olaz_linux::call::{
     apply_mic_gain_and_level, build_audio_rtp, build_group_init_zrtp_request,
-    build_group_init_zrtp_v6_request, build_init_zrtp_request, build_probe, build_rtcp_pli,
-    build_rtcp_rr, build_rtcp_sr_sdes_remb, build_srtp_iv, build_zavi_no_seq_iv,
-    downmix_to_mono_i16, extract_master_material, get_ui_asset, is_h264_idr_au,
-    is_ignored_audio_device, is_opus_available, is_pulse_simple_available,
-    map_nonzero_answer_status, packetize_zalo_h264_au, parse_init_zrtp_response,
-    parse_relay_endpoint, parse_rtp_packet, redact_voip_value, resample_mono_i16,
-    rtcp_requests_keyframe, rtp_header_layout, split_annex_b_nals, unpack_send_to_native_args,
+    build_group_init_zrtp_v6_request, build_init_zrtp_request, build_probe,
+    build_recording_file_path, build_rtcp_pli, build_rtcp_rr, build_rtcp_sr_sdes_remb,
+    build_srtp_iv, build_zavi_no_seq_iv, default_recordings_dir, downmix_to_mono_i16,
+    extract_master_material, get_ui_asset, is_h264_idr_au, is_ignored_audio_device,
+    is_opus_available, is_pulse_simple_available, map_nonzero_answer_status, ogg_crc32,
+    packetize_zalo_h264_au, parse_init_zrtp_response, parse_relay_endpoint, parse_rtp_packet,
+    redact_voip_value, resample_mono_i16, rtcp_requests_keyframe, rtp_header_layout,
+    sanitize_partner_slug, soft_clip_mono_sum, split_annex_b_nals, unpack_send_to_native_args,
     unwrap_zrtc, wrap_group_zrtc, wrap_zrtc, AudioDeviceEntry, AudioDeviceList, AudioIoSession,
-    BoxMediaSetupFuture, CallEngineConfig, CallMediaDriver, CallMediaDriverFactory, CallUiEvent,
-    H264Depacketizer, InboundZrtcEvent, MediaSetupParams, MediaSetupResult, OlazCallEngine,
-    OpusVoipDecoder, OpusVoipEncoder, PlaybackJitterBuffer, ReflexiveAddress, RelaySweepEntry,
-    SrtpContext, SrtpError, SrtpMode, SrtpSessionKeys, VoipLogger, ZrtcError, ZrtcMediaSession,
-    ZrtcPacketKind, ZrtcSweepConfig, CALL_UI_CALL_URL, CALL_UI_DEVICES_URL, CALL_UI_INCOMING_URL,
-    DEFAULT_MIC_GAIN, DEFAULT_RELAY_PORT, FfmpegH264Decoder, H264_AUD_ANNEX_B,
-    MAX_PLAYBACK_JITTER_SAMPLES, OPUS_CODEC_DESCRIPTOR, OPUS_VOIP_FRAME_SAMPLES, PRELOAD_BRIDGE_JS,
-    ZALO_H264_PT_IDR, ZALO_H264_PT_PFRAME,
+    AudioTapPacket, BoxMediaSetupFuture, CallEngineConfig, CallMediaDriver, CallMediaDriverFactory,
+    CallRecorderHandle, CallUiEvent, DriftAligner, FfmpegH264Decoder, H264Depacketizer,
+    InboundZrtcEvent, MediaSetupParams, MediaSetupResult, OlazCallEngine, OpusPcmDecoder,
+    OpusPcmEncoder, OpusVoipDecoder, OpusVoipEncoder, PlaybackJitterBuffer, ReflexiveAddress,
+    RecordingChannelLayout, RecordingFormat, RelaySweepEntry, SrtpContext, SrtpError, SrtpMode,
+    SrtpSessionKeys, TapSource, VoipLogger, ZrtcError, ZrtcMediaSession, ZrtcPacketKind,
+    ZrtcSweepConfig, ALIGNER_FRAME_SAMPLES, ALIGNER_LAG_THRESHOLD_SAMPLES,
+    ALIGNER_MAX_QUEUE_SAMPLES, AUDIO_FRAME_SAMPLES, CALL_UI_CALL_URL, CALL_UI_DEVICES_URL,
+    CALL_UI_INCOMING_URL, DEFAULT_MIC_GAIN, DEFAULT_RELAY_PORT, H264_AUD_ANNEX_B,
+    MAX_PLAYBACK_JITTER_SAMPLES, OGG_OPUS_GRANULE_STEP_20MS, OGG_OPUS_PRE_SKIP,
+    OPUS_CODEC_DESCRIPTOR, OPUS_VOIP_FRAME_SAMPLES, PRELOAD_BRIDGE_JS, WAV_HEADER_BYTES,
+    WAV_SYNC_INTERVAL_FRAMES, ZALO_H264_PT_IDR, ZALO_H264_PT_PFRAME,
 };
 use olaz_linux::call_stub::{CallChunker, CallTransportCrypto, LINUX_CALL_UNSUPPORTED_MESSAGE};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -816,6 +822,8 @@ struct MockMediaDriver {
     selected_in: AtomicI32,
     selected_out: AtomicI32,
     video_state: Mutex<(bool, bool)>,
+    audio_tap: Mutex<Option<SyncSender<AudioTapPacket>>>,
+    dropped_tap: AtomicU64,
     stopped: AtomicBool,
 }
 
@@ -827,7 +835,19 @@ impl Default for MockMediaDriver {
             selected_in: AtomicI32::new(-1),
             selected_out: AtomicI32::new(-1),
             video_state: Mutex::new((false, false)),
+            audio_tap: Mutex::new(None),
+            dropped_tap: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
+        }
+    }
+}
+
+impl MockMediaDriver {
+    fn emit_tap(&self, pkt: AudioTapPacket) {
+        if let Some(ref tx) = *self.audio_tap.lock() {
+            if tx.try_send(pkt).is_err() {
+                self.dropped_tap.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -872,9 +892,21 @@ impl CallMediaDriver for MockMediaDriver {
         *self.video_state.lock() = (camera_enabled, screen_sharing);
     }
 
+    fn set_audio_tap(&self, tap: Option<SyncSender<AudioTapPacket>>) {
+        if tap.is_some() {
+            self.dropped_tap.store(0, Ordering::Relaxed);
+        }
+        *self.audio_tap.lock() = tap;
+    }
+
+    fn dropped_tap_frames(&self) -> u64 {
+        self.dropped_tap.load(Ordering::Relaxed)
+    }
+
     fn inject_inbound_audio_for_test(&self, _opus_payload: &[u8]) {}
 
     fn stop(&self) {
+        *self.audio_tap.lock() = None;
         self.stopped.store(true, Ordering::Relaxed);
     }
 }
@@ -939,21 +971,25 @@ struct TestHarness {
     engine: Arc<OlazCallEngine>,
     factory: Arc<MockMediaFactory>,
     events: Arc<Mutex<Vec<RecordedEvent>>>,
+    ui_events: Arc<Mutex<Vec<CallUiEvent>>>,
 }
 
 impl TestHarness {
     fn new(ring_timeout: Duration) -> Self {
         let events = Arc::new(Mutex::new(Vec::new()));
+        let ui_events = Arc::new(Mutex::new(Vec::new()));
         let factory = Arc::new(MockMediaFactory::default());
 
         let ev_u = Arc::clone(&events);
         let ev_s = Arc::clone(&events);
         let ev_ui = Arc::clone(&events);
+        let raw_ui = Arc::clone(&ui_events);
 
         let mut cfg = CallEngineConfig::new(
             move |cmd, val| ev_u.lock().push(RecordedEvent::Update(cmd.to_string(), val)),
             move |cmd, val| ev_s.lock().push(RecordedEvent::Signal(cmd, val)),
             move |ui| {
+                raw_ui.lock().push(ui.clone());
                 let tag = match ui {
                     CallUiEvent::ShowCall { is_video, .. } => format!("ShowCall(video={is_video})"),
                     CallUiEvent::ShowIncoming { is_video, .. } => {
@@ -968,6 +1004,12 @@ impl TestHarness {
                     CallUiEvent::SetDevices(_) => "SetDevices".into(),
                     CallUiEvent::SetMicLevel { .. } => "SetMicLevel".into(),
                     CallUiEvent::VideoFrame { .. } => "VideoFrame".into(),
+                    CallUiEvent::SetRecording {
+                        active,
+                        format,
+                        error,
+                        ..
+                    } => format!("SetRecording(active={active},fmt={format:?},err={error:?})"),
                 };
                 ev_ui.lock().push(RecordedEvent::Ui(tag));
             },
@@ -982,6 +1024,7 @@ impl TestHarness {
             engine,
             factory,
             events,
+            ui_events,
         }
     }
 }
@@ -1398,6 +1441,25 @@ fn ui_assets_and_call_stub_backwards_compatibility() {
     assert!(call_html_str.contains(r#"id="local-video""#));
     assert!(call_html_str.contains(r#"id="btn-cam""#));
     assert!(call_html_str.contains(r#"id="btn-screen""#));
+    assert!(call_html_str.contains(r#"id="btn-record""#));
+    assert!(call_html_str.contains(r#"id="rec-indicator""#));
+    assert!(call_html_str.contains(r#"id="rec-toast""#));
+    assert!(call_html_str.contains("header-info"));
+    assert!(call_html_str.contains("controls-bar"));
+
+    assert!(PRELOAD_BRIDGE_JS.contains("toggleRecord"));
+    assert!(PRELOAD_BRIDGE_JS.contains("openRecordingFolder"));
+    assert!(PRELOAD_BRIDGE_JS.contains("onRecording"));
+
+    let (_, call_css) = get_ui_asset("call.css").unwrap();
+    let call_css_str = std::str::from_utf8(call_css).unwrap();
+    assert!(call_css_str.contains(".rec-indicator"));
+    assert!(call_css_str.contains("recPulse"));
+
+    let (_, call_js) = get_ui_asset("call.js").unwrap();
+    let call_js_str = std::str::from_utf8(call_js).unwrap();
+    assert!(call_js_str.contains("toggleRecord"));
+    assert!(call_js_str.contains("openRecordingFolder"));
 
     // Verify existing `call_stub` exports remain intact.
     assert!(!LINUX_CALL_UNSUPPORTED_MESSAGE.is_empty());
@@ -1516,4 +1578,723 @@ fn ffmpeg_h264_aud_flush_decoder_roundtrip() {
     );
     assert_eq!(got[0], (320, 240, 320 * 240 * 4));
 }
+
+// ============================================================================
+// 7. Full-Duplex VoIP Call Recorder (`recorder.rs`, `audio_io.rs`, `opus_ffi.rs`, `engine.rs`)
+// ============================================================================
+
+#[test]
+fn recorder_wav_header_stereo_split_mono_mix_permissions_and_crash_safe_periodic_sync() {
+    assert_eq!(WAV_HEADER_BYTES, 44);
+    assert_eq!(WAV_SYNC_INTERVAL_FRAMES, 250);
+    assert!(!default_recordings_dir().as_os_str().is_empty());
+    assert_eq!(
+        sanitize_partner_slug("Nguyễn Văn Đạt / Team #1!"),
+        "nguyen-van-dat-team-1"
+    );
+    assert_eq!(sanitize_partner_slug("...///"), "peer");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let rec_dir = tmp.path().join("private_recordings");
+    let wav_path = build_recording_file_path(&rec_dir, "Nguyễn Văn Đạt", RecordingFormat::Wav);
+    assert!(wav_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .ends_with("-nguyen-van-dat.wav"));
+
+    // 1. Start StereoSplit WAV recorder and feed 260 frames (> 250 periodic sync threshold!).
+    let rec = CallRecorderHandle::start(
+        wav_path.clone(),
+        RecordingFormat::Wav,
+        RecordingChannelLayout::StereoSplit,
+    )
+    .unwrap();
+    let tap = rec.tap_sender();
+
+    let total_frames: usize = 260;
+    for f in 0..total_frames {
+        let tx_val = (1000 + f as i16).clamp(-30_000, 30_000);
+        let rx_val = (-2000 - f as i16).clamp(-30_000, 30_000);
+        let mut tx_samples = [0i16; AUDIO_FRAME_SAMPLES];
+        let mut rx_samples = [0i16; AUDIO_FRAME_SAMPLES];
+        for i in 0..AUDIO_FRAME_SAMPLES {
+            tx_samples[i] = tx_val.wrapping_add((i & 7) as i16);
+            rx_samples[i] = rx_val.wrapping_sub((i & 7) as i16);
+        }
+        tap.send(AudioTapPacket {
+            source: TapSource::TxMic,
+            samples: tx_samples,
+        })
+        .unwrap();
+        tap.send(AudioTapPacket {
+            source: TapSource::RxRemote,
+            samples: rx_samples,
+        })
+        .unwrap();
+    }
+
+    // Verify crash-safe periodic patching at 250 frames BEFORE `stop()` is called!
+    let expected_250_data_bytes = 250u32 * (AUDIO_FRAME_SAMPLES as u32) * 4;
+    let sync_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_midstream_patched_header = false;
+    while std::time::Instant::now() < sync_deadline {
+        if let Ok(mid_bytes) = std::fs::read(&wav_path) {
+            if mid_bytes.len() >= 44 {
+                let mid_riff_sz = u32::from_le_bytes(mid_bytes[4..8].try_into().unwrap());
+                let mid_data_sz = u32::from_le_bytes(mid_bytes[40..44].try_into().unwrap());
+                if mid_data_sz >= expected_250_data_bytes && mid_riff_sz == 36 + mid_data_sz {
+                    saw_midstream_patched_header = true;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        saw_midstream_patched_header,
+        "WAV writer must patch RIFF (offset 4) and data (offset 40) chunk sizes every 250 frames while still recording"
+    );
+
+    drop(tap);
+    let summary = rec.stop().unwrap();
+    assert_eq!(summary.format, RecordingFormat::Wav);
+    assert_eq!(summary.layout, RecordingChannelLayout::StereoSplit);
+    assert_eq!(summary.frames_written, total_frames as u64);
+    assert_eq!(summary.duration_ms, (total_frames as u64) * 20);
+    let expected_data_len = (total_frames * AUDIO_FRAME_SAMPLES * 4) as u64;
+    assert_eq!(summary.bytes_written, 44 + expected_data_len);
+
+    // Verify Unix `0o700` directory mode and `0o600` file mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir_mode = std::fs::metadata(&rec_dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&wav_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+    }
+
+    // Parse full 44-byte WAV header and verify EVERY StereoSplit sample (`Left == TxMic`, `Right == RxRemote`).
+    let raw = std::fs::read(&wav_path).unwrap();
+    assert_eq!(raw.len() as u64, 44 + expected_data_len);
+    assert_eq!(&raw[0..4], b"RIFF");
+    assert_eq!(
+        u32::from_le_bytes(raw[4..8].try_into().unwrap()),
+        (raw.len() - 8) as u32
+    );
+    assert_eq!(&raw[8..12], b"WAVE");
+    assert_eq!(&raw[12..16], b"fmt ");
+    assert_eq!(u32::from_le_bytes(raw[16..20].try_into().unwrap()), 16);
+    assert_eq!(u16::from_le_bytes(raw[20..22].try_into().unwrap()), 1); // PCM
+    assert_eq!(u16::from_le_bytes(raw[22..24].try_into().unwrap()), 2); // 2 channels
+    assert_eq!(u32::from_le_bytes(raw[24..28].try_into().unwrap()), 16_000);
+    assert_eq!(u32::from_le_bytes(raw[28..32].try_into().unwrap()), 64_000); // 16000 * 2 * 2
+    assert_eq!(u16::from_le_bytes(raw[32..34].try_into().unwrap()), 4); // block_align
+    assert_eq!(u16::from_le_bytes(raw[34..36].try_into().unwrap()), 16); // bits_per_sample
+    assert_eq!(&raw[36..40], b"data");
+    assert_eq!(
+        u32::from_le_bytes(raw[40..44].try_into().unwrap()),
+        expected_data_len as u32
+    );
+
+    let pcm_bytes = &raw[44..];
+    for f in 0..total_frames {
+        let tx_base = 1000 + f as i16;
+        let rx_base = -2000 - f as i16;
+        for i in 0..AUDIO_FRAME_SAMPLES {
+            let sample_pair_idx = f * AUDIO_FRAME_SAMPLES + i;
+            let off = sample_pair_idx * 4;
+            let left = i16::from_le_bytes([pcm_bytes[off], pcm_bytes[off + 1]]);
+            let right = i16::from_le_bytes([pcm_bytes[off + 2], pcm_bytes[off + 3]]);
+            assert_eq!(left, tx_base + (i & 7) as i16);
+            assert_eq!(right, rx_base - (i & 7) as i16);
+        }
+    }
+
+    // 2. Verify MonoMix WAV + soft-clipping behavior.
+    assert_eq!(soft_clip_mono_sum(10_000, 5_000), 15_000);
+    assert_eq!(soft_clip_mono_sum(-10_000, -5_000), -15_000);
+    let loud_pos = soft_clip_mono_sum(30_000, 30_000);
+    let loud_neg = soft_clip_mono_sum(-30_000, -30_000);
+    assert!(loud_pos > 24_576 && loud_pos <= i16::MAX);
+    assert_eq!(loud_neg, -loud_pos);
+
+    let mono_path = rec_dir.join("mono-test.wav");
+    let mono_rec = CallRecorderHandle::start(
+        mono_path.clone(),
+        RecordingFormat::Wav,
+        RecordingChannelLayout::MonoMix,
+    )
+    .unwrap();
+    let mono_tap = mono_rec.tap_sender();
+    mono_tap
+        .send(AudioTapPacket {
+            source: TapSource::TxMic,
+            samples: [8_000i16; AUDIO_FRAME_SAMPLES],
+        })
+        .unwrap();
+    mono_tap
+        .send(AudioTapPacket {
+            source: TapSource::RxRemote,
+            samples: [4_500i16; AUDIO_FRAME_SAMPLES],
+        })
+        .unwrap();
+    drop(mono_tap);
+    let mono_sum = mono_rec.stop().unwrap();
+    assert_eq!(mono_sum.frames_written, 1);
+    let mono_raw = std::fs::read(&mono_path).unwrap();
+    assert_eq!(u16::from_le_bytes(mono_raw[22..24].try_into().unwrap()), 1); // 1 channel
+    assert_eq!(
+        i16::from_le_bytes([mono_raw[44], mono_raw[45]]),
+        12_500 // 8_000 + 4_500 linear sum
+    );
+}
+
+#[test]
+fn recorder_drift_aligner_lag_zero_padding_queue_cap_and_wait_free_audio_tap() {
+    assert_eq!(ALIGNER_FRAME_SAMPLES, 320);
+    assert_eq!(ALIGNER_LAG_THRESHOLD_SAMPLES, 960);
+    assert_eq!(ALIGNER_MAX_QUEUE_SAMPLES, 3_200);
+
+    let mut aligner = DriftAligner::new();
+
+    // 1. Push 2 TX frames (`640` samples < `960` lag threshold) with 0 RX frames -> must wait without padding yet.
+    aligner.push(AudioTapPacket {
+        source: TapSource::TxMic,
+        samples: [101i16; 320],
+    });
+    aligner.push(AudioTapPacket {
+        source: TapSource::TxMic,
+        samples: [102i16; 320],
+    });
+    assert!(aligner.pop_aligned_frame().is_none());
+    assert_eq!(aligner.zero_padded_frames(), 0);
+
+    // 2. Push 3rd TX frame (`960` samples == `60ms` threshold) while RX `< 320` -> pops `(tx0, [0; 320])`!
+    aligner.push(AudioTapPacket {
+        source: TapSource::TxMic,
+        samples: [103i16; 320],
+    });
+    let (tx0, rx0) = aligner
+        .pop_aligned_frame()
+        .expect("960-sample TX lead must zero-pad lagging RX");
+    assert_eq!(tx0, [101i16; 320]);
+    assert_eq!(rx0, [0i16; 320]);
+    assert_eq!(aligner.zero_padded_frames(), 1);
+    // Remaining TX is `640` (< `960`), so no second pad yet.
+    assert!(aligner.pop_aligned_frame().is_none());
+
+    // 3. Now RX arrives -> pairs cleanly with queued `tx1` (`102`) without zero-padding!
+    aligner.push(AudioTapPacket {
+        source: TapSource::RxRemote,
+        samples: [202i16; 320],
+    });
+    let (tx1, rx1) = aligner.pop_aligned_frame().unwrap();
+    assert_eq!(tx1, [102i16; 320]);
+    assert_eq!(rx1, [202i16; 320]);
+    assert_eq!(aligner.zero_padded_frames(), 1);
+
+    // Drain remaining `tx2` via flush, then test reverse lag (`RX >= 960` while `TX == 0`).
+    let (tx2_flush, rx2_flush) = aligner.pop_flush_frame().unwrap();
+    assert_eq!(tx2_flush, [103i16; 320]);
+    assert_eq!(rx2_flush, [0i16; 320]);
+    assert!(aligner.pop_flush_frame().is_none());
+
+    for val in [301i16, 302, 303] {
+        aligner.push(AudioTapPacket {
+            source: TapSource::RxRemote,
+            samples: [val; 320],
+        });
+    }
+    let (tx_pad, rx_lead) = aligner
+        .pop_aligned_frame()
+        .expect("960-sample RX lead must zero-pad lagging TX");
+    assert_eq!(tx_pad, [0i16; 320]);
+    assert_eq!(rx_lead, [301i16; 320]);
+
+    // 4. Verify `3,200`-sample (`200ms` = 10 frames) clock-skew cap per queue.
+    let mut cap_aligner = DriftAligner::new();
+    for step in 0..20i16 {
+        cap_aligner.push(AudioTapPacket {
+            source: TapSource::TxMic,
+            samples: [step; 320],
+        });
+    }
+    assert_eq!(cap_aligner.tx_len(), ALIGNER_MAX_QUEUE_SAMPLES);
+    let (oldest_kept_tx, _) = cap_aligner.pop_aligned_frame().unwrap();
+    // 20 frames pushed, cap = 10 frames -> oldest 10 (`0..10`) dropped, oldest retained is `10`!
+    assert_eq!(oldest_kept_tx[0], 10);
+
+    // 5. Verify wait-free `AudioIoSession` tap (`try_send` never blocks when full + counts `dropped_tap_frames`)
+    // AND preserves inbound remote PCM in jitter buffer while `speaker_muted` is `true` if `recording_active`!
+    let audio = AudioIoSession::new();
+    let (tiny_tx, tiny_rx) = std::sync::mpsc::sync_channel::<AudioTapPacket>(2);
+    audio.set_audio_tap(Some(tiny_tx));
+    for k in 0..5i16 {
+        audio.emit_tap_frame(TapSource::TxMic, &[k; 320]);
+    }
+    assert_eq!(audio.dropped_tap_frames(), 3);
+    assert_eq!(tiny_rx.try_recv().unwrap().samples[0], 0);
+    assert_eq!(tiny_rx.try_recv().unwrap().samples[0], 1);
+    assert!(tiny_rx.try_recv().is_err());
+
+    // Mute speaker while recording is active -> `push_inbound_pcm` must NOT discard remote audio!
+    audio.set_speaker_muted(true);
+    audio.push_inbound_pcm(&[777i16; 320]);
+    audio.set_audio_tap(None);
+}
+
+struct ParsedOggPage {
+    header_type: u8,
+    granule_pos: u64,
+    serial: u32,
+    page_seq: u32,
+    packets: Vec<Vec<u8>>,
+}
+
+fn parse_and_verify_ogg_pages(raw: &[u8]) -> Vec<ParsedOggPage> {
+    let mut pos = 0usize;
+    let mut pages = Vec::new();
+    let mut carry_pkt = Vec::new();
+
+    while pos < raw.len() {
+        assert!(
+            pos + 27 <= raw.len(),
+            "truncated Ogg page header at offset {pos}"
+        );
+        assert_eq!(&raw[pos..pos + 4], b"OggS", "invalid OggS magic at {pos}");
+        assert_eq!(raw[pos + 4], 0, "Ogg stream_structure_version must be 0");
+        let header_type = raw[pos + 5];
+        let granule_pos = u64::from_le_bytes(raw[pos + 6..pos + 14].try_into().unwrap());
+        let serial = u32::from_le_bytes(raw[pos + 14..pos + 18].try_into().unwrap());
+        let page_seq = u32::from_le_bytes(raw[pos + 18..pos + 22].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(raw[pos + 22..pos + 26].try_into().unwrap());
+        let seg_count = raw[pos + 26] as usize;
+        let seg_table_end = pos + 27 + seg_count;
+        assert!(seg_table_end <= raw.len());
+        let seg_table = &raw[pos + 27..seg_table_end];
+        let body_len: usize = seg_table.iter().map(|&b| b as usize).sum();
+        let page_end = seg_table_end + body_len;
+        assert!(page_end <= raw.len());
+
+        // Verify RFC 3533 Ogg CRC-32 with bytes 22..26 zeroed!
+        let mut page_copy = raw[pos..page_end].to_vec();
+        page_copy[22..26].copy_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(
+            ogg_crc32(&page_copy),
+            stored_crc,
+            "Ogg CRC-32 mismatch on page_seq={page_seq}"
+        );
+
+        let mut packets = Vec::new();
+        let mut body_off = seg_table_end;
+        for &lacing in seg_table {
+            let seg_len = lacing as usize;
+            carry_pkt.extend_from_slice(&raw[body_off..body_off + seg_len]);
+            body_off += seg_len;
+            if lacing < 255 {
+                packets.push(std::mem::take(&mut carry_pkt));
+            }
+        }
+
+        pages.push(ParsedOggPage {
+            header_type,
+            granule_pos,
+            serial,
+            page_seq,
+            packets,
+        });
+        pos = page_end;
+    }
+    assert!(carry_pkt.is_empty(), "unterminated laced packet at EOF");
+    pages
+}
+
+#[test]
+fn recorder_ogg_opus_rfc7845_headers_crc32_granule_decode_and_wav_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // 1. Deterministic fallback test: when `allow_opus == false`, `.opus` cleanly falls back to `.wav`!
+    let req_opus_fb = tmp.path().join("fallback-call.opus");
+    let fb_rec = CallRecorderHandle::start_with_opus_availability(
+        req_opus_fb,
+        RecordingFormat::OggOpus,
+        RecordingChannelLayout::StereoSplit,
+        false,
+    )
+    .unwrap();
+    assert_eq!(fb_rec.format(), RecordingFormat::Wav);
+    assert_eq!(fb_rec.path().extension().unwrap(), "wav");
+    let fb_tap = fb_rec.tap_sender();
+    fb_tap
+        .send(AudioTapPacket {
+            source: TapSource::TxMic,
+            samples: [500i16; 320],
+        })
+        .unwrap();
+    fb_tap
+        .send(AudioTapPacket {
+            source: TapSource::RxRemote,
+            samples: [-500i16; 320],
+        })
+        .unwrap();
+    drop(fb_tap);
+    let fb_summary = fb_rec.stop().unwrap();
+    assert_eq!(fb_summary.format, RecordingFormat::Wav);
+    assert_eq!(&std::fs::read(&fb_summary.path).unwrap()[0..4], b"RIFF");
+
+    if !is_opus_available() {
+        return;
+    }
+
+    // 2. Direct multi-channel `OpusPcmEncoder` + `OpusVoipDecoder` (mono) & `OpusPcmDecoder` (stereo) sanity check.
+    let mut mono_enc = OpusPcmEncoder::new(1, 32_000).unwrap();
+    let mut voip_dec = OpusVoipDecoder::new().unwrap();
+    let mono_pkt = mono_enc.encode_20ms_slice(&[4_000i16; 320]).unwrap();
+    assert_eq!(voip_dec.decode_20ms(Some(&mono_pkt), false).unwrap().len(), 320);
+
+    // 3. Full RFC 7845 Stereo Ogg/Opus recording (`30` frames = `600ms` across 2 audio pages: 25 + 5 frames).
+    let opus_path = build_recording_file_path(tmp.path(), "Trần Minh", RecordingFormat::OggOpus);
+    let rec = CallRecorderHandle::start(
+        opus_path.clone(),
+        RecordingFormat::OggOpus,
+        RecordingChannelLayout::StereoSplit,
+    )
+    .unwrap();
+    assert_eq!(rec.format(), RecordingFormat::OggOpus);
+    let tap = rec.tap_sender();
+
+    let total_frames = 30usize;
+    for f in 0..total_frames {
+        let mut tx_sine = [0i16; 320];
+        let mut rx_sine = [0i16; 320];
+        for i in 0..320 {
+            let t = ((f * 320 + i) as f64) / 16_000.0;
+            tx_sine[i] = ((2.0 * std::f64::consts::PI * 440.0 * t).sin() * 14_000.0) as i16;
+            rx_sine[i] = ((2.0 * std::f64::consts::PI * 880.0 * t).sin() * 11_000.0) as i16;
+        }
+        tap.send(AudioTapPacket {
+            source: TapSource::TxMic,
+            samples: tx_sine,
+        })
+        .unwrap();
+        tap.send(AudioTapPacket {
+            source: TapSource::RxRemote,
+            samples: rx_sine,
+        })
+        .unwrap();
+    }
+    drop(tap);
+
+    let summary = rec.stop().unwrap();
+    assert_eq!(summary.format, RecordingFormat::OggOpus);
+    assert_eq!(summary.layout, RecordingChannelLayout::StereoSplit);
+    assert_eq!(summary.frames_written, total_frames as u64);
+    assert_eq!(summary.duration_ms, 600);
+
+    let raw_ogg = std::fs::read(&summary.path).unwrap();
+    assert_eq!(raw_ogg.len() as u64, summary.bytes_written);
+
+    let pages = parse_and_verify_ogg_pages(&raw_ogg);
+    assert!(
+        pages.len() >= 3,
+        "expected OpusHead + OpusTags + >=1 audio page, got {}",
+        pages.len()
+    );
+
+    let serial = pages[0].serial;
+    for (idx, p) in pages.iter().enumerate() {
+        assert_eq!(p.serial, serial);
+        assert_eq!(p.page_seq, idx as u32);
+        if idx == 0 {
+            assert_eq!(p.header_type, 0x02, "Page 0 MUST have BOS flag (0x02)");
+        } else if idx + 1 == pages.len() {
+            assert_eq!(
+                p.header_type & 0x04,
+                0x04,
+                "Final page MUST have EOS flag (0x04)"
+            );
+        } else {
+            assert_eq!(p.header_type, 0x00);
+        }
+    }
+
+    // Page 0: RFC 7845 §5.1 `OpusHead` (19 bytes).
+    assert_eq!(pages[0].granule_pos, 0);
+    assert_eq!(pages[0].packets.len(), 1);
+    let head = &pages[0].packets[0];
+    assert_eq!(head.len(), 19);
+    assert_eq!(&head[0..8], b"OpusHead");
+    assert_eq!(head[8], 1); // version = 1
+    assert_eq!(head[9], 2); // channels = 2 (StereoSplit)
+    assert_eq!(
+        u16::from_le_bytes(head[10..12].try_into().unwrap()),
+        OGG_OPUS_PRE_SKIP
+    );
+    assert_eq!(u32::from_le_bytes(head[12..16].try_into().unwrap()), 16_000);
+    assert_eq!(i16::from_le_bytes(head[16..18].try_into().unwrap()), 0);
+    assert_eq!(head[18], 0); // channel_mapping_family = 0
+
+    // Page 1: RFC 7845 §5.2 `OpusTags` (`vendor = "olaz-linux"`).
+    assert_eq!(pages[1].granule_pos, 0);
+    assert_eq!(pages[1].packets.len(), 1);
+    let tags = &pages[1].packets[0];
+    assert_eq!(&tags[0..8], b"OpusTags");
+    let vendor_len = u32::from_le_bytes(tags[8..12].try_into().unwrap()) as usize;
+    assert_eq!(&tags[12..12 + vendor_len], b"olaz-linux");
+
+    // Audio pages: verify granule progression (`960` per 20ms frame at `48 kHz`) & decode every stereo Opus packet!
+    let mut dec = OpusPcmDecoder::new(2).unwrap();
+    let mut cumulative_frames = 0u64;
+    let mut peak_left: i16 = 0;
+    let mut peak_right: i16 = 0;
+
+    for audio_page in &pages[2..] {
+        assert!(!audio_page.packets.is_empty());
+        cumulative_frames += audio_page.packets.len() as u64;
+        assert_eq!(
+            audio_page.granule_pos,
+            cumulative_frames * OGG_OPUS_GRANULE_STEP_20MS
+        );
+        for pkt in &audio_page.packets {
+            let decoded_interleaved = dec.decode_20ms(Some(pkt), false).unwrap();
+            assert_eq!(decoded_interleaved.len(), 320 * 2);
+            for pair in decoded_interleaved.chunks_exact(2) {
+                peak_left = peak_left.max(pair[0].saturating_abs());
+                peak_right = peak_right.max(pair[1].saturating_abs());
+            }
+        }
+    }
+    assert_eq!(cumulative_frames, total_frames as u64);
+    assert!(
+        peak_left > 2_500 && peak_right > 2_000,
+        "decoded stereo Opus channels must both carry strong sine tones (peak_left={peak_left}, peak_right={peak_right})"
+    );
+
+    // Also verify external `ffmpeg` RFC 7845 Ogg/Opus demux + decode if `ffmpeg` is installed!
+    if let Ok(ff_out) = std::process::Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-i",
+            summary.path.to_str().unwrap(),
+            "-f",
+            "s16le",
+            "-ac",
+            "2",
+            "-ar",
+            "16000",
+            "pipe:1",
+        ])
+        .output()
+    {
+        assert!(
+            ff_out.status.success(),
+            "ffmpeg failed to decode recorded .opus file: {}",
+            String::from_utf8_lossy(&ff_out.stderr)
+        );
+        assert!(
+            ff_out.stdout.len() >= 25 * 320 * 4,
+            "ffmpeg decoded unexpectedly short PCM byte length: {}",
+            ff_out.stdout.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn engine_toggle_record_midcall_manual_stop_and_autostop_on_end_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rec_dir = tmp.path().join("engine_recordings");
+
+    let h = TestHarness::new(Duration::from_secs(30));
+    h.engine.set_recordings_dir(rec_dir.clone());
+    assert_eq!(h.engine.recordings_dir(), rec_dir);
+
+    // 1. Calling `toggleRecord` with no active call emits `SetRecording { active: false, error: Some(...) }`.
+    h.engine.handle_ui_action("toggleRecord", Value::Null);
+    {
+        let uis = h.ui_events.lock();
+        assert!(matches!(
+            uis.last(),
+            Some(CallUiEvent::SetRecording {
+                active: false,
+                error: Some(_),
+                ..
+            })
+        ));
+    }
+
+    // 2. Establish an outgoing connected call with partner `"Nguyễn Văn Đạt"`.
+    h.engine.handle_send_to_native(json!({
+        "type": "request",
+        "command": "makeCall",
+        "data": {
+            "type": 1,
+            "partner": [{ "id": "888002", "name": "Nguyễn Văn Đạt" }]
+        }
+    }));
+    h.engine.handle_send_to_native(json!({
+        "type": "recvSignal",
+        "command": 401,
+        "data": {
+            "fromId": 100_002,
+            "toId": 888_002,
+            "sessId": SAMPLE_SESS_154,
+            "rtpIP": "49.213.119.2:4200"
+        }
+    }));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    h.engine.handle_send_to_native(json!({
+        "type": "control",
+        "data": { "act": "answer", "data": { "callId": 700_001, "status": 0 } }
+    }));
+
+    let drv = h.factory.last_driver.lock().clone().unwrap();
+
+    // 3. Toggle record ON (WAV + StereoSplit), push 6 frames, then toggle record OFF manually mid-call.
+    h.engine
+        .handle_ui_action("toggleRecord", json!({ "format": "wav", "layout": "stereo" }));
+    assert!(h.engine.is_recording());
+
+    let started_wav_path = {
+        let uis = h.ui_events.lock();
+        match uis.last().cloned() {
+            Some(CallUiEvent::SetRecording {
+                active: true,
+                started_at_ms: Some(ts),
+                path: Some(p),
+                format: Some(fmt),
+                error: None,
+            }) => {
+                assert!(ts > 0);
+                assert_eq!(fmt, "wav");
+                assert!(p.ends_with("-nguyen-van-dat.wav"));
+                p
+            }
+            other => panic!("expected SetRecording(active=true, wav), got {other:?}"),
+        }
+    };
+
+    for f in 0..6i16 {
+        drv.emit_tap(AudioTapPacket {
+            source: TapSource::TxMic,
+            samples: [1000 + f; 320],
+        });
+        drv.emit_tap(AudioTapPacket {
+            source: TapSource::RxRemote,
+            samples: [-1000 - f; 320],
+        });
+    }
+
+    h.engine.handle_ui_action("toggleRecord", Value::Null);
+    assert!(!h.engine.is_recording());
+    {
+        let uis = h.ui_events.lock();
+        match uis.last().cloned() {
+            Some(CallUiEvent::SetRecording {
+                active: false,
+                started_at_ms: None,
+                path: Some(p),
+                format: Some(fmt),
+                error: None,
+            }) => {
+                assert_eq!(p, started_wav_path);
+                assert_eq!(fmt, "wav");
+            }
+            other => panic!("expected SetRecording(active=false, wav), got {other:?}"),
+        }
+    }
+    let wav_bytes = std::fs::read(&started_wav_path).unwrap();
+    assert_eq!(wav_bytes.len(), 44 + 6 * 320 * 4);
+    assert_eq!(
+        u32::from_le_bytes(wav_bytes[40..44].try_into().unwrap()),
+        (6 * 320 * 4) as u32
+    );
+
+    // 4. Start a SECOND recording (`"opus"`) during the same call, push 8 frames, then send `"endCall"`
+    // WITHOUT manually toggling record off -> engine MUST auto-stop & finalize before closing call!
+    h.engine
+        .handle_ui_action("toggleRecord", json!({ "format": "opus", "layout": "stereo" }));
+    assert!(h.engine.is_recording());
+
+    let started_second_path = {
+        let uis = h.ui_events.lock();
+        match uis.last().cloned() {
+            Some(CallUiEvent::SetRecording {
+                active: true,
+                path: Some(p),
+                error: None,
+                ..
+            }) => p,
+            other => panic!("expected 2nd SetRecording(active=true), got {other:?}"),
+        }
+    };
+
+    for f in 0..8usize {
+        let mut s = [0i16; 320];
+        for (i, sample) in s.iter_mut().enumerate() {
+            let t = ((f * 320 + i) as f64) / 16_000.0;
+            *sample = ((2.0 * std::f64::consts::PI * 520.0 * t).sin() * 9_000.0) as i16;
+        }
+        drv.emit_tap(AudioTapPacket {
+            source: TapSource::TxMic,
+            samples: s,
+        });
+        drv.emit_tap(AudioTapPacket {
+            source: TapSource::RxRemote,
+            samples: s,
+        });
+    }
+
+    // Trigger `"endCall"` via `handle_send_to_native`!
+    h.engine.handle_send_to_native(json!({
+        "type": "request",
+        "command": "endCall"
+    }));
+    assert!(!h.engine.is_recording());
+
+    // Wait for delayed `CloseCall` (`10ms` in `TestHarness`).
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    {
+        let uis = h.ui_events.lock();
+        let stop_rec_idx = uis
+            .iter()
+            .rposition(|ev| {
+                matches!(
+                    ev,
+                    CallUiEvent::SetRecording {
+                        active: false,
+                        path: Some(p),
+                        error: None,
+                        ..
+                    } if p == &started_second_path
+                )
+            })
+            .expect("endCall teardown MUST emit SetRecording(active=false, path=Some(..))");
+        let close_idx = uis
+            .iter()
+            .rposition(|ev| matches!(ev, CallUiEvent::CloseCall))
+            .expect("expected CloseCall");
+        assert!(
+            stop_rec_idx < close_idx,
+            "SetRecording(active=false) ({stop_rec_idx}) must fire before CloseCall ({close_idx})"
+        );
+    }
+
+    let finalized_second = std::fs::read(&started_second_path).unwrap();
+    if is_opus_available() {
+        let pages = parse_and_verify_ogg_pages(&finalized_second);
+        assert!(pages.len() >= 3);
+        assert_eq!(
+            pages.last().unwrap().header_type & 0x04,
+            0x04,
+            "auto-stopped .opus recording on endCall must have EOS flag set on final Ogg page"
+        );
+    } else {
+        assert_eq!(&finalized_second[0..4], b"RIFF");
+    }
+}
+
 

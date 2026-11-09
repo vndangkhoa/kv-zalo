@@ -3,33 +3,28 @@
 //! Omarchy live theme watcher, `StatusNotifierItem` tray integration, and `ZaloEngineState` -> UI store serializer.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use gtk::prelude::*;
 use javascriptcore::ValueExt as JscValueExt;
-use olaz_core::{InstallProgress, ZaloPlatform, ZaloRuntimeManager};
+use olaz_core::{AsarArchive, InstallProgress, ProfileRegistry, ZaloPlatform, ZaloRuntimeManager};
+use olaz_linux::api_mcp::MultiAccountControlBackend;
 use olaz_linux::{
-    capture_interactive_screenshot, has_gstreamer_audio_sink, instance_socket_path,
-    load_omarchy_theme, pick_open_files, resolve_olaz_executable_path, spawn_automation_loop,
-    spawn_local_api_server, spawn_omarchy_watcher, spawn_tray, stage_screenshot_file, unix_now_ms,
-    AutoReplyEngine, AutomationLoopHandle, ComposerDraft, Conversation, DesktopTheme,
-    EngineControlBackend, EnginePhase, FileCard, IncomingVoipCall, InstanceEvent,
-    LocalApiServerHandle, Mention, NotificationPolicy, OlazControlBackend, OlazTrayEvent,
-    OlazTrayHandle, OmarchyWatcherHandle, PrivacyConfig, ProfileInstanceEvent, SchedulerEngine,
-    StartCallCallback, TrayPrivacyState, WaitingConfirm, ZaloEngineState, DEFAULT_AUTOMATION_TICK,
-    PRIVACY_CONFIG_FILENAME, SCREENSHOT_STAGING_DIR,
+    capture_interactive_screenshot, has_gstreamer_audio_sink, load_omarchy_theme, pick_open_dialog,
+    pick_open_files, spawn_local_api_server, spawn_omarchy_watcher, spawn_tray,
+    stage_screenshot_file, unix_now_ms, CallRecordingSettings, ComposerDraft, Conversation,
+    DesktopTheme, EnginePhase, FileCard, IncomingVoipCall, InstanceEvent, LocalApiServerHandle,
+    Mention, NotificationPolicy, OlazControlBackend, OlazTrayEvent, OlazTrayHandle,
+    OmarchyWatcherHandle, ProfileInstanceEvent, WaitingConfirm, ZaloEngineState,
+    SCREENSHOT_STAGING_DIR,
 };
 use olaz_net::{serve_local_media_range, MediaLoader, MediaRangeResponse};
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use soup::{MessageHeaders, MessageHeadersType};
@@ -44,6 +39,11 @@ use webkit2gtk::{
     WebContextExt, WebView, WebViewExt, WebsiteDataManager, WebsiteDataManagerExt,
 };
 
+use crate::account_session::{
+    privacy_config_from_tray, resolve_instance_root_dir, save_legacy_tray_privacy,
+    tray_privacy_from_config, AccountOutboundCall, AccountOutboundSend, AccountPrivacyEvent,
+    AccountSession, WindowPageMode,
+};
 use crate::client_host::{HostPage, OfficialClientHost, PageEvent};
 use crate::main_process::{MainProcessEvent, NotificationContext, WindowCommand, ZaloMainProcess};
 
@@ -305,68 +305,152 @@ impl SavedWindowState {
     }
 }
 
-fn load_privacy_state(path: &Path) -> TrayPrivacyState {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<TrayPrivacyState>(&bytes).ok())
-        .unwrap_or_default()
+const ACCOUNT_RAIL_CSS: &str = "\
+.olaz-account-rail {\
+  background-color: #0068ff;\
+  border-right: 1px solid rgba(0, 0, 0, 0.08);\
+}\
+.olaz-rail-indicator {\
+  background-color: transparent;\
+  border-radius: 0 3px 3px 0;\
+  min-width: 3px;\
+  min-height: 20px;\
+}\
+.olaz-rail-indicator-active {\
+  background-color: #ffffff;\
+  min-height: 28px;\
+}\
+.olaz-rail-btn {\
+  background-image: none;\
+  background-color: rgba(255, 255, 255, 0.16);\
+  color: #ffffff;\
+  border: 1.5px solid rgba(255, 255, 255, 0.72);\
+  border-radius: 22px;\
+  padding: 0;\
+  min-width: 44px;\
+  min-height: 44px;\
+  font-weight: 700;\
+  font-size: 13px;\
+}\
+.olaz-rail-btn:hover {\
+  background-color: rgba(255, 255, 255, 0.28);\
+  border-color: #ffffff;\
+}\
+.olaz-rail-btn-active {\
+  background-color: #0043a8;\
+  color: #ffffff;\
+  border-color: #ffffff;\
+  border-radius: 12px;\
+}\
+.olaz-rail-badge {\
+  background-color: #ef4444;\
+  color: #ffffff;\
+  border-radius: 9px;\
+  padding: 1px 5px;\
+  font-size: 10px;\
+  font-weight: 700;\
+  min-width: 16px;\
+  min-height: 16px;\
+}\
+.olaz-rail-add-btn {\
+  background-image: none;\
+  background-color: transparent;\
+  color: #ffffff;\
+  border: none;\
+  border-radius: 6px;\
+  padding: 0;\
+  min-width: 48px;\
+  min-height: 48px;\
+  font-size: 22px;\
+  font-weight: 500;\
+}\
+.olaz-rail-add-btn:hover {\
+  background-color: rgba(255, 255, 255, 0.16);\
+  color: #ffffff;\
+}\
+.olaz-account-page {\
+  background-color: #eef3fa;\
+}\
+.olaz-close-login-tab-btn {\
+  background-image: none;\
+  background-color: #ffffff;\
+  color: #081b3a;\
+  border: 1px solid rgba(8, 27, 58, 0.16);\
+  border-radius: 8px;\
+  padding: 6px 12px;\
+  font-size: 12px;\
+  font-weight: 600;\
+}\
+.olaz-close-login-tab-btn:hover {\
+  background-color: #dc2626;\
+  color: #ffffff;\
+  border-color: #dc2626;\
+}\
+.olaz-workspace-toast {\
+  background-color: rgba(15, 23, 42, 0.94);\
+  color: #f8fafc;\
+  border: 1px solid rgba(255, 255, 255, 0.18);\
+  border-radius: 10px;\
+  padding: 8px 16px;\
+  font-size: 13px;\
+  font-weight: 600;\
+}";
+
+fn install_account_rail_css() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let provider = gtk::CssProvider::new();
+        if let Err(err) = provider.load_from_data(ACCOUNT_RAIL_CSS.as_bytes()) {
+            tracing::warn!(%err, "failed to load AccountRail GTK CSS");
+            return;
+        }
+        if let Some(screen) = gdk::Screen::default() {
+            gtk::StyleContext::add_provider_for_screen(
+                &screen,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    });
 }
 
-fn save_privacy_state(state: &TrayPrivacyState, path: &Path) {
-    if let Ok(bytes) = serde_json::to_vec_pretty(state) {
-        let _ = std::fs::write(path, bytes);
-    }
+struct AccountRailWidgets {
+    row: gtk::Box,
+    indicator: gtk::Box,
+    button: gtk::Button,
+    initials_label: gtk::Label,
+    badge_label: gtk::Label,
 }
 
-fn tray_privacy_from_config(cfg: PrivacyConfig) -> TrayPrivacyState {
-    TrayPrivacyState {
-        block_typing: cfg.block_typing,
-        block_seen: cfg.block_seen,
-        block_delivered: cfg.block_delivered,
-    }
-}
-
-fn privacy_config_from_tray(state: TrayPrivacyState) -> PrivacyConfig {
-    PrivacyConfig {
-        block_typing: state.block_typing,
-        block_seen: state.block_seen,
-        block_delivered: state.block_delivered,
-    }
-}
-
-struct OutboundSendRequest {
-    conv_id: String,
-    text: String,
-    reply_tx: Option<oneshot::Sender<anyhow::Result<()>>>,
-}
-
-struct OutboundCallRequest {
-    target_id: String,
-    video: bool,
-    reply_tx: oneshot::Sender<anyhow::Result<Value>>,
-}
-
-/// Primary GTK3 application window hosting Zalo's official renderer directly (in normal GUI mode,
-/// matching `vndangkhoa/zalo-linux` pixel-for-pixel) and falling back to the `olaz-ui://` setup
-/// view during first-run DMG installation or `--demo`.
+/// Primary GTK3 application window hosting one or more isolated Zalo account sessions inside an
+/// instant-switching `gtk::Stack` with an auto-showing `AccountRail` sidebar, falling back to the
+/// `olaz-ui://` setup view during first-run DMG installation or `--demo`.
 pub struct OlazAppWindow {
     window: gtk::Window,
+    #[allow(dead_code)]
+    root_overlay: gtk::Overlay,
+    toast_label: gtk::Label,
+    toast_source: RefCell<Option<glib::SourceId>>,
     stack: gtk::Stack,
-    zalo_container: gtk::Box,
+    workspace_hbox: gtk::Box,
+    account_rail: gtk::Box,
+    rail_accounts_box: gtk::Box,
+    rail_widgets: RefCell<HashMap<String, AccountRailWidgets>>,
+    accounts_stack: gtk::Stack,
     ui_webview: WebView,
-    platform: Arc<ZaloPlatform>,
+
+    instance_root_dir: PathBuf,
+    profile_registry: RefCell<ProfileRegistry>,
+    sessions: RefCell<Vec<Rc<AccountSession>>>,
+    active_slug: RefCell<String>,
+
+    primary_platform: Arc<ZaloPlatform>,
     runtime_mgr: ZaloRuntimeManager,
-    host: Rc<OfficialClientHost>,
-    main_process: Rc<ZaloMainProcess>,
+    shared_asar: RefCell<Option<Arc<AsarArchive>>>,
     tokio_handle: tokio::runtime::Handle,
     demo_mode: bool,
 
-    engine_state: RefCell<ZaloEngineState>,
-    engine_state_mirror: Arc<RwLock<ZaloEngineState>>,
     runtime_progress: RefCell<Option<UiRuntimeProgress>>,
-    signing_in: Cell<bool>,
-    qr_seq: Cell<u64>,
-    last_qr: RefCell<Option<String>>,
     installing_runtime: Cell<bool>,
     last_delete_undo_id: RefCell<Option<String>>,
     settings: RefCell<UiSettings>,
@@ -375,8 +459,6 @@ pub struct OlazAppWindow {
     win_state_path: PathBuf,
     win_state_save_source: RefCell<Option<glib::SourceId>>,
     window_size_restored: Cell<bool>,
-    privacy_state: RefCell<TrayPrivacyState>,
-    privacy_path: PathBuf,
     in_login_mode: Cell<bool>,
     desktop_theme: RefCell<DesktopTheme>,
     ui_loaded: Cell<bool>,
@@ -385,12 +467,11 @@ pub struct OlazAppWindow {
     suppress_renderer_auto_show: Cell<bool>,
     quitting: Cell<bool>,
 
-    boot_time_ms: i64,
-    autoreply: Arc<AutoReplyEngine>,
-    autoreply_seen_ids: RefCell<HashSet<(String, String)>>,
-    outbound_send_tx: tokio::sync::mpsc::UnboundedSender<OutboundSendRequest>,
+    outbound_send_tx: tokio::sync::mpsc::UnboundedSender<AccountOutboundSend>,
+    outbound_call_tx: tokio::sync::mpsc::UnboundedSender<AccountOutboundCall>,
+    privacy_obs_tx: tokio::sync::mpsc::UnboundedSender<AccountPrivacyEvent>,
+    multi_control_backend: Arc<MultiAccountControlBackend>,
     control_backend: Arc<dyn OlazControlBackend>,
-    _automation_loop: Option<AutomationLoopHandle>,
     _api_server: RefCell<Option<LocalApiServerHandle>>,
 
     tray_handle: RefCell<Option<OlazTrayHandle>>,
@@ -487,6 +568,7 @@ impl OlazAppWindow {
         api_port: Option<u16>,
     ) -> Rc<Self> {
         gtk::Window::set_default_icon_name("olaz");
+        install_account_rail_css();
 
         let hide_on_startup = start_minimized && !demo_mode;
         main_process
@@ -499,99 +581,43 @@ impl OlazAppWindow {
         let settings = UiSettings::load(&settings_path, &initial_theme.language);
         let win_state_path = platform.user_data().join("olaz-window-state.json");
         let saved_win_state = SavedWindowState::load(&win_state_path);
-        let privacy_path = platform.user_data().join("olaz-privacy.json");
-        let config_privacy_file = platform.config_dir().join(PRIVACY_CONFIG_FILENAME);
-        let initial_privacy = if config_privacy_file.exists() {
-            let cfg = PrivacyConfig::load_from(platform.config_dir());
-            let st = tray_privacy_from_config(cfg);
-            save_privacy_state(&st, &privacy_path);
-            st
-        } else {
-            let st = load_privacy_state(&privacy_path);
-            let _ = privacy_config_from_tray(st).save_to(platform.config_dir());
-            st
-        };
 
-        let engine_state_mirror = Arc::new(RwLock::new(ZaloEngineState::new()));
-        let scheduler = Arc::new(SchedulerEngine::load_from(platform.config_dir()));
-        let autoreply = Arc::new(AutoReplyEngine::load_from(platform.config_dir()));
-        let (outbound_send_tx, mut outbound_send_rx) =
-            tokio::sync::mpsc::unbounded_channel::<OutboundSendRequest>();
-        let (outbound_call_tx, mut outbound_call_rx) =
-            tokio::sync::mpsc::unbounded_channel::<OutboundCallRequest>();
-        let (privacy_obs_tx, mut privacy_obs_rx) =
-            tokio::sync::mpsc::unbounded_channel::<PrivacyConfig>();
-
-        let send_tx_for_backend = outbound_send_tx.clone();
-        let send_tx_for_scheduler = outbound_send_tx.clone();
-        let call_cb: StartCallCallback = Arc::new(move |target_id: String, video: bool| {
-            let tx = outbound_call_tx.clone();
-            Box::pin(async move {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                tx.send(OutboundCallRequest {
-                    target_id,
-                    video,
-                    reply_tx,
-                })
-                .map_err(|_| anyhow::anyhow!("Olaz UI call channel closed"))?;
-                reply_rx
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Olaz UI call handler dropped"))?
-            })
-        });
-
-        let control_backend_concrete = EngineControlBackend::new(
-            Arc::clone(&engine_state_mirror),
-            Arc::clone(&scheduler),
-            Arc::clone(&autoreply),
-            platform.config_dir(),
-        )
-        .with_profile_slug(platform.profile_slug())
-        .with_send_callback(move |conv_id: String, text: String| {
-            let tx = send_tx_for_backend.clone();
-            async move {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                tx.send(OutboundSendRequest {
-                    conv_id,
-                    text,
-                    reply_tx: Some(reply_tx),
-                })
-                .map_err(|_| anyhow::anyhow!("Olaz UI send channel closed"))?;
-                reply_rx
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Olaz UI send handler dropped"))?
+        let instance_root_dir = resolve_instance_root_dir(&platform);
+        let mut initial_registry = ProfileRegistry::load_or_discover(&instance_root_dir);
+        let primary_slug = platform.profile_slug().to_string();
+        if let Ok(meta) = initial_registry.ensure_profile(&primary_slug) {
+            if meta.proxy_url.is_none() {
+                meta.proxy_url = platform.proxy_url().map(str::to_owned);
             }
-        })
-        .with_call_callback(call_cb)
-        .with_privacy_observer(move |cfg| {
-            let _ = privacy_obs_tx.send(cfg);
-        });
-        let control_backend: Arc<dyn OlazControlBackend> = Arc::new(control_backend_concrete);
+        }
+        if primary_slug != "default" {
+            initial_registry.active_slug = primary_slug.clone();
+        }
+        if !demo_mode {
+            let _ = initial_registry.save_to(&instance_root_dir);
+        }
 
-        let automation_loop = if demo_mode {
-            None
-        } else {
-            let _enter = tokio_handle.enter();
-            Some(spawn_automation_loop(
-                Arc::clone(&scheduler),
-                DEFAULT_AUTOMATION_TICK,
-                move |conv_id: String, text: String| {
-                    let tx = send_tx_for_scheduler.clone();
-                    async move {
-                        let (reply_tx, reply_rx) = oneshot::channel();
-                        tx.send(OutboundSendRequest {
-                            conv_id,
-                            text,
-                            reply_tx: Some(reply_tx),
-                        })
-                        .map_err(|_| anyhow::anyhow!("Olaz UI send channel closed"))?;
-                        reply_rx
-                            .await
-                            .map_err(|_| anyhow::anyhow!("Olaz UI send handler dropped"))?
-                    }
-                },
-            ))
-        };
+        let (outbound_send_tx, mut outbound_send_rx) =
+            tokio::sync::mpsc::unbounded_channel::<AccountOutboundSend>();
+        let (outbound_call_tx, mut outbound_call_rx) =
+            tokio::sync::mpsc::unbounded_channel::<AccountOutboundCall>();
+        let (privacy_obs_tx, mut privacy_obs_rx) =
+            tokio::sync::mpsc::unbounded_channel::<AccountPrivacyEvent>();
+
+        let primary_session = AccountSession::from_existing(
+            Arc::clone(&platform),
+            host,
+            Rc::clone(&main_process),
+            &tokio_handle,
+            demo_mode,
+            outbound_send_tx.clone(),
+            outbound_call_tx.clone(),
+            privacy_obs_tx.clone(),
+        );
+
+        let multi_control_backend = Arc::new(MultiAccountControlBackend::new(&primary_slug));
+        let control_backend: Arc<dyn OlazControlBackend> =
+            Arc::clone(&multi_control_backend) as Arc<dyn OlazControlBackend>;
 
         let ui_context = build_ui_web_context(
             &platform,
@@ -633,13 +659,70 @@ impl OlazAppWindow {
         stack.set_hexpand(true);
         stack.set_vexpand(true);
 
-        let zalo_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        zalo_container.set_hexpand(true);
-        zalo_container.set_vexpand(true);
+        let workspace_hbox = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        workspace_hbox.set_hexpand(true);
+        workspace_hbox.set_vexpand(true);
+
+        let account_rail = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        account_rail.set_width_request(64);
+        account_rail.set_vexpand(true);
+        account_rail.style_context().add_class("olaz-account-rail");
+        account_rail.set_no_show_all(true);
+        account_rail.hide();
+
+        let rail_accounts_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        rail_accounts_box.set_margin_top(10);
+        rail_accounts_box.set_margin_bottom(8);
+        rail_accounts_box.show();
+
+        let rail_spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        rail_spacer.set_vexpand(true);
+        rail_spacer.show();
+
+        let add_btn_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        add_btn_row.set_halign(gtk::Align::Center);
+        add_btn_row.set_margin_bottom(12);
+        let add_account_btn = gtk::Button::with_label("+");
+        add_account_btn
+            .style_context()
+            .add_class("olaz-rail-add-btn");
+        add_account_btn.set_tooltip_text(Some("Thêm tài khoản Zalo (Ctrl+Shift+N)"));
+        add_account_btn.show();
+        add_btn_row.pack_start(&add_account_btn, false, false, 0);
+        add_btn_row.show();
+
+        account_rail.pack_start(&rail_accounts_box, false, false, 0);
+        account_rail.pack_start(&rail_spacer, true, true, 0);
+        account_rail.pack_end(&add_btn_row, false, false, 0);
+
+        let accounts_stack = gtk::Stack::new();
+        accounts_stack.set_transition_type(gtk::StackTransitionType::None);
+        accounts_stack.set_hexpand(true);
+        accounts_stack.set_vexpand(true);
+
+        workspace_hbox.pack_start(&account_rail, false, false, 0);
+        workspace_hbox.pack_start(&accounts_stack, true, true, 0);
 
         stack.add_named(&ui_webview, "setup");
-        stack.add_named(&zalo_container, "zalo");
+        stack.add_named(&workspace_hbox, "zalo");
         stack.set_visible_child_name("setup");
+
+        let root_overlay = gtk::Overlay::new();
+        root_overlay.set_hexpand(true);
+        root_overlay.set_vexpand(true);
+        root_overlay.add(&stack);
+
+        let toast_label = gtk::Label::new(None);
+        toast_label
+            .style_context()
+            .add_class("olaz-workspace-toast");
+        toast_label.set_halign(gtk::Align::Center);
+        toast_label.set_valign(gtk::Align::Start);
+        toast_label.set_margin_top(18);
+        toast_label.set_no_show_all(true);
+        toast_label.hide();
+        root_overlay.add_overlay(&toast_label);
+        root_overlay.set_overlay_pass_through(&toast_label, true);
 
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
         if demo_mode {
@@ -647,17 +730,17 @@ impl OlazAppWindow {
             window.set_default_size(1180, 760);
             window.set_size_request(960, 620);
         } else {
-            if platform.profile_slug() == "default" {
+            if primary_slug == "default" {
                 window.set_title("Zalo");
             } else {
-                window.set_title(&format!("Zalo ({})", platform.profile_slug()));
+                window.set_title(&format!("Zalo ({primary_slug})"));
             }
             // Frameless window so Zalo's patched Windows-style `#titleBar` and login bar are the sole chrome!
             window.set_decorated(false);
             window.set_default_size(saved_win_state.width, saved_win_state.height);
             window.set_size_request(400, 560);
         }
-        window.add(&stack);
+        window.add(&root_overlay);
 
         // Spawn Omarchy live theme/language watcher bridging to the GTK main context.
         let (theme_tx, mut theme_rx) = tokio::sync::mpsc::unbounded_channel::<DesktopTheme>();
@@ -667,21 +750,26 @@ impl OlazAppWindow {
 
         let app = Rc::new(Self {
             window: window.clone(),
+            root_overlay,
+            toast_label,
+            toast_source: RefCell::new(None),
             stack,
-            zalo_container,
+            workspace_hbox,
+            account_rail,
+            rail_accounts_box,
+            rail_widgets: RefCell::new(HashMap::new()),
+            accounts_stack,
             ui_webview: ui_webview.clone(),
-            platform,
+            instance_root_dir,
+            profile_registry: RefCell::new(initial_registry),
+            sessions: RefCell::new(Vec::new()),
+            active_slug: RefCell::new(primary_slug),
+            primary_platform: platform,
             runtime_mgr,
-            host,
-            main_process,
+            shared_asar: RefCell::new(None),
             tokio_handle: tokio_handle.clone(),
             demo_mode,
-            engine_state: RefCell::new(ZaloEngineState::new()),
-            engine_state_mirror,
             runtime_progress: RefCell::new(None),
-            signing_in: Cell::new(false),
-            qr_seq: Cell::new(0),
-            last_qr: RefCell::new(None),
             installing_runtime: Cell::new(false),
             last_delete_undo_id: RefCell::new(None),
             settings: RefCell::new(settings),
@@ -690,8 +778,6 @@ impl OlazAppWindow {
             win_state_path,
             win_state_save_source: RefCell::new(None),
             window_size_restored: Cell::new(false),
-            privacy_state: RefCell::new(initial_privacy),
-            privacy_path,
             in_login_mode: Cell::new(false),
             desktop_theme: RefCell::new(initial_theme),
             ui_loaded: Cell::new(false),
@@ -699,22 +785,29 @@ impl OlazAppWindow {
             ui_crash_timestamps: RefCell::new(Vec::new()),
             suppress_renderer_auto_show: Cell::new(hide_on_startup),
             quitting: Cell::new(false),
-            boot_time_ms: unix_now_ms(),
-            autoreply,
-            autoreply_seen_ids: RefCell::new(HashSet::new()),
             outbound_send_tx,
+            outbound_call_tx,
+            privacy_obs_tx,
+            multi_control_backend,
             control_backend: Arc::clone(&control_backend),
-            _automation_loop: automation_loop,
             _api_server: RefCell::new(None),
             tray_handle: RefCell::new(None),
             _omarchy_watcher: omarchy_watcher,
         });
 
+        {
+            let app_weak = Rc::downgrade(&app);
+            add_account_btn.connect_clicked(move |_| {
+                if let Some(app) = app_weak.upgrade() {
+                    app.add_new_account_tab(None);
+                }
+            });
+        }
+
+        app.register_session_in_ui(&primary_session);
         app.install_window_lifecycle();
         app.install_ui_rpc(&ucm);
         if !demo_mode {
-            app.install_window_command_listener();
-            app.install_host_and_main_process_hooks();
             app.install_auto_relock_timer();
         }
 
@@ -729,7 +822,9 @@ impl OlazAppWindow {
                         }
                         break;
                     };
-                    let res = app.execute_control_send(&req.conv_id, &req.text).await;
+                    let res = app
+                        .execute_control_send_for(&req.slug, &req.conv_id, &req.text)
+                        .await;
                     if let Some(tx) = req.reply_tx {
                         let _ = tx.send(res);
                     }
@@ -746,38 +841,45 @@ impl OlazAppWindow {
                         let _ = req.reply_tx.send(Err(anyhow::anyhow!("Olaz window closed")));
                         break;
                     };
-                    let res = app.execute_control_call(&req.target_id, req.video).await;
+                    let res = app
+                        .execute_control_call_for(&req.slug, &req.target_id, req.video)
+                        .await;
                     let _ = req.reply_tx.send(res);
                 }
             });
         }
 
         // Synchronize privacy updates originating from REST `/api/v1/privacy` or MCP `zalo_set_privacy`
-        // onto the system tray checkboxes, `olaz-privacy.json`, and active WebView.
+        // onto the target session's WebView, `olaz-privacy.json`, and (if active) system tray checkboxes.
         {
             let app_weak = Rc::downgrade(&app);
             glib::MainContext::default().spawn_local(async move {
-                while let Some(cfg) = privacy_obs_rx.recv().await {
+                while let Some(ev) = privacy_obs_rx.recv().await {
                     let Some(app) = app_weak.upgrade() else {
                         break;
                     };
-                    let next_state = tray_privacy_from_config(cfg);
+                    let Some(sess) = app.session_by_slug(&ev.slug) else {
+                        continue;
+                    };
                     let changed = {
-                        let mut cur = app.privacy_state.borrow_mut();
-                        if *cur == next_state {
+                        let mut cur = sess.privacy.borrow_mut();
+                        if *cur == ev.config {
                             false
                         } else {
-                            *cur = next_state;
+                            *cur = ev.config;
                             true
                         }
                     };
                     if changed {
-                        save_privacy_state(&next_state, &app.privacy_path);
-                        app.sync_privacy_to_webview();
-                        if let Some(tray) = app.tray_handle.borrow().clone() {
-                            app.tokio_handle.spawn(async move {
-                                tray.set_privacy_state(next_state).await;
-                            });
+                        let tray_state = tray_privacy_from_config(ev.config);
+                        save_legacy_tray_privacy(&tray_state, &sess.privacy_path);
+                        sess.sync_privacy_to_webview();
+                        if app.active_slug() == ev.slug {
+                            if let Some(tray) = app.tray_handle.borrow().clone() {
+                                app.tokio_handle.spawn(async move {
+                                    tray.set_privacy_state(tray_state).await;
+                                });
+                            }
                         }
                     }
                 }
@@ -823,7 +925,10 @@ impl OlazAppWindow {
                                 "presenting primary window for secondary olaz invocation"
                             );
                             app.present_window();
-                            app.host.bridge().send("show-from-tray", vec![]);
+                            app.active_session()
+                                .host
+                                .bridge()
+                                .send("show-from-tray", vec![]);
                         }
                         ProfileInstanceEvent::BackgroundPing => {
                             tracing::debug!(
@@ -833,7 +938,10 @@ impl OlazAppWindow {
                         ProfileInstanceEvent::OpenDeepLink(url) => {
                             tracing::info!(%url, "forwarding zalo:// deep link to primary window");
                             app.present_window();
-                            app.host.bridge().send("show-from-tray", vec![]);
+                            app.active_session()
+                                .host
+                                .bridge()
+                                .send("show-from-tray", vec![]);
                             app.handle_deep_link(&url);
                         }
                     }
@@ -854,10 +962,683 @@ impl OlazAppWindow {
             tracing::info!("started minimized to system tray (--minimized)");
         } else {
             window.show_all();
+            app.refresh_workspace_chrome();
             window.present();
         }
 
         app
+    }
+
+    fn active_slug(&self) -> String {
+        self.active_slug.borrow().clone()
+    }
+
+    fn session_count(&self) -> usize {
+        self.sessions.borrow().len()
+    }
+
+    fn session_by_slug(&self, slug: &str) -> Option<Rc<AccountSession>> {
+        self.sessions
+            .borrow()
+            .iter()
+            .find(|s| s.slug == slug)
+            .cloned()
+    }
+
+    fn active_session(&self) -> Rc<AccountSession> {
+        let cur = self.active_slug.borrow().clone();
+        self.session_by_slug(&cur).unwrap_or_else(|| {
+            self.sessions
+                .borrow()
+                .first()
+                .cloned()
+                .expect("OlazAppWindow always keeps at least one AccountSession")
+        })
+    }
+
+    fn account_effective_name(&self, slug: &str) -> String {
+        self.profile_registry
+            .borrow()
+            .get(slug)
+            .map(|m| m.effective_name())
+            .unwrap_or_else(|| slug.to_string())
+    }
+
+    fn account_initials(&self, slug: &str) -> String {
+        self.profile_registry
+            .borrow()
+            .get(slug)
+            .map(|m| m.initials())
+            .unwrap_or_else(|| "Z".to_string())
+    }
+
+    fn save_profile_registry(&self) {
+        if self.demo_mode {
+            return;
+        }
+        let _ = self.profile_registry.borrow().save_to(&self.instance_root_dir);
+    }
+
+    fn show_workspace_toast(self: &Rc<Self>, text: &str) {
+        if let Some(prev) = self.toast_source.borrow_mut().take() {
+            prev.remove();
+        }
+        self.toast_label.set_text(text);
+        self.toast_label.show();
+        let app_weak = Rc::downgrade(self);
+        let source_id = glib::timeout_add_local_once(Duration::from_millis(3600), move || {
+            if let Some(app) = app_weak.upgrade() {
+                app.toast_source.borrow_mut().take();
+                app.toast_label.hide();
+            }
+        });
+        *self.toast_source.borrow_mut() = Some(source_id);
+    }
+
+    fn refresh_rail_item_visuals(&self, slug: &str) {
+        let is_active = self.active_slug() == slug;
+        let initials = self.account_initials(slug);
+        let eff_name = self.account_effective_name(slug);
+        let unread = self
+            .session_by_slug(slug)
+            .map(|s| s.unread_count.get())
+            .unwrap_or(0);
+        let idx_opt = self
+            .sessions
+            .borrow()
+            .iter()
+            .position(|s| s.slug == slug);
+
+        let widgets_map = self.rail_widgets.borrow();
+        let Some(w) = widgets_map.get(slug) else {
+            return;
+        };
+        w.initials_label.set_text(&initials);
+        let shortcut_hint = idx_opt
+            .filter(|&i| i < 9)
+            .map(|i| format!(" (Ctrl+{})", i + 1))
+            .unwrap_or_default();
+        if unread > 0 {
+            w.button.set_tooltip_text(Some(&format!(
+                "{eff_name} — {unread} tin chưa đọc{shortcut_hint}"
+            )));
+            let badge_txt = if unread > 99 {
+                "99+".to_string()
+            } else {
+                unread.to_string()
+            };
+            w.badge_label.set_text(&badge_txt);
+            w.badge_label.show();
+        } else {
+            w.button
+                .set_tooltip_text(Some(&format!("{eff_name}{shortcut_hint}")));
+            w.badge_label.hide();
+        }
+
+        let ind_ctx = w.indicator.style_context();
+        let btn_ctx = w.button.style_context();
+        if is_active {
+            ind_ctx.add_class("olaz-rail-indicator-active");
+            btn_ctx.add_class("olaz-rail-btn-active");
+        } else {
+            ind_ctx.remove_class("olaz-rail-indicator-active");
+            btn_ctx.remove_class("olaz-rail-btn-active");
+        }
+    }
+
+    fn sync_accounts_to_all_webviews(&self) {
+        if self.demo_mode {
+            return;
+        }
+        let sessions: Vec<Rc<AccountSession>> = self.sessions.borrow().clone();
+        let active = self.active_slug();
+        let reg = self.profile_registry.borrow();
+        let accounts_arr: Vec<Value> = sessions
+            .iter()
+            .enumerate()
+            .map(|(idx, sess)| {
+                let meta = reg.get(&sess.slug);
+                let logged_in = sess.main_process.has_session();
+                let has_named_ident = meta
+                    .and_then(|m| m.label.as_ref().or(m.display_name.as_ref()))
+                    .is_some_and(|s| !s.trim().is_empty());
+                let name = if !logged_in && !has_named_ident {
+                    format!("Tài khoản mới ({})", idx + 1)
+                } else {
+                    meta.map(|m| m.effective_name())
+                        .unwrap_or_else(|| sess.slug.clone())
+                };
+                let initials = if !logged_in && !has_named_ident {
+                    "QR".to_string()
+                } else {
+                    meta.map(|m| m.initials())
+                        .unwrap_or_else(|| "Z".to_string())
+                };
+                let avatar = sess
+                    .engine_state
+                    .borrow()
+                    .user
+                    .as_ref()
+                    .and_then(|u| u.avatar.clone())
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| meta.and_then(|m| m.avatar_url.clone()));
+                json!({
+                    "slug": sess.slug,
+                    "name": name,
+                    "initials": initials,
+                    "avatar": avatar,
+                    "unread": sess.unread_count.get(),
+                    "loggedIn": logged_in,
+                    "shortcutIndex": idx + 1,
+                })
+            })
+            .collect();
+        drop(reg);
+
+        for sess in &sessions {
+            sess.sync_accounts_to_webview(&json!({
+                "selfSlug": sess.slug,
+                "activeSlug": active,
+                "accounts": accounts_arr,
+            }));
+        }
+    }
+
+    fn refresh_workspace_chrome(&self) {
+        let multi = self.session_count() >= 2;
+        let active_sess = self.active_session();
+        // On `index.html` (`WindowPageMode::Main`), Zalo's native 64px `#main-tab` sidebar hosts
+        // `#olaz-sidebar-accounts` directly, so hide `account_rail` to prevent a double sidebar.
+        // Show `account_rail` (styled identically at 64px `#0068ff`) when on `login.html` (`WindowPageMode::Login`)!
+        if multi
+            && !self.demo_mode
+            && (!active_sess.host.is_direct_ui()
+                || active_sess.page_mode.get() == WindowPageMode::Login)
+        {
+            self.account_rail.show();
+        } else {
+            self.account_rail.hide();
+        }
+
+        let sessions: Vec<Rc<AccountSession>> = self.sessions.borrow().clone();
+        for sess in &sessions {
+            sess.apply_layout_mode(multi);
+            self.refresh_rail_item_visuals(&sess.slug);
+        }
+        self.sync_accounts_to_all_webviews();
+
+        if !self.demo_mode {
+            let active = self.active_slug();
+            let eff_name = self.account_effective_name(&active);
+            if !multi && active == "default" {
+                self.window.set_title("Zalo");
+            } else {
+                self.window.set_title(&format!("Zalo — {eff_name}"));
+            }
+        }
+    }
+
+    fn register_session_in_ui(self: &Rc<Self>, session: &Rc<AccountSession>) {
+        let slug = session.slug.clone();
+        self.sessions.borrow_mut().push(Rc::clone(session));
+        self.accounts_stack
+            .add_named(&session.page_container, &slug);
+        session.page_container.show_all();
+
+        let label_for_mcp = self
+            .profile_registry
+            .borrow()
+            .get(&slug)
+            .and_then(|m| m.label.clone().or_else(|| m.display_name.clone()));
+        self.multi_control_backend.register_account(
+            slug.clone(),
+            label_for_mcp,
+            Arc::clone(&session.control_backend) as Arc<dyn OlazControlBackend>,
+        );
+
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        row.set_margin_end(6);
+
+        let indicator = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        indicator.set_valign(gtk::Align::Center);
+        indicator.style_context().add_class("olaz-rail-indicator");
+        indicator.show();
+
+        let overlay = gtk::Overlay::new();
+        overlay.set_halign(gtk::Align::Center);
+        overlay.set_valign(gtk::Align::Center);
+
+        let initials_label = gtk::Label::new(Some(&self.account_initials(&slug)));
+        initials_label.show();
+
+        let button = gtk::Button::new();
+        button.style_context().add_class("olaz-rail-btn");
+        button.add(&initials_label);
+        button.show();
+
+        let badge_label = gtk::Label::new(None);
+        badge_label.style_context().add_class("olaz-rail-badge");
+        badge_label.set_halign(gtk::Align::End);
+        badge_label.set_valign(gtk::Align::Start);
+        badge_label.set_no_show_all(true);
+        badge_label.hide();
+
+        overlay.add(&button);
+        overlay.add_overlay(&badge_label);
+        overlay.set_overlay_pass_through(&badge_label, true);
+        overlay.show();
+
+        row.pack_start(&indicator, false, false, 0);
+        row.pack_start(&overlay, true, false, 0);
+        row.show();
+        self.rail_accounts_box.pack_start(&row, false, false, 0);
+
+        {
+            let app_weak = Rc::downgrade(self);
+            let slug_click = slug.clone();
+            button.connect_clicked(move |_| {
+                if let Some(app) = app_weak.upgrade() {
+                    app.switch_to_account(&slug_click);
+                }
+            });
+        }
+        {
+            let app_weak = Rc::downgrade(self);
+            let slug_ctx = slug.clone();
+            button.connect_button_press_event(move |_, ev| {
+                if ev.button() == 3 {
+                    if let Some(app) = app_weak.upgrade() {
+                        app.show_account_context_menu(&slug_ctx, Some(ev));
+                    }
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+        }
+        {
+            let app_weak = Rc::downgrade(self);
+            let slug_close = slug.clone();
+            session.connect_close_login_tab(move || {
+                if let Some(app) = app_weak.upgrade() {
+                    app.remove_account_session(&slug_close);
+                }
+            });
+        }
+
+        self.rail_widgets.borrow_mut().insert(
+            slug.clone(),
+            AccountRailWidgets {
+                row,
+                indicator,
+                button,
+                initials_label,
+                badge_label,
+            },
+        );
+
+        if !self.demo_mode {
+            self.install_session_window_commands(session);
+            self.install_session_hooks(session);
+        }
+        self.refresh_rail_item_visuals(&slug);
+    }
+
+    fn show_account_context_menu(self: &Rc<Self>, slug: &str, ev: Option<&gdk::EventButton>) {
+        let menu = gtk::Menu::new();
+
+        let item_switch = gtk::MenuItem::with_label("Chuyển sang tài khoản này");
+        {
+            let app_weak = Rc::downgrade(self);
+            let slug_s = slug.to_string();
+            item_switch.connect_activate(move |_| {
+                if let Some(app) = app_weak.upgrade() {
+                    app.switch_to_account(&slug_s);
+                }
+            });
+        }
+        menu.append(&item_switch);
+
+        let item_rename = gtk::MenuItem::with_label("Đổi tên gợi nhớ...");
+        {
+            let app_weak = Rc::downgrade(self);
+            let slug_r = slug.to_string();
+            item_rename.connect_activate(move |_| {
+                if let Some(app) = app_weak.upgrade() {
+                    app.prompt_rename_account(&slug_r);
+                }
+            });
+        }
+        menu.append(&item_rename);
+
+        let item_reload = gtk::MenuItem::with_label("Tải lại (Reload)");
+        {
+            let app_weak = Rc::downgrade(self);
+            let slug_rel = slug.to_string();
+            item_reload.connect_activate(move |_| {
+                if let Some(app) = app_weak.upgrade() {
+                    if let Some(sess) = app.session_by_slug(&slug_rel) {
+                        let target = if sess.main_process.has_session() {
+                            HostPage::Main
+                        } else {
+                            HostPage::Login
+                        };
+                        sess.host
+                            .load(target, &sess.main_process.page_query(target == HostPage::Main));
+                    }
+                }
+            });
+        }
+        menu.append(&item_reload);
+
+        menu.append(&gtk::SeparatorMenuItem::new());
+
+        let item_remove = gtk::MenuItem::with_label("Xóa tài khoản khỏi Olaz");
+        {
+            let app_weak = Rc::downgrade(self);
+            let slug_rm = slug.to_string();
+            item_remove.connect_activate(move |_| {
+                if let Some(app) = app_weak.upgrade() {
+                    app.remove_account_session(&slug_rm);
+                }
+            });
+        }
+        menu.append(&item_remove);
+
+        menu.show_all();
+        menu.popup_at_pointer(ev.map(|v| &**v));
+    }
+
+    fn prompt_rename_account(self: &Rc<Self>, slug: &str) {
+        let current = self
+            .profile_registry
+            .borrow()
+            .get(slug)
+            .and_then(|m| m.label.clone())
+            .unwrap_or_default();
+
+        let dialog = gtk::Dialog::with_buttons(
+            Some("Đổi tên gợi nhớ tài khoản"),
+            Some(&self.window),
+            gtk::DialogFlags::MODAL | gtk::DialogFlags::DESTROY_WITH_PARENT,
+            &[
+                ("Hủy", gtk::ResponseType::Cancel),
+                ("Lưu", gtk::ResponseType::Accept),
+            ],
+        );
+        dialog.set_default_response(gtk::ResponseType::Accept);
+        dialog.set_default_size(360, 120);
+
+        let content = dialog.content_area();
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+        content.set_spacing(8);
+
+        let hint = gtk::Label::new(Some("Nhập tên gợi nhớ (để trống để dùng tên Zalo):"));
+        hint.set_halign(gtk::Align::Start);
+        let entry = gtk::Entry::new();
+        entry.set_text(&current);
+        entry.set_activates_default(true);
+        content.pack_start(&hint, false, false, 0);
+        content.pack_start(&entry, false, false, 0);
+        content.show_all();
+
+        if dialog.run() == gtk::ResponseType::Accept {
+            let new_label = entry.text().to_string();
+            let changed = self
+                .profile_registry
+                .borrow_mut()
+                .set_label(slug, Some(new_label));
+            if changed {
+                self.save_profile_registry();
+                let updated_lbl = self
+                    .profile_registry
+                    .borrow()
+                    .get(slug)
+                    .and_then(|m| m.label.clone().or_else(|| m.display_name.clone()));
+                self.multi_control_backend
+                    .set_account_label(slug, updated_lbl);
+                self.refresh_workspace_chrome();
+            }
+        }
+        unsafe {
+            dialog.destroy();
+        }
+    }
+
+    pub fn add_new_account_tab(self: &Rc<Self>, explicit_proxy: Option<String>) {
+        if self.demo_mode || self.installing_runtime.get() {
+            return;
+        }
+        let slug = {
+            let mut reg = self.profile_registry.borrow_mut();
+            let allocated = reg.allocate_new_slug();
+            if let Some(meta) = reg.get_mut(&allocated) {
+                meta.proxy_url = explicit_proxy.clone();
+            }
+            reg.active_slug = allocated.clone();
+            allocated
+        };
+        self.save_profile_registry();
+
+        let shared_asar = self.shared_asar.borrow().clone();
+        let direct_ui = self.active_session().host.is_direct_ui();
+        let session = match AccountSession::spawn_secondary(
+            &slug,
+            explicit_proxy,
+            &self.primary_platform,
+            &self.instance_root_dir,
+            shared_asar,
+            &self.tokio_handle,
+            direct_ui,
+            self.outbound_send_tx.clone(),
+            self.outbound_call_tx.clone(),
+            self.privacy_obs_tx.clone(),
+        ) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::error!(%slug, %err, "failed to create secondary AccountSession");
+                self.profile_registry.borrow_mut().remove_profile(&slug);
+                self.save_profile_registry();
+                return;
+            }
+        };
+
+        self.register_session_in_ui(&session);
+        self.start_account_session(&session);
+        self.apply_main_window_size();
+        self.refresh_workspace_chrome();
+        self.switch_to_account(&slug);
+        self.present_window();
+    }
+
+    pub fn switch_to_account(self: &Rc<Self>, slug: &str) {
+        let Some(target) = self.session_by_slug(slug) else {
+            return;
+        };
+        let prev_slug = self.active_slug();
+        if prev_slug != slug {
+            if let Some(prev) = self.session_by_slug(&prev_slug) {
+                prev.host
+                    .bridge()
+                    .send("visibility-change", vec![json!("blur"), json!("1")]);
+            }
+            *self.active_slug.borrow_mut() = slug.to_string();
+            {
+                let mut reg = self.profile_registry.borrow_mut();
+                reg.active_slug = slug.to_string();
+            }
+            self.save_profile_registry();
+            self.multi_control_backend.set_active_slug(slug);
+        }
+
+        if !self.demo_mode && target.host.is_direct_ui() && !self.installing_runtime.get() {
+            if self.window.is_visible() {
+                target.mount_into_page();
+            }
+            self.accounts_stack.set_visible_child_name(slug);
+            self.stack.set_visible_child_name("zalo");
+        }
+
+        self.refresh_workspace_chrome();
+
+        if self.session_count() == 1 && !self.demo_mode && self.window.is_visible() {
+            if target.page_mode.get() == WindowPageMode::Login {
+                self.apply_login_window_size();
+            } else {
+                self.apply_main_window_size();
+            }
+        }
+
+        if self.window.is_visible() {
+            target.host.webview().grab_focus();
+            target
+                .host
+                .bridge()
+                .send("visibility-change", vec![json!("show")]);
+            target
+                .host
+                .bridge()
+                .send("visibility-change", vec![json!("focus"), json!("1")]);
+        }
+
+        let tray_privacy = tray_privacy_from_config(*target.privacy.borrow());
+        if let Some(tray) = self.tray_handle.borrow().clone() {
+            self.tokio_handle.spawn(async move {
+                tray.set_privacy_state(tray_privacy).await;
+            });
+        }
+
+        if !target.host.is_direct_ui() && !self.demo_mode {
+            let snap = self.full_ui_snapshot();
+            self.push_ui_state(&snap);
+        }
+    }
+
+    fn cycle_next_account(self: &Rc<Self>, reverse: bool) {
+        let slugs: Vec<String> = self
+            .sessions
+            .borrow()
+            .iter()
+            .map(|s| s.slug.clone())
+            .collect();
+        if slugs.len() < 2 {
+            return;
+        }
+        let cur = self.active_slug();
+        let idx = slugs.iter().position(|s| s == &cur).unwrap_or(0);
+        let next_idx = if reverse {
+            if idx == 0 {
+                slugs.len() - 1
+            } else {
+                idx - 1
+            }
+        } else {
+            (idx + 1) % slugs.len()
+        };
+        self.switch_to_account(&slugs[next_idx]);
+    }
+
+    fn remove_account_session(self: &Rc<Self>, slug: &str) {
+        if self.session_count() <= 1 {
+            // Sole account in window: log out cleanly rather than leaving zero sessions.
+            if let Some(sole) = self.session_by_slug(slug) {
+                if sole.main_process.has_session() {
+                    sole.main_process.logout();
+                }
+                self.profile_registry.borrow_mut().remove_profile(slug);
+                self.save_profile_registry();
+                self.refresh_workspace_chrome();
+            }
+            return;
+        }
+
+        if slug == "default" {
+            // Keep the primary `"default"` profile slot if user tries to delete it while other tabs exist:
+            // log out `"default"` and switch to the next open session, or if already logged out, keep `"default"` only when needed.
+            // Wait: allow removing secondary profiles cleanly; for `"default"`, log it out and switch to another tab!
+            if let Some(def_sess) = self.session_by_slug("default") {
+                if def_sess.main_process.has_session() {
+                    def_sess.main_process.logout();
+                }
+                self.profile_registry.borrow_mut().remove_profile("default");
+                self.save_profile_registry();
+                if let Some(other) = self
+                    .sessions
+                    .borrow()
+                    .iter()
+                    .find(|s| s.slug != "default")
+                    .map(|s| s.slug.clone())
+                {
+                    self.switch_to_account(&other);
+                }
+                self.refresh_workspace_chrome();
+                self.refresh_total_unread_indicators();
+                return;
+            }
+        }
+
+        let fallback_slug = self
+            .sessions
+            .borrow()
+            .iter()
+            .find(|s| s.slug != slug)
+            .map(|s| s.slug.clone())
+            .unwrap_or_else(|| "default".to_string());
+
+        if self.active_slug() == slug {
+            self.switch_to_account(&fallback_slug);
+        }
+
+        let removed_opt = {
+            let mut list = self.sessions.borrow_mut();
+            list.iter()
+                .position(|s| s.slug == slug)
+                .map(|idx| list.remove(idx))
+        };
+        let Some(removed) = removed_opt else {
+            return;
+        };
+
+        self.multi_control_backend.unregister_account(slug);
+        self.profile_registry.borrow_mut().remove_profile(slug);
+        self.save_profile_registry();
+
+        let _ = removed.main_process.autostart().set_open_at_login(false);
+        self.accounts_stack.remove(&removed.page_container);
+        if let Some(w) = self.rail_widgets.borrow_mut().remove(slug) {
+            self.rail_accounts_box.remove(&w.row);
+        }
+
+        let base_dir = removed.platform.base_dir().to_path_buf();
+        let cfg_dir = removed.platform.config_dir().to_path_buf();
+        let cache_dir = removed.platform.cache_dir().to_path_buf();
+        removed.shutdown();
+
+        if slug != "default" {
+            let expected_profiles_root = self.instance_root_dir.join("profiles");
+            if base_dir.starts_with(&expected_profiles_root) {
+                let _ = std::fs::remove_dir_all(&base_dir);
+            }
+            if cfg_dir.ends_with(Path::new("profiles").join(slug)) {
+                let _ = std::fs::remove_dir_all(&cfg_dir);
+            }
+            if cache_dir.ends_with(Path::new("profiles").join(slug)) {
+                let _ = std::fs::remove_dir_all(&cache_dir);
+            }
+        }
+
+        self.refresh_workspace_chrome();
+        if self.session_count() == 1 && self.window.is_visible() {
+            let active_sess = self.active_session();
+            if active_sess.page_mode.get() == WindowPageMode::Login {
+                self.apply_login_window_size();
+            } else {
+                self.apply_main_window_size();
+            }
+        }
+        self.refresh_total_unread_indicators();
     }
 
     fn ensure_setup_ui_loaded(&self) {
@@ -895,6 +1676,68 @@ impl OlazAppWindow {
             glib::Propagation::Proceed
         });
 
+        // Keyboard shortcuts: Ctrl+1..9 switch accounts, Ctrl+Tab / Ctrl+Shift+Tab cycle accounts,
+        // and Ctrl+Shift+N opens a brand-new account tab in-window!
+        let app_weak_keys = Rc::downgrade(self);
+        self.window.connect_key_press_event(move |_, ev| {
+            let Some(app) = app_weak_keys.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if app.demo_mode {
+                return glib::Propagation::Proceed;
+            }
+            let state = ev.state();
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+            let alt = state.contains(gdk::ModifierType::MOD1_MASK);
+            if !ctrl || alt {
+                return glib::Propagation::Proceed;
+            }
+
+            let keyval = ev.keyval();
+            if shift && (keyval == gdk::keys::constants::N || keyval == gdk::keys::constants::n) {
+                app.add_new_account_tab(None);
+                return glib::Propagation::Stop;
+            }
+
+            if keyval == gdk::keys::constants::Tab || keyval == gdk::keys::constants::ISO_Left_Tab
+            {
+                if app.session_count() >= 2 {
+                    let rev = shift || keyval == gdk::keys::constants::ISO_Left_Tab;
+                    app.cycle_next_account(rev);
+                    return glib::Propagation::Stop;
+                }
+            }
+
+            if !shift {
+                let digit_idx = match keyval {
+                    gdk::keys::constants::_1 => Some(0usize),
+                    gdk::keys::constants::_2 => Some(1usize),
+                    gdk::keys::constants::_3 => Some(2usize),
+                    gdk::keys::constants::_4 => Some(3usize),
+                    gdk::keys::constants::_5 => Some(4usize),
+                    gdk::keys::constants::_6 => Some(5usize),
+                    gdk::keys::constants::_7 => Some(6usize),
+                    gdk::keys::constants::_8 => Some(7usize),
+                    gdk::keys::constants::_9 => Some(8usize),
+                    _ => None,
+                };
+                if let Some(idx) = digit_idx {
+                    let target_slug = app
+                        .sessions
+                        .borrow()
+                        .get(idx)
+                        .map(|s| s.slug.clone());
+                    if let Some(slug) = target_slug {
+                        app.switch_to_account(&slug);
+                        return glib::Propagation::Stop;
+                    }
+                }
+            }
+
+            glib::Propagation::Proceed
+        });
+
         // Track window state (`maximized`, `fullscreen`) and forward `visibility-change` to Zalo's `#titleBar`.
         let app_weak_state = Rc::downgrade(self);
         self.window.connect_window_state_event(move |_, ev| {
@@ -904,9 +1747,11 @@ impl OlazAppWindow {
             let ns = ev.new_window_state();
             let max_now = ns.contains(gdk::WindowState::MAXIMIZED);
             let fs_now = ns.contains(gdk::WindowState::FULLSCREEN);
-            let ws = app.main_process.window_state();
-            ws.is_maximized.store(max_now, Ordering::Relaxed);
-            ws.is_fullscreen.store(fs_now, Ordering::Relaxed);
+            for sess in app.sessions.borrow().iter() {
+                let ws = sess.main_process.window_state();
+                ws.is_maximized.store(max_now, Ordering::Relaxed);
+                ws.is_fullscreen.store(fs_now, Ordering::Relaxed);
+            }
 
             if ev.changed_mask().contains(gdk::WindowState::MAXIMIZED) {
                 if !app.in_login_mode.get() {
@@ -914,9 +1759,11 @@ impl OlazAppWindow {
                     app.persist_window_geometry();
                 }
                 let ev_name = if max_now { "maximize" } else { "unmaximize" };
-                app.host
-                    .bridge()
-                    .send("visibility-change", vec![json!(ev_name)]);
+                for sess in app.sessions.borrow().iter() {
+                    sess.host
+                        .bridge()
+                        .send("visibility-change", vec![json!(ev_name)]);
+                }
             }
             glib::Propagation::Proceed
         });
@@ -925,7 +1772,8 @@ impl OlazAppWindow {
         self.window.connect_focus_in_event(move |win, _| {
             win.set_urgency_hint(false);
             if let Some(app) = app_weak_focus_in.upgrade() {
-                app.host
+                app.active_session()
+                    .host
                     .bridge()
                     .send("visibility-change", vec![json!("focus"), json!("1")]);
             }
@@ -935,7 +1783,8 @@ impl OlazAppWindow {
         let app_weak_focus_out = Rc::downgrade(self);
         self.window.connect_focus_out_event(move |_, _| {
             if let Some(app) = app_weak_focus_out.upgrade() {
-                app.host
+                app.active_session()
+                    .host
                     .bridge()
                     .send("visibility-change", vec![json!("blur"), json!("1")]);
             }
@@ -1024,9 +1873,10 @@ impl OlazAppWindow {
             });
     }
 
-    fn install_window_command_listener(self: &Rc<Self>) {
+    fn install_session_window_commands(self: &Rc<Self>, session: &Rc<AccountSession>) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WindowCommand>();
-        self.main_process.window_state().set_command_sender(tx);
+        session.main_process.window_state().set_command_sender(tx);
+        let slug = session.slug.clone();
 
         let app_weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
@@ -1034,10 +1884,13 @@ impl OlazAppWindow {
                 let Some(app) = app_weak.upgrade() else {
                     break;
                 };
+                let Some(sess) = app.session_by_slug(&slug) else {
+                    break;
+                };
                 match cmd {
                     WindowCommand::Minimize { window_id } => {
                         if let Some(ref wid) = window_id {
-                            if app.host.minimize_child_window(wid)
+                            if sess.host.minimize_child_window(wid)
                                 || matches!(wid.as_str(), "photo-viewer" | "file-viewer")
                             {
                                 continue;
@@ -1047,7 +1900,7 @@ impl OlazAppWindow {
                     }
                     WindowCommand::ToggleMaximize { window_id, target } => {
                         if let Some(ref wid) = window_id {
-                            if app.host.toggle_maximize_child_window(wid, target)
+                            if sess.host.toggle_maximize_child_window(wid, target)
                                 || matches!(wid.as_str(), "photo-viewer" | "file-viewer")
                             {
                                 continue;
@@ -1062,13 +1915,13 @@ impl OlazAppWindow {
                     }
                     WindowCommand::ToggleFullscreen { window_id, target } => {
                         if let Some(ref wid) = window_id {
-                            if app.host.toggle_fullscreen_child_window(wid, target)
+                            if sess.host.toggle_fullscreen_child_window(wid, target)
                                 || matches!(wid.as_str(), "photo-viewer" | "file-viewer")
                             {
                                 continue;
                             }
                         }
-                        let cur = app
+                        let cur = sess
                             .main_process
                             .window_state()
                             .is_fullscreen
@@ -1083,7 +1936,7 @@ impl OlazAppWindow {
                     WindowCommand::CloseOrHide { window_id }
                     | WindowCommand::Hide { window_id } => {
                         if let Some(ref wid) = window_id {
-                            if app.host.close_child_window(wid)
+                            if sess.host.close_child_window(wid)
                                 || matches!(wid.as_str(), "photo-viewer" | "file-viewer")
                             {
                                 continue;
@@ -1105,7 +1958,7 @@ impl OlazAppWindow {
                     }
                     WindowCommand::Show { window_id, focus } => {
                         if let Some(ref wid) = window_id {
-                            if app.host.show_child_window(wid, focus)
+                            if sess.host.show_child_window(wid, focus)
                                 || matches!(wid.as_str(), "photo-viewer" | "file-viewer")
                             {
                                 continue;
@@ -1117,49 +1970,55 @@ impl OlazAppWindow {
                             );
                             continue;
                         }
+                        if app.active_slug() != slug {
+                            // Keep background sessions mounted inside `accounts_stack` without stealing active tab!
+                            if sess.host.is_direct_ui() && !app.installing_runtime.get() {
+                                sess.mount_into_page();
+                            }
+                            continue;
+                        }
                         if focus {
                             app.present_window();
                         } else {
                             let was_visible = app.window.is_visible();
                             if !app.demo_mode
-                                && app.host.is_direct_ui()
+                                && sess.host.is_direct_ui()
                                 && !app.installing_runtime.get()
                             {
-                                app.host.mount_into(&app.zalo_container);
-                                app.host.webview().show();
-                                app.zalo_container.show_all();
+                                sess.mount_into_page();
+                                app.accounts_stack.set_visible_child_name(&slug);
                                 app.stack.set_visible_child_name("zalo");
                                 if !was_visible {
-                                    if app.in_login_mode.get() {
+                                    if app.session_count() == 1
+                                        && sess.page_mode.get() == WindowPageMode::Login
+                                    {
                                         app.apply_login_window_size();
                                     } else {
                                         app.apply_main_window_size();
                                     }
                                 }
                             }
-                            app.main_process
+                            sess.main_process
                                 .window_state()
                                 .is_visible
                                 .store(true, Ordering::Relaxed);
                             app.window.show_all();
+                            app.refresh_workspace_chrome();
                             app.window.deiconify();
-                            app.host
+                            sess.host
                                 .bridge()
                                 .send("visibility-change", vec![json!("show")]);
                         }
                     }
                     WindowCommand::Focus { window_id } => {
                         if let Some(ref wid) = window_id {
-                            if app.host.focus_child_window(wid)
+                            if sess.host.focus_child_window(wid)
                                 || matches!(wid.as_str(), "photo-viewer" | "file-viewer")
                             {
                                 continue;
                             }
                         }
-                        if app.suppress_renderer_auto_show.get() {
-                            tracing::debug!(
-                                "suppressing renderer-initiated main window focus while started minimized in tray"
-                            );
+                        if app.suppress_renderer_auto_show.get() || app.active_slug() != slug {
                             continue;
                         }
                         app.present_window();
@@ -1173,13 +2032,25 @@ impl OlazAppWindow {
                         app.window.set_urgency_hint(flag);
                     }
                     WindowCommand::SetLoginSize => {
-                        app.apply_login_window_size();
+                        sess.page_mode.set(WindowPageMode::Login);
+                        app.refresh_workspace_chrome();
+                        if app.session_count() == 1 && app.active_slug() == slug {
+                            app.apply_login_window_size();
+                        }
                     }
                     WindowCommand::ExpandMainWindow => {
-                        app.apply_main_window_size();
+                        sess.page_mode.set(WindowPageMode::Main);
+                        app.refresh_workspace_chrome();
+                        if app.active_slug() == slug || app.session_count() >= 2 {
+                            app.apply_main_window_size();
+                        }
                     }
                     WindowCommand::SetResizable(resizable) => {
-                        app.window.set_resizable(resizable);
+                        if app.session_count() == 1 {
+                            app.window.set_resizable(resizable);
+                        } else {
+                            app.window.set_resizable(true);
+                        }
                     }
                 }
             }
@@ -1232,51 +2103,89 @@ impl OlazAppWindow {
         });
     }
 
-    fn install_host_and_main_process_hooks(self: &Rc<Self>) {
+    fn install_session_hooks(self: &Rc<Self>, session: &Rc<AccountSession>) {
+        let slug = session.slug.clone();
+
         // 1. OfficialClientHost console & page lifecycle
-        self.host.set_on_console(|line| {
-            let official = line.starts_with("[log]") || line.starts_with("[info]");
-            if line.contains("do open indexeddb") {
-                return;
-            }
-            if !official
-                || line.contains("[adapter]")
-                || line.contains("[chat]")
-                || line.contains("[transfer]")
-                || line.contains("[bridge]")
-            {
-                let truncated: String = line.chars().take(320).collect();
-                tracing::debug!(target: "olaz::zalo_console", "{truncated}");
-            }
-        });
+        {
+            let slug_log = slug.clone();
+            session.host.set_on_console(move |line| {
+                let official = line.starts_with("[log]") || line.starts_with("[info]");
+                if line.contains("do open indexeddb") {
+                    return;
+                }
+                if !official
+                    || line.contains("[adapter]")
+                    || line.contains("[chat]")
+                    || line.contains("[transfer]")
+                    || line.contains("[bridge]")
+                {
+                    let truncated: String = line.chars().take(320).collect();
+                    tracing::debug!(
+                        target: "olaz::zalo_console",
+                        profile = %slug_log,
+                        "{truncated}"
+                    );
+                }
+            });
+        }
 
         {
             let app_weak = Rc::downgrade(self);
-            self.host.set_on_page_event(move |ev| {
+            let slug_page = slug.clone();
+            session.host.set_on_page_event(move |ev| {
                 let Some(app) = app_weak.upgrade() else {
+                    return;
+                };
+                let Some(sess) = app.session_by_slug(&slug_page) else {
                     return;
                 };
                 match ev {
                     PageEvent::StartedLoading => {
-                        app.main_process.page_did_start_loading();
+                        sess.main_process.page_did_start_loading();
                     }
                     PageEvent::FinishedLoading(page) => {
-                        app.main_process.page_did_finish_loading(page);
-                        app.sync_privacy_to_webview();
-                        if page == HostPage::Main && app.main_process.has_session() {
-                            let needs_ready = app.signing_in.get()
-                                || matches!(app.engine_state.borrow().phase, EnginePhase::Booting);
-                            if needs_ready {
-                                app.signing_in.set(false);
-                                app.engine_state.borrow_mut().phase = EnginePhase::Ready;
-                                app.sync_engine_state_mirror();
-                                let snap = app.full_ui_snapshot();
-                                app.push_ui_state(&snap);
+                        sess.main_process.page_did_finish_loading(page);
+                        sess.sync_privacy_to_webview();
+                        sess.sync_call_recording_settings_to_webview();
+                        match page {
+                            HostPage::Main => {
+                                sess.page_mode.set(WindowPageMode::Main);
+                                app.refresh_workspace_chrome();
+                                if app.window.is_visible() && !app.suppress_renderer_auto_show.get()
+                                {
+                                    app.apply_main_window_size();
+                                }
                             }
-                            let app_refresh = Rc::clone(&app);
+                            HostPage::Login => {
+                                sess.page_mode.set(WindowPageMode::Login);
+                                app.refresh_workspace_chrome();
+                                if app.session_count() == 1
+                                    && app.active_slug() == slug_page
+                                    && app.window.is_visible()
+                                    && !app.suppress_renderer_auto_show.get()
+                                {
+                                    app.apply_login_window_size();
+                                }
+                            }
+                            HostPage::SharedWorker => {}
+                        }
+                        if page == HostPage::Main && sess.main_process.has_session() {
+                            let needs_ready = sess.signing_in.get()
+                                || matches!(sess.engine_state.borrow().phase, EnginePhase::Booting);
+                            if needs_ready {
+                                sess.signing_in.set(false);
+                                sess.engine_state.borrow_mut().phase = EnginePhase::Ready;
+                                sess.sync_engine_state_mirror();
+                                if app.active_slug() == slug_page {
+                                    let snap = app.full_ui_snapshot();
+                                    app.push_ui_state(&snap);
+                                }
+                            }
+                            let host_refresh = Rc::clone(&sess.host);
                             glib::MainContext::default().spawn_local(async move {
-                                let _ = app_refresh
-                                    .eval_host_js(
+                                let _ = host_refresh
+                                    .evaluate(
                                         "if (window.__zaloConvActions && typeof window.__zaloConvActions.refresh === 'function') {\n\
                                            await window.__zaloConvActions.refresh();\n\
                                          }\n\
@@ -1287,25 +2196,28 @@ impl OlazAppWindow {
                         }
                     }
                     PageEvent::Failed(err) => {
-                        tracing::warn!(%err, "official Zalo host navigation failed");
+                        tracing::warn!(profile = %slug_page, %err, "official Zalo host navigation failed");
                     }
                     PageEvent::Terminated => {
                         if app.quitting.get() {
                             return;
                         }
-                        if app.host.allow_crash_recovery() {
-                            let target = if app.main_process.has_session() {
+                        if sess.host.allow_crash_recovery() {
+                            let target = if sess.main_process.has_session() {
                                 HostPage::Main
                             } else {
                                 HostPage::Login
                             };
                             tracing::warn!(
+                                profile = %slug_page,
                                 ?target,
                                 "official Zalo host WebProcess terminated; reloading target page"
                             );
-                            app.host.load(target, &app.main_process.page_query(false));
+                            sess.host
+                                .load(target, &sess.main_process.page_query(false));
                         } else {
                             tracing::error!(
+                                profile = %slug_page,
                                 "official Zalo host WebProcess crashed >3 times within 15s; halting automatic host reload"
                             );
                         }
@@ -1314,31 +2226,43 @@ impl OlazAppWindow {
             });
         }
 
-        // 2. Incoming `zstate` patches from all 21 official `HostScripts/*.js`
+        // 2. Incoming `zstate` patches from official `HostScripts/*.js` & `LINUX_DIRECT_UI_SCRIPT`
         {
             let app_weak = Rc::downgrade(self);
-            self.host.set_on_state(move |payload| {
+            let slug_state = slug.clone();
+            session.host.set_on_state(move |payload| {
                 let Some(app) = app_weak.upgrade() else {
                     return;
                 };
-                app.handle_zstate_payload(payload);
+                app.handle_session_zstate_payload(&slug_state, payload);
             });
         }
 
-        // 3. Notification privacy & focus context provider
+        // 3. Notification privacy & focus context provider (background tabs are NEVER suppressed!)
         {
             let app_weak = Rc::downgrade(self);
-            self.main_process
+            let slug_notif = slug.clone();
+            session
+                .main_process
                 .set_notification_context_provider(move || {
                     let Some(app) = app_weak.upgrade() else {
                         return NotificationContext::default();
                     };
-                    let state = app.engine_state.borrow();
+                    let Some(sess) = app.session_by_slug(&slug_notif) else {
+                        return NotificationContext::default();
+                    };
+                    let is_active_tab = app.active_slug() == slug_notif;
+                    let state = sess.engine_state.borrow();
                     let settings = app.settings.borrow();
+                    let prefix = if app.session_count() > 1 {
+                        Some(app.account_effective_name(&slug_notif))
+                    } else {
+                        None
+                    };
                     NotificationContext {
-                        window_focused: app.window.is_active(),
+                        window_focused: is_active_tab && app.window.is_active(),
                         window_visible: app.window.is_visible(),
-                        open_conversation: if app.host.is_direct_ui() {
+                        open_conversation: if !is_active_tab || sess.host.is_direct_ui() {
                             None
                         } else {
                             state.open_conversation_id.clone()
@@ -1349,12 +2273,13 @@ impl OlazAppWindow {
                         sound_enabled: settings.sound,
                         // In direct-UI mode, Zalo's own official renderer gates hidden-chat previews
                         // before invoking `new Notification(...)`.
-                        hidden_known: if app.host.is_direct_ui() {
+                        hidden_known: if sess.host.is_direct_ui() {
                             true
                         } else {
                             state.conv_actions.hidden_known
                         },
                         locked_ids: state.conv_actions.locked_ids(),
+                        account_title_prefix: prefix,
                     }
                 });
         }
@@ -1362,40 +2287,71 @@ impl OlazAppWindow {
         // 4. High-level main-process events (login, QR scan/failure, logout/kickout, badge, notification click, calls)
         {
             let app_weak = Rc::downgrade(self);
-            self.main_process.set_on_event(move |ev| {
+            let slug_ev = slug;
+            session.main_process.set_on_event(move |ev| {
                 let Some(app) = app_weak.upgrade() else {
                     return;
                 };
+                let Some(sess) = app.session_by_slug(&slug_ev) else {
+                    return;
+                };
+                let is_active = app.active_slug() == slug_ev;
                 match ev {
                     MainProcessEvent::LoginSucceeded => {
-                        app.signing_in.set(true);
-                        *app.last_qr.borrow_mut() = None;
-                        app.qr_seq.set(app.qr_seq.get().wrapping_add(1));
-                        app.engine_state.borrow_mut().phase = EnginePhase::Booting;
-                        app.sync_engine_state_mirror();
-                        let snap = app.full_ui_snapshot();
-                        app.push_ui_state(&snap);
+                        sess.signing_in.set(true);
+                        sess.page_mode.set(WindowPageMode::Main);
+                        *sess.last_qr.borrow_mut() = None;
+                        sess.qr_seq.set(sess.qr_seq.get().wrapping_add(1));
+                        sess.engine_state.borrow_mut().phase = EnginePhase::Booting;
+                        sess.sync_engine_state_mirror();
+                        app.refresh_workspace_chrome();
+                        if app.window.is_visible() && !app.suppress_renderer_auto_show.get() {
+                            app.apply_main_window_size();
+                        }
+                        if is_active {
+                            let snap = app.full_ui_snapshot();
+                            app.push_ui_state(&snap);
+                        }
                     }
                     MainProcessEvent::LoggedOut { kickout_notice } => {
-                        app.signing_in.set(false);
-                        *app.last_qr.borrow_mut() = None;
-                        app.qr_seq.set(app.qr_seq.get().wrapping_add(1));
-                        app.autoreply_seen_ids.borrow_mut().clear();
+                        sess.signing_in.set(false);
+                        sess.page_mode.set(WindowPageMode::Login);
+                        *sess.last_qr.borrow_mut() = None;
+                        sess.qr_seq.set(sess.qr_seq.get().wrapping_add(1));
+                        sess.autoreply_seen_ids.borrow_mut().clear();
+                        sess.unread_count.set(0);
                         {
-                            let mut state = app.engine_state.borrow_mut();
+                            let mut state = sess.engine_state.borrow_mut();
                             state.reset_account_state(kickout_notice.clone());
                         }
-                        app.sync_engine_state_mirror();
-                        app.refresh_unread_indicators(0);
-                        let mut snap = app.full_ui_snapshot();
-                        if let (Some(notice), Some(obj)) = (kickout_notice, snap.as_object_mut()) {
-                            obj.insert("toast".to_string(), json!({ "text": notice }));
+                        sess.sync_engine_state_mirror();
+                        app.refresh_workspace_chrome();
+                        app.refresh_total_unread_indicators();
+                        if app.session_count() == 1
+                            && is_active
+                            && app.window.is_visible()
+                            && !app.suppress_renderer_auto_show.get()
+                        {
+                            app.apply_login_window_size();
                         }
-                        app.push_ui_state(&snap);
+                        if let Some(ref notice) = kickout_notice {
+                            if !is_active {
+                                let name = app.account_effective_name(&slug_ev);
+                                app.show_workspace_toast(&format!("[{name}] {notice}"));
+                            }
+                        }
+                        if is_active {
+                            let mut snap = app.full_ui_snapshot();
+                            if let (Some(notice), Some(obj)) = (kickout_notice, snap.as_object_mut())
+                            {
+                                obj.insert("toast".to_string(), json!({ "text": notice }));
+                            }
+                            app.push_ui_state(&snap);
+                        }
                     }
                     MainProcessEvent::QrScanned { name, avatar } => {
                         let updated = {
-                            let mut state = app.engine_state.borrow_mut();
+                            let mut state = sess.engine_state.borrow_mut();
                             if let EnginePhase::Login {
                                 qr_expired,
                                 waiting_confirm,
@@ -1411,13 +2367,13 @@ impl OlazAppWindow {
                                 false
                             }
                         };
-                        if updated {
-                            app.push_login_phase_patch();
+                        if updated && is_active {
+                            app.push_login_phase_patch(&sess);
                         }
                     }
                     MainProcessEvent::QrFailed { message } => {
                         let updated = {
-                            let mut state = app.engine_state.borrow_mut();
+                            let mut state = sess.engine_state.borrow_mut();
                             if let EnginePhase::Login { error_notice, .. } = &mut state.phase {
                                 *error_notice = Some(message);
                                 true
@@ -1425,17 +2381,21 @@ impl OlazAppWindow {
                                 false
                             }
                         };
-                        if updated {
-                            app.push_login_phase_patch();
+                        if updated && is_active {
+                            app.push_login_phase_patch(&sess);
                         }
                     }
                     MainProcessEvent::Badge(count) => {
                         let unread = u64::try_from(count.max(0)).unwrap_or(0);
-                        app.refresh_unread_indicators(unread);
+                        sess.unread_count.set(unread);
+                        app.refresh_rail_item_visuals(&slug_ev);
+                        app.sync_accounts_to_all_webviews();
+                        app.refresh_total_unread_indicators();
                     }
                     MainProcessEvent::NotificationClicked { conv_id } => {
+                        app.switch_to_account(&slug_ev);
                         app.present_window();
-                        if !app.host.is_direct_ui() && !conv_id.is_empty() {
+                        if !sess.host.is_direct_ui() && !conv_id.is_empty() {
                             let app_sel = Rc::clone(&app);
                             glib::MainContext::default().spawn_local(async move {
                                 let _ = app_sel
@@ -1448,8 +2408,10 @@ impl OlazAppWindow {
                         }
                     }
                     MainProcessEvent::IncomingCall(call_opt) => {
-                        let incoming_val = call_opt.as_ref().map(incoming_call_to_ui_json);
-                        app.push_ui_state(&json!({ "incomingCall": incoming_val }));
+                        if is_active {
+                            let incoming_val = call_opt.as_ref().map(incoming_call_to_ui_json);
+                            app.push_ui_state(&json!({ "incomingCall": incoming_val }));
+                        }
                     }
                 }
             });
@@ -1462,24 +2424,31 @@ impl OlazAppWindow {
             let Some(app) = app_weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            let relocked = app
-                .engine_state
-                .borrow_mut()
-                .conv_actions
-                .check_auto_relock(Instant::now());
-            if relocked {
-                let state = app.engine_state.borrow();
-                let patch = build_ui_patch_for_slices(
-                    &state,
-                    &[
-                        "conversations".to_string(),
-                        "conv_actions".to_string(),
-                    ],
-                    None,
-                    app.signing_in.get(),
-                );
-                drop(state);
-                app.push_ui_state(&patch);
+            let active = app.active_slug();
+            let sessions: Vec<Rc<AccountSession>> = app.sessions.borrow().clone();
+            for sess in sessions {
+                let relocked = sess
+                    .engine_state
+                    .borrow_mut()
+                    .conv_actions
+                    .check_auto_relock(Instant::now());
+                if relocked {
+                    sess.sync_engine_state_mirror();
+                    if sess.slug == active {
+                        let state = sess.engine_state.borrow();
+                        let patch = build_ui_patch_for_slices(
+                            &state,
+                            &[
+                                "conversations".to_string(),
+                                "conv_actions".to_string(),
+                            ],
+                            None,
+                            sess.signing_in.get(),
+                        );
+                        drop(state);
+                        app.push_ui_state(&patch);
+                    }
+                }
             }
             glib::ControlFlow::Continue
         });
@@ -1525,8 +2494,9 @@ impl OlazAppWindow {
                 return;
             };
             if let Some(app) = app_weak.upgrade() {
-                let unread = app.engine_state.borrow().total_unread();
-                let initial_privacy = *app.privacy_state.borrow();
+                let unread = app.total_unread_across_sessions();
+                let initial_privacy =
+                    tray_privacy_from_config(*app.active_session().privacy.borrow());
                 *app.tray_handle.borrow_mut() = Some(handle.clone());
                 app.tokio_handle.spawn(async move {
                     handle.set_unread_count(unread).await;
@@ -1541,19 +2511,28 @@ impl OlazAppWindow {
                 match ev {
                     OlazTrayEvent::ShowWindow { .. } => {
                         app.present_window();
-                        app.host.bridge().send("show-from-tray", vec![]);
+                        app.active_session()
+                            .host
+                            .bridge()
+                            .send("show-from-tray", vec![]);
                     }
                     OlazTrayEvent::ToggleWindow { .. } => {
                         if app.window.is_visible() && app.window.is_active() {
                             app.hide_to_tray();
                         } else {
                             app.present_window();
-                            app.host.bridge().send("show-from-tray", vec![]);
+                            app.active_session()
+                                .host
+                                .bridge()
+                                .send("show-from-tray", vec![]);
                         }
                     }
                     OlazTrayEvent::SetUserStatusOnline => {
                         // Silent presence toggle: keep the window hidden if hidden in tray!
-                        app.host.bridge().send("change-user-mode-online", vec![]);
+                        app.active_session()
+                            .host
+                            .bridge()
+                            .send("change-user-mode-online", vec![]);
                         if let Some(tray) = app.tray_handle.borrow().clone() {
                             app.tokio_handle.spawn(async move {
                                 tray.set_online_busy_index(0).await;
@@ -1562,7 +2541,10 @@ impl OlazAppWindow {
                     }
                     OlazTrayEvent::SetUserStatusBusy => {
                         // Silent DND/Busy toggle: keep the window hidden if hidden in tray!
-                        app.host.bridge().send("change-user-mode-busy", vec![]);
+                        app.active_session()
+                            .host
+                            .bridge()
+                            .send("change-user-mode-busy", vec![]);
                         if let Some(tray) = app.tray_handle.borrow().clone() {
                             app.tokio_handle.spawn(async move {
                                 tray.set_online_busy_index(1).await;
@@ -1570,35 +2552,43 @@ impl OlazAppWindow {
                         }
                     }
                     OlazTrayEvent::TogglePrivacy { field, enabled } => {
+                        let sess = app.active_session();
                         let next_state = {
-                            let mut st = app.privacy_state.borrow_mut();
+                            let mut st = tray_privacy_from_config(*sess.privacy.borrow());
                             st.set(field, enabled);
-                            *st
+                            *sess.privacy.borrow_mut() = privacy_config_from_tray(st);
+                            st
                         };
-                        save_privacy_state(&next_state, &app.privacy_path);
-                        app.sync_privacy_to_webview();
+                        save_legacy_tray_privacy(&next_state, &sess.privacy_path);
+                        let _ = sess
+                            .privacy
+                            .borrow()
+                            .save_to(sess.platform.config_dir());
+                        sess.sync_privacy_to_webview();
                         if let Some(tray) = app.tray_handle.borrow().clone() {
                             app.tokio_handle.spawn(async move {
                                 tray.set_privacy_state(next_state).await;
                             });
                         }
-                        let backend = Arc::clone(&app.control_backend);
+                        let backend = Arc::clone(&sess.control_backend) as Arc<dyn OlazControlBackend>;
                         let req = json!({
                             "blockTyping": next_state.block_typing,
                             "blockSeen": next_state.block_seen,
                             "blockDelivered": next_state.block_delivered,
+                            "antiRecall": next_state.anti_recall,
                         });
                         app.tokio_handle.spawn(async move {
                             let _ = backend.set_privacy(&req).await;
                         });
                     }
                     OlazTrayEvent::LaunchSecondaryProfile => {
-                        app.launch_secondary_profile();
+                        app.add_new_account_tab(None);
                     }
                     OlazTrayEvent::Screenshot => {
-                        if app.host.is_direct_ui() {
+                        let sess = app.active_session();
+                        if sess.host.is_direct_ui() {
                             let rt = app.tokio_handle.clone();
-                            let platform_shot = Arc::clone(&app.platform);
+                            let platform_shot = Arc::clone(&sess.platform);
                             let app_shot = Rc::clone(&app);
                             let (tx, rx_shot) = oneshot::channel();
                             rt.spawn(async move {
@@ -1631,7 +2621,8 @@ impl OlazAppWindow {
                             let app_shot = Rc::clone(&app);
                             glib::MainContext::default().spawn_local(async move {
                                 let target_conv = {
-                                    let st = app_shot.engine_state.borrow();
+                                    let active_s = app_shot.active_session();
+                                    let st = active_s.engine_state.borrow();
                                     st.open_conversation_id
                                         .clone()
                                         .or_else(|| st.self_conversation_id.clone())
@@ -1666,13 +2657,22 @@ impl OlazAppWindow {
         if ZaloRuntimeManager::is_complete(&self.runtime_mgr.current_dir()) {
             match self.runtime_mgr.open_asar() {
                 Ok(archive) => {
+                    let asar_arc = Arc::new(archive);
+                    *self.shared_asar.borrow_mut() = Some(Arc::clone(&asar_arc));
                     if let Some(ver) =
                         ZaloRuntimeManager::installed_version(&self.runtime_mgr.current_dir())
                     {
-                        self.platform.set_app_version(&ver);
-                        self.host.reload_user_scripts(&self.platform);
+                        self.primary_platform.set_app_version(&ver);
+                        for sess in self.sessions.borrow().iter() {
+                            sess.platform.set_app_version(&ver);
+                            sess.host.reload_user_scripts(&sess.platform);
+                        }
                     }
-                    self.main_process.runtime().set_asar(Arc::new(archive));
+                    for sess in self.sessions.borrow().iter() {
+                        sess.main_process
+                            .runtime()
+                            .set_asar(Arc::clone(&asar_arc));
+                    }
                     self.runtime_progress.replace(None);
                     self.begin_main_process();
                     return;
@@ -1692,17 +2692,20 @@ impl OlazAppWindow {
         }
         self.installing_runtime.set(true);
         self.suppress_renderer_auto_show.set(false);
-        self.main_process
-            .window_state()
-            .is_visible
-            .store(true, Ordering::Relaxed);
+        for sess in self.sessions.borrow().iter() {
+            sess.main_process
+                .window_state()
+                .is_visible
+                .store(true, Ordering::Relaxed);
+        }
         self.stack.set_visible_child_name("setup");
         self.ensure_setup_ui_loaded();
 
         let initial_prog = UiRuntimeProgress::from_install_progress(InstallProgress::Looking);
         *self.runtime_progress.borrow_mut() = Some(initial_prog.clone());
         {
-            let mut state = self.engine_state.borrow_mut();
+            let active = self.active_session();
+            let mut state = active.engine_state.borrow_mut();
             state.phase = EnginePhase::InstallingRuntime {
                 step: "looking".to_string(),
                 fraction: 0.0,
@@ -1758,9 +2761,16 @@ impl OlazAppWindow {
             {
                 Ok((version, archive)) => {
                     tracing::info!(%version, "Zalo runtime installed; starting main process");
-                    app.platform.set_app_version(&version);
-                    app.host.reload_user_scripts(&app.platform);
-                    app.main_process.runtime().set_asar(Arc::new(archive));
+                    let asar_arc = Arc::new(archive);
+                    *app.shared_asar.borrow_mut() = Some(Arc::clone(&asar_arc));
+                    app.primary_platform.set_app_version(&version);
+                    for sess in app.sessions.borrow().iter() {
+                        sess.platform.set_app_version(&version);
+                        sess.host.reload_user_scripts(&sess.platform);
+                        sess.main_process
+                            .runtime()
+                            .set_asar(Arc::clone(&asar_arc));
+                    }
                     *app.runtime_progress.borrow_mut() = None;
                     app.begin_main_process();
                 }
@@ -1775,7 +2785,8 @@ impl OlazAppWindow {
                     };
                     *app.runtime_progress.borrow_mut() = Some(failed.clone());
                     {
-                        let mut state = app.engine_state.borrow_mut();
+                        let active = app.active_session();
+                        let mut state = active.engine_state.borrow_mut();
                         state.phase = EnginePhase::InstallingRuntime {
                             step: "failed".to_string(),
                             fraction: 0.0,
@@ -1792,18 +2803,20 @@ impl OlazAppWindow {
         });
     }
 
-    fn begin_main_process(self: &Rc<Self>) {
-        let logged_in = self.main_process.has_session();
+    fn start_account_session(&self, session: &Rc<AccountSession>) {
+        let logged_in = session.main_process.has_session();
         if logged_in {
-            self.signing_in.set(true);
-            *self.last_qr.borrow_mut() = None;
-            self.qr_seq.set(self.qr_seq.get().wrapping_add(1));
-            self.engine_state.borrow_mut().phase = EnginePhase::Booting;
+            session.page_mode.set(WindowPageMode::Main);
+            session.signing_in.set(true);
+            *session.last_qr.borrow_mut() = None;
+            session.qr_seq.set(session.qr_seq.get().wrapping_add(1));
+            session.engine_state.borrow_mut().phase = EnginePhase::Booting;
         } else {
-            self.signing_in.set(false);
-            *self.last_qr.borrow_mut() = None;
-            self.qr_seq.set(self.qr_seq.get().wrapping_add(1));
-            self.engine_state.borrow_mut().phase = EnginePhase::Login {
+            session.page_mode.set(WindowPageMode::Login);
+            session.signing_in.set(false);
+            *session.last_qr.borrow_mut() = None;
+            session.qr_seq.set(session.qr_seq.get().wrapping_add(1));
+            session.engine_state.borrow_mut().phase = EnginePhase::Login {
                 qr: None,
                 qr_expired: false,
                 waiting_confirm: None,
@@ -1811,54 +2824,130 @@ impl OlazAppWindow {
                 error_notice: None,
             };
         }
+        session.sync_engine_state_mirror();
 
-        if self.host.is_direct_ui() {
-            let start_hidden = self.suppress_renderer_auto_show.get();
+        if session.host.is_direct_ui() {
             if logged_in {
                 let st = self.saved_win_state.borrow().clone();
-                self.host.resize_offscreen(
+                session.host.resize_offscreen(
                     st.width.max(MIN_MAIN_WINDOW_DIM),
                     st.height.max(MIN_MAIN_WINDOW_DIM),
                 );
-                if start_hidden {
-                    self.in_login_mode.set(false);
-                } else {
-                    self.apply_main_window_size();
-                }
             } else {
-                self.host.resize_offscreen(400, 580);
+                session.host.resize_offscreen(400, 580);
+            }
+            if !self.suppress_renderer_auto_show.get() {
+                session.mount_into_page();
+            }
+        }
+
+        session
+            .main_process
+            .window_state()
+            .is_visible
+            .store(!self.suppress_renderer_auto_show.get(), Ordering::Relaxed);
+        session.main_process.start();
+    }
+
+    fn restore_workspace_secondary_sessions(self: &Rc<Self>) {
+        if self.demo_mode || self.primary_platform.profile_slug() != "default" {
+            return;
+        }
+        let metas = self.profile_registry.borrow().workspace_profiles();
+        let shared_asar = self.shared_asar.borrow().clone();
+        let direct_ui = self.active_session().host.is_direct_ui();
+
+        for meta in metas {
+            if meta.slug == "default" || self.session_by_slug(&meta.slug).is_some() {
+                continue;
+            }
+            // Only auto-restore secondary profiles that have an existing session or explicit registry entry
+            // with `enabled_in_workspace: true`.
+            match AccountSession::spawn_secondary(
+                &meta.slug,
+                meta.proxy_url.clone(),
+                &self.primary_platform,
+                &self.instance_root_dir,
+                shared_asar.clone(),
+                &self.tokio_handle,
+                direct_ui,
+                self.outbound_send_tx.clone(),
+                self.outbound_call_tx.clone(),
+                self.privacy_obs_tx.clone(),
+            ) {
+                Ok(sess) => {
+                    self.register_session_in_ui(&sess);
+                    self.start_account_session(&sess);
+                }
+                Err(err) => {
+                    tracing::warn!(slug = %meta.slug, %err, "failed to restore secondary AccountSession");
+                }
+            }
+        }
+    }
+
+    fn begin_main_process(self: &Rc<Self>) {
+        let primary = self.active_session();
+        self.start_account_session(&primary);
+        self.restore_workspace_secondary_sessions();
+
+        let desired_active = {
+            let saved = self.profile_registry.borrow().active_slug.clone();
+            if self.session_by_slug(&saved).is_some() {
+                saved
+            } else {
+                primary.slug.clone()
+            }
+        };
+        *self.active_slug.borrow_mut() = desired_active.clone();
+        self.multi_control_backend.set_active_slug(&desired_active);
+
+        let active_sess = self.active_session();
+        let start_hidden = self.suppress_renderer_auto_show.get();
+        if active_sess.host.is_direct_ui() {
+            let multi = self.session_count() >= 2;
+            if !multi && active_sess.page_mode.get() == WindowPageMode::Login {
                 if start_hidden {
                     self.in_login_mode.set(true);
                     self.window_size_restored.set(false);
                 } else {
                     self.apply_login_window_size();
                 }
+            } else if start_hidden {
+                self.in_login_mode.set(false);
+            } else {
+                self.apply_main_window_size();
             }
+
             if !start_hidden {
-                self.host.mount_into(&self.zalo_container);
-                self.host.webview().show();
-                self.zalo_container.show_all();
+                for sess in self.sessions.borrow().iter() {
+                    sess.mount_into_page();
+                }
+                self.accounts_stack.set_visible_child_name(&desired_active);
+                self.workspace_hbox.show_all();
                 self.stack.set_visible_child_name("zalo");
             }
+            self.refresh_workspace_chrome();
         } else {
             let snap = self.full_ui_snapshot();
             self.push_ui_state(&snap);
         }
-
-        self.main_process.start();
     }
 
-    fn schedule_qr_expiry_timer(self: &Rc<Self>, seq: u64) {
+    fn schedule_qr_expiry_timer(self: &Rc<Self>, slug: String, seq: u64) {
         let app_weak = Rc::downgrade(self);
         glib::timeout_add_seconds_local_once(Self::QR_EXPIRY_SECS, move || {
             let Some(app) = app_weak.upgrade() else {
                 return;
             };
-            if app.qr_seq.get() != seq {
+            let Some(sess) = app.session_by_slug(&slug) else {
+                return;
+            };
+            if sess.qr_seq.get() != seq {
                 return;
             }
             let expired_now = {
-                let mut state = app.engine_state.borrow_mut();
+                let mut state = sess.engine_state.borrow_mut();
                 if let EnginePhase::Login {
                     qr_expired,
                     waiting_confirm: None,
@@ -1875,21 +2964,21 @@ impl OlazAppWindow {
                     false
                 }
             };
-            if expired_now {
-                app.push_login_phase_patch();
+            if expired_now && app.active_slug() == slug {
+                app.push_login_phase_patch(&sess);
             }
         });
     }
 
-    fn push_login_phase_patch(&self) {
+    fn push_login_phase_patch(&self, sess: &AccountSession) {
         let ui_patch = {
-            let state = self.engine_state.borrow();
+            let state = sess.engine_state.borrow();
             let rt_prog = self.runtime_progress.borrow().clone();
             build_ui_patch_for_slices(
                 &state,
                 &["phase".to_string()],
                 rt_prog.as_ref(),
-                self.signing_in.get(),
+                sess.signing_in.get(),
             )
         };
         if ui_patch.as_object().is_some_and(|m| !m.is_empty()) {
@@ -1897,9 +2986,12 @@ impl OlazAppWindow {
         }
     }
 
-    fn handle_zstate_payload(self: &Rc<Self>, payload: Value) {
+    fn handle_session_zstate_payload(self: &Rc<Self>, slug: &str, payload: Value) {
+        let Some(sess) = self.session_by_slug(slug) else {
+            return;
+        };
         // Ignore stale `login.html` DOM polls once login succeeds and we are loading `index.html`.
-        if self.signing_in.get()
+        if sess.signing_in.get()
             && payload
                 .get("page")
                 .and_then(Value::as_str)
@@ -1908,7 +3000,173 @@ impl OlazAppWindow {
             return;
         }
 
+        let is_active = self.active_slug() == slug;
+
         if let Some(obj) = payload.as_object() {
+            // In-window titlebar actions (`toggleAntiRecall` / `addAccount`).
+            if let Some(ui_act) = obj.get("uiAction").and_then(Value::as_str) {
+                match ui_act {
+                    "toggleAntiRecall" => {
+                        let next_state = {
+                            let mut st = tray_privacy_from_config(*sess.privacy.borrow());
+                            let next_val = obj
+                                .get("enabled")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(!st.anti_recall);
+                            st.set(olaz_linux::tray::PrivacyField::AntiRecall, next_val);
+                            *sess.privacy.borrow_mut() = privacy_config_from_tray(st);
+                            st
+                        };
+                        save_legacy_tray_privacy(&next_state, &sess.privacy_path);
+                        let _ = sess.privacy.borrow().save_to(sess.platform.config_dir());
+                        sess.sync_privacy_to_webview();
+                        if is_active {
+                            if let Some(tray) = self.tray_handle.borrow().clone() {
+                                self.tokio_handle.spawn(async move {
+                                    tray.set_privacy_state(next_state).await;
+                                });
+                            }
+                        }
+                        let backend =
+                            Arc::clone(&sess.control_backend) as Arc<dyn OlazControlBackend>;
+                        let req = json!({
+                            "blockTyping": next_state.block_typing,
+                            "blockSeen": next_state.block_seen,
+                            "blockDelivered": next_state.block_delivered,
+                            "antiRecall": next_state.anti_recall,
+                        });
+                        self.tokio_handle.spawn(async move {
+                            let _ = backend.set_privacy(&req).await;
+                        });
+                        return;
+                    }
+                    "addAccount" => {
+                        self.add_new_account_tab(None);
+                        return;
+                    }
+                    "switchAccount" => {
+                        if let Some(target_slug) = obj
+                            .get("slug")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
+                            self.switch_to_account(target_slug);
+                        }
+                        return;
+                    }
+                    "accountContextMenu" => {
+                        if let Some(target_slug) = obj
+                            .get("slug")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
+                            self.show_account_context_menu(target_slug, None);
+                        }
+                        return;
+                    }
+                    "chooseCallRecordingsDir" => {
+                        let current_dir = sess.main_process.call_engine().recordings_dir();
+                        let rt = self.tokio_handle.clone();
+                        let app_weak = Rc::downgrade(self);
+                        let slug_owned = slug.to_string();
+                        let (tx, rx) = oneshot::channel();
+                        rt.spawn(async move {
+                            let _ = tx.send(
+                                pick_open_dialog(
+                                    "Chọn thư mục lưu ghi âm cuộc gọi",
+                                    false,
+                                    true,
+                                    Some(&current_dir),
+                                    &[],
+                                )
+                                .await,
+                            );
+                        });
+                        glib::MainContext::default().spawn_local(async move {
+                            let Some(app) = app_weak.upgrade() else {
+                                return;
+                            };
+                            let chosen_opt = match rx.await {
+                                Ok(Ok(mut paths)) => paths.drain(..).next(),
+                                _ => {
+                                    let dialog = gtk::FileChooserNative::new(
+                                        Some("Chọn thư mục lưu ghi âm cuộc gọi"),
+                                        Some(&app.window),
+                                        gtk::FileChooserAction::SelectFolder,
+                                        Some("Chọn thư mục"),
+                                        Some("Hủy"),
+                                    );
+                                    let cur = app
+                                        .session_by_slug(&slug_owned)
+                                        .map(|s| s.main_process.call_engine().recordings_dir());
+                                    if let Some(ref d) = cur {
+                                        let _ = std::fs::create_dir_all(d);
+                                        let _ = dialog.set_current_folder(d);
+                                    }
+                                    if dialog.run() == gtk::ResponseType::Accept {
+                                        dialog.filename()
+                                    } else {
+                                        None
+                                    }
+                                }
+                            };
+                            if let Some(chosen) = chosen_opt.filter(|p| !p.as_os_str().is_empty()) {
+                                let _ = std::fs::create_dir_all(&chosen);
+                                if let Some(target_sess) = app.session_by_slug(&slug_owned) {
+                                    target_sess.platform.grant_readable_path(&chosen);
+                                    target_sess
+                                        .main_process
+                                        .call_engine()
+                                        .set_recordings_dir(chosen.clone());
+                                    let default_dir =
+                                        target_sess.platform.base_dir().join("recordings");
+                                    let cfg = CallRecordingSettings {
+                                        recordings_dir: if chosen == default_dir {
+                                            None
+                                        } else {
+                                            Some(chosen)
+                                        },
+                                    };
+                                    let _ = cfg.save_to(target_sess.platform.config_dir());
+                                    target_sess.sync_call_recording_settings_to_webview();
+                                }
+                            }
+                        });
+                        return;
+                    }
+                    "openCallRecordingsDir" => {
+                        let dir = sess.main_process.call_engine().recordings_dir();
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::process::Command::new("xdg-open")
+                            .arg(&dir)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn();
+                        return;
+                    }
+                    "resetCallRecordingsDir" => {
+                        let default_dir = sess.platform.base_dir().join("recordings");
+                        let _ = std::fs::create_dir_all(&default_dir);
+                        sess.platform.grant_readable_path(&default_dir);
+                        sess.main_process
+                            .call_engine()
+                            .set_recordings_dir(default_dir);
+                        let _ = CallRecordingSettings {
+                            recordings_dir: None,
+                        }
+                        .save_to(sess.platform.config_dir());
+                        sess.sync_call_recording_settings_to_webview();
+                        return;
+                    }
+                    "queryCallRecordingsDir" => {
+                        sess.sync_call_recording_settings_to_webview();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+
             // Message delete undo token (`msgActions: { deleteUndo: { undoId, convId, msgId } }`).
             if let Some(undo_id) = obj
                 .get("msgActions")
@@ -1917,7 +3175,9 @@ impl OlazAppWindow {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
             {
-                *self.last_delete_undo_id.borrow_mut() = Some(undo_id.to_string());
+                if is_active {
+                    *self.last_delete_undo_id.borrow_mut() = Some(undo_id.to_string());
+                }
             }
 
             // Notification chime sound from `notification-adapter.js`.
@@ -1927,23 +3187,27 @@ impl OlazAppWindow {
                 .and_then(Value::as_str)
             {
                 if self.settings.borrow().sound {
-                    self.main_process.play_notification_sound_if_allowed(sound_url);
+                    sess.main_process.play_notification_sound_if_allowed(sound_url);
                 }
             }
 
             // Incoming VoIP call signaling from `call-adapter.js` (`{call: ...}` or `{voip: ...}`).
             if obj.contains_key("call") || obj.contains_key("voip") {
-                let incoming_opt = self
+                let incoming_opt = sess
                     .main_process
                     .call_coordinator()
                     .borrow_mut()
                     .handle_voip_event(&payload);
                 if let Some(ref call) = incoming_opt {
                     if self.settings.borrow().notifications {
-                        let req = call.to_notification_request();
-                        let locked = self.engine_state.borrow().conv_actions.locked_ids();
-                        let hk = self.engine_state.borrow().conv_actions.hidden_known;
-                        let _ = self.main_process.notifier().show_notification(
+                        let mut req = call.to_notification_request();
+                        if self.session_count() > 1 {
+                            let prefix = self.account_effective_name(slug);
+                            req.title = format!("[{prefix}] {}", req.title);
+                        }
+                        let locked = sess.engine_state.borrow().conv_actions.locked_ids();
+                        let hk = sess.engine_state.borrow().conv_actions.hidden_known;
+                        let _ = sess.main_process.notifier().show_notification(
                             &req,
                             false,
                             self.window.is_visible(),
@@ -1956,26 +3220,28 @@ impl OlazAppWindow {
                         );
                     }
                 }
-                let active = self
-                    .main_process
-                    .call_coordinator()
-                    .borrow()
-                    .active_incoming
-                    .clone();
-                self.push_ui_state(&json!({
-                    "incomingCall": active.as_ref().map(incoming_call_to_ui_json),
-                }));
+                if is_active {
+                    let active = sess
+                        .main_process
+                        .call_coordinator()
+                        .borrow()
+                        .active_incoming
+                        .clone();
+                    self.push_ui_state(&json!({
+                        "incomingCall": active.as_ref().map(incoming_call_to_ui_json),
+                    }));
+                }
             }
         }
 
-        let old_hidden = self.engine_state.borrow().conv_actions.hidden_ids.clone();
-        let changed = self.engine_state.borrow_mut().apply_zstate_patch(&payload);
-        let new_hidden = self.engine_state.borrow().conv_actions.hidden_ids.clone();
+        let old_hidden = sess.engine_state.borrow().conv_actions.hidden_ids.clone();
+        let changed = sess.engine_state.borrow_mut().apply_zstate_patch(&payload);
+        let new_hidden = sess.engine_state.borrow().conv_actions.hidden_ids.clone();
 
         // Clear any OS notifications belonging to conversations that just became hidden.
         let newly_hidden = NotificationPolicy::newly_hidden(&old_hidden, &new_hidden);
         if !newly_hidden.is_empty() {
-            let notifier = self.main_process.notifier().clone();
+            let notifier = sess.main_process.notifier().clone();
             self.tokio_handle.spawn(async move {
                 for cid in newly_hidden {
                     notifier.clear_conversation(&cid).await;
@@ -1984,76 +3250,166 @@ impl OlazAppWindow {
         }
 
         if matches!(
-            self.engine_state.borrow().phase,
+            sess.engine_state.borrow().phase,
             EnginePhase::Ready | EnginePhase::Login { .. }
         ) {
-            self.signing_in.set(false);
+            sess.signing_in.set(false);
+        }
+
+        // Duplicate-UID guard + persistent ProfileRegistry user identity update!
+        let user_ident = {
+            let st = sess.engine_state.borrow();
+            st.user.as_ref().map(|u| {
+                (
+                    u.user_id.trim().to_string(),
+                    u.display_name.trim().to_string(),
+                    u.avatar.clone(),
+                )
+            })
+        };
+        if let Some((uid, dname, ava)) = user_ident.filter(|(u, _, _)| !u.is_empty()) {
+            let dup_slug_opt = self
+                .sessions
+                .borrow()
+                .iter()
+                .find(|other| {
+                    if other.slug == slug {
+                        return false;
+                    }
+                    let other_uid_live = other
+                        .engine_state
+                        .borrow()
+                        .user
+                        .as_ref()
+                        .map(|u| u.user_id.trim().to_string());
+                    if other_uid_live.as_deref() == Some(uid.as_str()) {
+                        return true;
+                    }
+                    other.main_process.has_session()
+                        && self
+                            .profile_registry
+                            .borrow()
+                            .get(&other.slug)
+                            .and_then(|m| m.zalo_uid.as_deref())
+                            == Some(uid.as_str())
+                })
+                .map(|other| other.slug.clone());
+
+            if let Some(existing_slug) = dup_slug_opt {
+                if slug != "default" {
+                    self.show_workspace_toast("Tài khoản này đã đăng nhập ở tab khác");
+                    self.switch_to_account(&existing_slug);
+                    let app_dup = Rc::clone(self);
+                    let dup_to_remove = slug.to_string();
+                    glib::idle_add_local_once(move || {
+                        app_dup.remove_account_session(&dup_to_remove);
+                    });
+                    return;
+                }
+            }
+
+            let ident_changed = self.profile_registry.borrow_mut().update_identity(
+                slug,
+                Some(&uid),
+                (!dname.is_empty()).then_some(dname.as_str()),
+                ava.as_deref(),
+            );
+            if ident_changed {
+                self.save_profile_registry();
+                let updated_lbl = self
+                    .profile_registry
+                    .borrow()
+                    .get(slug)
+                    .and_then(|m| m.label.clone().or_else(|| m.display_name.clone()));
+                self.multi_control_backend
+                    .set_account_label(slug, updated_lbl);
+                self.refresh_workspace_chrome();
+            }
         }
 
         // Arm a fresh 100s expiry timer whenever `EnginePhase::Login`'s QR image transitions to a new value.
         let new_qr_seq = {
-            let state = self.engine_state.borrow();
+            let state = sess.engine_state.borrow();
             match &state.phase {
                 EnginePhase::Login { qr: Some(q), .. } => {
-                    let changed_qr = self.last_qr.borrow().as_deref() != Some(q.as_str());
+                    let changed_qr = sess.last_qr.borrow().as_deref() != Some(q.as_str());
                     if changed_qr {
-                        *self.last_qr.borrow_mut() = Some(q.clone());
-                        let next = self.qr_seq.get().wrapping_add(1);
-                        self.qr_seq.set(next);
+                        *sess.last_qr.borrow_mut() = Some(q.clone());
+                        let next = sess.qr_seq.get().wrapping_add(1);
+                        sess.qr_seq.set(next);
                         Some(next)
                     } else {
                         None
                     }
                 }
                 _ => {
-                    *self.last_qr.borrow_mut() = None;
+                    *sess.last_qr.borrow_mut() = None;
                     None
                 }
             }
         };
         if let Some(seq) = new_qr_seq {
-            self.schedule_qr_expiry_timer(seq);
+            self.schedule_qr_expiry_timer(slug.to_string(), seq);
         }
 
         if changed.is_empty() {
             return;
         }
 
-        self.sync_engine_state_mirror();
+        sess.sync_engine_state_mirror();
 
         if changed.iter().any(|s| s == "messages") {
-            self.evaluate_autoreply_for_new_messages();
+            self.evaluate_autoreply_for_session(&sess);
         }
 
-        let unread = self.engine_state.borrow().total_unread();
         if changed.iter().any(|s| s == "conversations" || s == "conv_actions") {
-            self.refresh_unread_indicators(unread);
+            let unread = sess.engine_state.borrow().total_unread();
+            sess.unread_count.set(unread);
+            self.refresh_rail_item_visuals(slug);
+            self.sync_accounts_to_all_webviews();
+            self.refresh_total_unread_indicators();
         }
 
-        let ui_patch = {
-            let state = self.engine_state.borrow();
-            let rt_prog = self.runtime_progress.borrow().clone();
-            build_ui_patch_for_slices(&state, &changed, rt_prog.as_ref(), self.signing_in.get())
-        };
+        if is_active {
+            let ui_patch = {
+                let state = sess.engine_state.borrow();
+                let rt_prog = self.runtime_progress.borrow().clone();
+                build_ui_patch_for_slices(
+                    &state,
+                    &changed,
+                    rt_prog.as_ref(),
+                    sess.signing_in.get(),
+                )
+            };
 
-        if ui_patch.as_object().is_some_and(|m| !m.is_empty()) {
-            self.push_ui_state(&ui_patch);
+            if ui_patch.as_object().is_some_and(|m| !m.is_empty()) {
+                self.push_ui_state(&ui_patch);
+            }
         }
     }
 
-    fn refresh_unread_indicators(&self, unread_count: u64) {
-        let notifier = self.main_process.notifier().clone();
+    fn total_unread_across_sessions(&self) -> u64 {
+        self.sessions
+            .borrow()
+            .iter()
+            .map(|s| s.unread_count.get())
+            .sum()
+    }
+
+    fn refresh_total_unread_indicators(&self) {
+        let total_unread = self.total_unread_across_sessions();
+        let notifier = self.active_session().main_process.notifier().clone();
         let tray_opt = self.tray_handle.borrow().clone();
         self.tokio_handle.spawn(async move {
-            let _ = notifier.emit_unity_badge(unread_count).await;
+            let _ = notifier.emit_unity_badge(total_unread).await;
             if let Some(tray) = tray_opt {
-                tray.set_unread_count(unread_count).await;
+                tray.set_unread_count(total_unread).await;
             }
         });
     }
 
     fn apply_login_window_size(&self) {
-        if self.demo_mode {
+        if self.demo_mode || self.session_count() >= 2 {
             return;
         }
         self.persist_window_geometry();
@@ -2072,16 +3428,23 @@ impl OlazAppWindow {
         if self.demo_mode {
             return;
         }
+        let multi = self.session_count() >= 2;
+        let min_w = if multi { 1040 } else { MIN_MAIN_WINDOW_DIM };
+        let min_h = if multi { 700 } else { MIN_MAIN_WINDOW_DIM };
         self.in_login_mode.set(false);
         if self.window_size_restored.replace(true) {
+            self.window.set_size_request(min_w, min_h);
+            let (cur_w, cur_h) = self.window.size();
+            if cur_w < min_w || cur_h < min_h {
+                self.window.resize(cur_w.max(min_w), cur_h.max(min_h));
+            }
             return;
         }
         let st = self.saved_win_state.borrow().clone();
-        let w = st.width.max(MIN_MAIN_WINDOW_DIM);
-        let h = st.height.max(MIN_MAIN_WINDOW_DIM);
+        let w = st.width.max(min_w);
+        let h = st.height.max(min_h);
         self.window.set_resizable(true);
-        self.window
-            .set_size_request(MIN_MAIN_WINDOW_DIM, MIN_MAIN_WINDOW_DIM);
+        self.window.set_size_request(min_w, min_h);
         self.window.set_default_size(w, h);
         self.window.resize(w, h);
         if let (Some(x), Some(y)) = (st.pos_x, st.pos_y) {
@@ -2120,38 +3483,51 @@ impl OlazAppWindow {
 
     fn hide_to_tray(&self) {
         self.persist_window_geometry();
-        if !self.demo_mode && self.host.is_direct_ui() && !self.installing_runtime.get() {
-            // Keep the Zalo WebView mapped inside `offscreen_window` while hidden in the tray
+        let sessions: Vec<Rc<AccountSession>> = self.sessions.borrow().clone();
+        if !self.demo_mode && !self.installing_runtime.get() {
+            // Keep all Zalo WebViews mapped inside their `offscreen_window` while hidden in the tray
             // so WebKit2GTK never throttles WebSocket frames, timers, or IndexedDB writes.
-            self.host.unmount_to_offscreen();
+            for sess in &sessions {
+                if sess.host.is_direct_ui() {
+                    sess.unmount_to_offscreen();
+                }
+            }
         }
         self.window.hide();
-        self.main_process
-            .window_state()
-            .is_visible
-            .store(false, Ordering::Relaxed);
-        self.host
-            .bridge()
-            .send("visibility-change", vec![json!("hide")]);
-        self.host
-            .bridge()
-            .send("visibility-change", vec![json!("blur"), json!("1")]);
+        for sess in &sessions {
+            sess.main_process
+                .window_state()
+                .is_visible
+                .store(false, Ordering::Relaxed);
+            sess.host
+                .bridge()
+                .send("visibility-change", vec![json!("hide")]);
+            sess.host
+                .bridge()
+                .send("visibility-change", vec![json!("blur"), json!("1")]);
+        }
     }
 
     pub fn present_window(&self) {
         self.suppress_renderer_auto_show.set(false);
-        self.main_process
-            .window_state()
-            .is_visible
-            .store(true, Ordering::Relaxed);
+        let sessions: Vec<Rc<AccountSession>> = self.sessions.borrow().clone();
+        for sess in &sessions {
+            sess.main_process
+                .window_state()
+                .is_visible
+                .store(true, Ordering::Relaxed);
+        }
         let was_visible = self.window.is_visible();
-        if !self.demo_mode && self.host.is_direct_ui() && !self.installing_runtime.get() {
-            self.host.mount_into(&self.zalo_container);
-            self.host.webview().show();
-            self.zalo_container.show_all();
+        let active = self.active_session();
+        if !self.demo_mode && active.host.is_direct_ui() && !self.installing_runtime.get() {
+            for sess in &sessions {
+                sess.mount_into_page();
+            }
+            self.accounts_stack.set_visible_child_name(&active.slug);
+            self.workspace_hbox.show_all();
             self.stack.set_visible_child_name("zalo");
             if !was_visible {
-                if self.in_login_mode.get() {
+                if self.session_count() == 1 && active.page_mode.get() == WindowPageMode::Login {
                     self.apply_login_window_size();
                 } else {
                     self.apply_main_window_size();
@@ -2159,93 +3535,37 @@ impl OlazAppWindow {
             }
         }
         self.window.show_all();
+        self.refresh_workspace_chrome();
         self.window.deiconify();
         self.window.present();
-        if self.host.is_direct_ui() {
-            self.host.webview().grab_focus();
+        if active.host.is_direct_ui() {
+            active.host.webview().grab_focus();
         }
-        self.host
+        active
+            .host
             .bridge()
             .send("visibility-change", vec![json!("show")]);
-        self.host
+        active
+            .host
             .bridge()
             .send("visibility-change", vec![json!("focus"), json!("1")]);
     }
 
-    fn sync_privacy_to_webview(&self) {
-        let state = *self.privacy_state.borrow();
-        if let Ok(cfg_json) = serde_json::to_string(&state) {
-            let js = format!(
-                "if (typeof window.__olazSetPrivacy === 'function') {{ window.__olazSetPrivacy({cfg_json}); }} else {{ window.__olazPrivacy = Object.assign({{ blockTyping: false, blockSeen: false, blockDelivered: false }}, window.__olazPrivacy || {{}}, {cfg_json}); }}"
-            );
-            self.host.webview().evaluate_javascript(
-                &js,
-                None,
-                None,
-                gio::Cancellable::NONE,
-                |_| {},
-            );
-        }
-    }
-
-    fn launch_secondary_profile(&self) {
-        let (data_home, cache_home) = match prepare_secondary_profile_dirs(
-            self.platform.base_dir(),
-            self.platform.runtime_root(),
-        ) {
-            Ok(pair) => pair,
-            Err(err) => {
-                tracing::error!(%err, "failed to prepare isolated secondary profile directories");
-                return;
-            }
-        };
-
-        let exe_path = resolve_olaz_executable_path();
-        match Command::new(&exe_path)
-            .env("XDG_DATA_HOME", &data_home)
-            .env("XDG_CACHE_HOME", &cache_home)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(child) => {
-                tracing::info!(
-                    pid = child.id(),
-                    xdg_data_home = %data_home.display(),
-                    "launched isolated secondary Olaz profile"
-                );
-            }
-            Err(err) => {
-                tracing::error!(
-                    %err,
-                    exe = %exe_path.display(),
-                    "failed to spawn secondary Olaz profile process"
-                );
-            }
-        }
-    }
-
-    fn sync_engine_state_mirror(&self) {
-        let snap = self.engine_state.borrow().clone();
-        *self.engine_state_mirror.write() = snap;
-    }
-
-    fn evaluate_autoreply_for_new_messages(&self) {
+    fn evaluate_autoreply_for_session(&self, sess: &AccountSession) {
         if self.demo_mode {
             return;
         }
         let now_ms = unix_now_ms();
         let mut pending_replies: Vec<(String, String)> = Vec::new();
         {
-            let state = self.engine_state.borrow();
+            let state = sess.engine_state.borrow();
             let self_uid = state.user.as_ref().map(|u| u.user_id.clone());
             let group_map: HashMap<&str, bool> = state
                 .conversations
                 .iter()
                 .map(|c| (c.id.as_str(), c.is_group))
                 .collect();
-            let mut seen = self.autoreply_seen_ids.borrow_mut();
+            let mut seen = sess.autoreply_seen_ids.borrow_mut();
 
             for (conv_id, list) in &state.messages {
                 let is_group = group_map
@@ -2262,10 +3582,10 @@ impl OlazAppWindow {
                     } else {
                         msg.timestamp
                     };
-                    if msg.is_mine || msg.recalled || msg_ts_ms < self.boot_time_ms {
+                    if msg.is_mine || msg.recalled || msg_ts_ms < sess.boot_time_ms {
                         continue;
                     }
-                    if let Some(rule) = self.autoreply.evaluate_chat_message(
+                    if let Some(rule) = sess.autoreply.evaluate_chat_message(
                         msg,
                         is_group,
                         self_uid.as_deref(),
@@ -2278,7 +3598,8 @@ impl OlazAppWindow {
         }
 
         for (conv_id, reply_text) in pending_replies {
-            let _ = self.outbound_send_tx.send(OutboundSendRequest {
+            let _ = sess.outbound_send_tx.send(AccountOutboundSend {
+                slug: sess.slug.clone(),
                 conv_id,
                 text: reply_text,
                 reply_tx: None,
@@ -2286,7 +3607,15 @@ impl OlazAppWindow {
         }
     }
 
-    async fn execute_control_send(&self, conv_id: &str, text: &str) -> anyhow::Result<()> {
+    async fn execute_control_send_for(
+        &self,
+        slug: &str,
+        conv_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let Some(sess) = self.session_by_slug(slug) else {
+            anyhow::bail!("account profile `{slug}` is not open");
+        };
         let cid = conv_id.trim();
         let body = text.trim();
         if cid.is_empty() || body.is_empty() {
@@ -2305,8 +3634,9 @@ impl OlazAppWindow {
              }}\n\
              return 'not-ready';"
         );
-        let out = self
-            .eval_host_js(&js)
+        let out = sess
+            .host
+            .evaluate(&js)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
         if out.as_str() == Some("sent") || out.as_bool() == Some(true) {
@@ -2316,7 +3646,15 @@ impl OlazAppWindow {
         }
     }
 
-    async fn execute_control_call(&self, target_id: &str, video: bool) -> anyhow::Result<Value> {
+    async fn execute_control_call_for(
+        &self,
+        slug: &str,
+        target_id: &str,
+        video: bool,
+    ) -> anyhow::Result<Value> {
+        let Some(sess) = self.session_by_slug(slug) else {
+            anyhow::bail!("account profile `{slug}` is not open");
+        };
         let tid = target_id.trim();
         if tid.is_empty() {
             anyhow::bail!("target_id must not be empty");
@@ -2333,7 +3671,7 @@ impl OlazAppWindow {
              }}\n\
              return 'fallback-native';"
         );
-        if let Ok(out) = self.eval_host_js(&js).await {
+        if let Ok(out) = sess.host.evaluate(&js).await {
             let s = out.as_str().unwrap_or("");
             if out.as_bool() == Some(true) || s == "started" || s == "sent" {
                 return Ok(json!({
@@ -2355,7 +3693,7 @@ impl OlazAppWindow {
                 "callType": if video { 2 } else { 1 },
             }
         });
-        self.main_process
+        sess.main_process
             .call_engine()
             .handle_send_to_native(payload);
         Ok(json!({
@@ -2371,14 +3709,16 @@ impl OlazAppWindow {
         if trimmed.is_empty() {
             return;
         }
-        self.host
+        let active = self.active_session();
+        active
+            .host
             .bridge()
             .send("open-deep-link", vec![json!(trimmed)]);
         if let Ok(url_json) = serde_json::to_string(trimmed) {
             let js = format!(
                 "if (window.__olazControl && typeof window.__olazControl.openDeepLink === 'function') {{ window.__olazControl.openDeepLink({url_json}); }}"
             );
-            self.host.webview().evaluate_javascript(
+            active.host.webview().evaluate_javascript(
                 &js,
                 None,
                 None,
@@ -2390,9 +3730,6 @@ impl OlazAppWindow {
 
     fn shutdown_and_quit(&self) {
         self.persist_window_geometry();
-        if let Some(ref loop_h) = self._automation_loop {
-            loop_h.stop();
-        }
         if let Some(srv) = self._api_server.borrow_mut().take() {
             srv.stop();
         }
@@ -2402,16 +3739,19 @@ impl OlazAppWindow {
                 tray.shutdown().await;
             });
         }
-        self.main_process.stop_shared_worker();
-        self.host.shutdown();
+        let sessions: Vec<Rc<AccountSession>> = self.sessions.borrow().clone();
+        for sess in sessions {
+            sess.shutdown();
+        }
         gtk::main_quit();
     }
 
     fn full_ui_snapshot(&self) -> Value {
-        let state = self.engine_state.borrow();
+        let active = self.active_session();
+        let state = active.engine_state.borrow();
         let rt_prog = self.runtime_progress.borrow().clone();
         let settings = self.settings.borrow().clone();
-        let incoming = self
+        let incoming = active
             .main_process
             .call_coordinator()
             .borrow()
@@ -2423,7 +3763,7 @@ impl OlazAppWindow {
             rt_prog.as_ref(),
             &settings,
             incoming.as_ref(),
-            self.signing_in.get(),
+            active.signing_in.get(),
         )
     }
 
@@ -2470,13 +3810,11 @@ impl OlazAppWindow {
             .evaluate_javascript(&js, None, None, gio::Cancellable::NONE, |_| {});
     }
 
-    async fn eval_host_js(&self, body: &str) -> Result<Value, String> {
-        self.host.evaluate(body).await
-    }
-
     async fn dispatch_ui_command(self: &Rc<Self>, cmd: &str, args: Value) -> Result<Value, String> {
+        let session = self.active_session();
         // Refresh 60-second hidden-chat inactivity timer on user actions.
-        self.engine_state
+        session
+            .engine_state
             .borrow_mut()
             .conv_actions
             .note_activity(Instant::now());
@@ -2500,12 +3838,30 @@ impl OlazAppWindow {
                 Ok(json!({ "ok": true }))
             }
 
+            "add_account" => {
+                let proxy = opt_str(&args, "proxyUrl").filter(|s| !s.trim().is_empty());
+                self.add_new_account_tab(proxy);
+                Ok(json!({ "ok": true, "activeSlug": self.active_slug() }))
+            }
+
+            "switch_account" => {
+                let slug = req_str(&args, "slug")?;
+                self.switch_to_account(&slug);
+                Ok(json!({ "ok": true, "activeSlug": self.active_slug() }))
+            }
+
+            "remove_account" => {
+                let slug = req_str(&args, "slug")?;
+                self.remove_account_session(&slug);
+                Ok(json!({ "ok": true, "activeSlug": self.active_slug() }))
+            }
+
             "refresh_qr" => {
-                self.signing_in.set(false);
-                *self.last_qr.borrow_mut() = None;
-                self.qr_seq.set(self.qr_seq.get().wrapping_add(1));
+                session.signing_in.set(false);
+                *session.last_qr.borrow_mut() = None;
+                session.qr_seq.set(session.qr_seq.get().wrapping_add(1));
                 {
-                    let mut state = self.engine_state.borrow_mut();
+                    let mut state = session.engine_state.borrow_mut();
                     let kickout_notice = match &state.phase {
                         EnginePhase::Login { kickout_notice, .. } => kickout_notice.clone(),
                         _ => None,
@@ -2518,19 +3874,20 @@ impl OlazAppWindow {
                         error_notice: None,
                     };
                 }
-                self.push_login_phase_patch();
-                self.host
-                    .load(HostPage::Login, &self.main_process.page_query(false));
+                self.push_login_phase_patch(&session);
+                session
+                    .host
+                    .load(HostPage::Login, &session.main_process.page_query(false));
                 Ok(json!({ "ok": true }))
             }
 
             "logout" => {
-                self.main_process.logout();
+                session.main_process.logout();
                 Ok(json!({ "ok": true }))
             }
 
             "toggle_debug_webview" => {
-                let visible = self.host.toggle_debug_window();
+                let visible = session.host.toggle_debug_window();
                 Ok(json!({ "ok": true, "visible": visible }))
             }
 
@@ -2549,14 +3906,15 @@ impl OlazAppWindow {
             }
 
             "transfer_start_manual" => {
-                let _ = self
-                    .eval_host_js("return window.__zaloTransfer && await window.__zaloTransfer.start();")
+                let _ = session
+                    .host
+                    .evaluate("return window.__zaloTransfer && await window.__zaloTransfer.start();")
                     .await?;
                 Ok(json!({ "ok": true }))
             }
 
             "transfer_accept" => {
-                let phase = self
+                let phase = session
                     .engine_state
                     .borrow()
                     .transfer
@@ -2564,8 +3922,9 @@ impl OlazAppWindow {
                     .clone()
                     .unwrap_or_else(|| "offer".to_string());
                 let phase_json = serde_json::to_string(&phase).unwrap();
-                let _ = self
-                    .eval_host_js(&format!(
+                let _ = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloTransfer && await window.__zaloTransfer.respond(true, {phase_json});"
                     ))
                     .await?;
@@ -2573,7 +3932,7 @@ impl OlazAppWindow {
             }
 
             "transfer_reject" => {
-                let phase = self
+                let phase = session
                     .engine_state
                     .borrow()
                     .transfer
@@ -2581,8 +3940,9 @@ impl OlazAppWindow {
                     .clone()
                     .unwrap_or_else(|| "offer".to_string());
                 let phase_json = serde_json::to_string(&phase).unwrap();
-                let _ = self
-                    .eval_host_js(&format!(
+                let _ = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloTransfer && await window.__zaloTransfer.respond(false, {phase_json});"
                     ))
                     .await?;
@@ -2590,7 +3950,7 @@ impl OlazAppWindow {
             }
 
             "transfer_cancel" => {
-                let phase = self
+                let phase = session
                     .engine_state
                     .borrow()
                     .transfer
@@ -2598,8 +3958,9 @@ impl OlazAppWindow {
                     .clone()
                     .unwrap_or_else(|| "transferring".to_string());
                 let phase_json = serde_json::to_string(&phase).unwrap();
-                let _ = self
-                    .eval_host_js(&format!(
+                let _ = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloTransfer && await window.__zaloTransfer.dismiss({phase_json});"
                     ))
                     .await?;
@@ -2609,7 +3970,7 @@ impl OlazAppWindow {
             "select_conversation" => {
                 let conv_id = req_str(&args, "convId")?;
                 let prev_id = {
-                    let mut st = self.engine_state.borrow_mut();
+                    let mut st = session.engine_state.borrow_mut();
                     let prev = st.open_conversation_id.clone();
                     st.open_conversation_id = Some(conv_id.clone());
                     prev
@@ -2617,7 +3978,7 @@ impl OlazAppWindow {
 
                 // Clear any desktop notifications for the newly opened conversation.
                 {
-                    let notifier = self.main_process.notifier().clone();
+                    let notifier = session.main_process.notifier().clone();
                     let cid_for_notif = conv_id.clone();
                     self.tokio_handle.spawn(async move {
                         notifier.clear_conversation(&cid_for_notif).await;
@@ -2625,7 +3986,7 @@ impl OlazAppWindow {
                 }
 
                 // Restore any stashed failed draft for this conversation.
-                let restored_draft = self
+                let restored_draft = session
                     .engine_state
                     .borrow_mut()
                     .failed_drafts
@@ -2644,7 +4005,7 @@ impl OlazAppWindow {
                      if (window.__zaloMsgActions) {{ try {{ window.__zaloMsgActions.watchPins(cid); }} catch {{}} }}\n\
                      return true;"
                 );
-                let _ = self.eval_host_js(&js).await;
+                let _ = session.host.evaluate(&js).await;
 
                 let mut patch = json!({ "activeConvId": conv_id });
                 if let Some((draft, show_notice)) = restored_draft {
@@ -2677,8 +4038,9 @@ impl OlazAppWindow {
             "load_older" => {
                 let conv_id = req_str(&args, "convId")?;
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
-                let res = self
-                    .eval_host_js(&format!(
+                let res = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloChat ? await window.__zaloChat.loadMore({cid_json}) : null;"
                     ))
                     .await?;
@@ -2711,7 +4073,7 @@ impl OlazAppWindow {
                         "return await window.__zaloConvActions.deleteConversation({cid_json});"
                     ),
                     "hide" => {
-                        let has_pin = self.engine_state.borrow().conv_actions.pin_set;
+                        let has_pin = session.engine_state.borrow().conv_actions.pin_set;
                         if has_pin {
                             format!(
                                 "return await window.__zaloConvActions.hide({cid_json}, {pin_json} || '');"
@@ -2734,7 +4096,7 @@ impl OlazAppWindow {
                     _ => return Ok(json!({ "ok": true })),
                 };
 
-                let out = self.eval_host_js(&js).await?;
+                let out = session.host.evaluate(&js).await?;
                 if out.as_bool() == Some(false)
                     || matches!(out.as_str(), Some("error" | "missing"))
                 {
@@ -2748,8 +4110,9 @@ impl OlazAppWindow {
                 let label_id = opt_str(&args, "labelId").filter(|s| !s.is_empty());
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
                 let lid_json = serde_json::to_string(&label_id).unwrap();
-                let _ = self
-                    .eval_host_js(&format!(
+                let _ = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloConversations && await window.__zaloConversations.setLabel({cid_json}, {lid_json});"
                     ))
                     .await?;
@@ -2759,8 +4122,9 @@ impl OlazAppWindow {
             "unlock_hidden_pin" => {
                 let pin = req_str(&args, "pin")?;
                 let pin_json = serde_json::to_string(&pin).unwrap();
-                let res = self
-                    .eval_host_js(&format!(
+                let res = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloConvActions && await window.__zaloConvActions.checkPin({pin_json});"
                     ))
                     .await?;
@@ -2773,14 +4137,15 @@ impl OlazAppWindow {
 
                 let now = Instant::now();
                 {
-                    let mut st = self.engine_state.borrow_mut();
+                    let mut st = session.engine_state.borrow_mut();
                     let hidden_ids: Vec<String> = st.conv_actions.hidden_ids.iter().cloned().collect();
                     for cid in hidden_ids {
                         st.conv_actions.unlock(cid, now);
                     }
                 }
+                session.sync_engine_state_mirror();
                 let patch = {
-                    let st = self.engine_state.borrow();
+                    let st = session.engine_state.borrow();
                     build_ui_patch_for_slices(
                         &st,
                         &[
@@ -2788,7 +4153,7 @@ impl OlazAppWindow {
                             "conv_actions".to_string(),
                         ],
                         None,
-                        self.signing_in.get(),
+                        session.signing_in.get(),
                     )
                 };
                 self.push_ui_state(&patch);
@@ -2803,8 +4168,9 @@ impl OlazAppWindow {
                             .or_else(|| opt_str(&args, "pin"))
                             .unwrap_or_default();
                         let np_json = serde_json::to_string(&new_pin).unwrap();
-                        let _ = self
-                            .eval_host_js(&format!(
+                        let _ = session
+                            .host
+                            .evaluate(&format!(
                                 "return await window.__zaloConvActions.setPin({np_json}, false);"
                             ))
                             .await?;
@@ -2814,25 +4180,29 @@ impl OlazAppWindow {
                         let new_pin = req_str(&args, "newPin")?;
                         let op_json = serde_json::to_string(&old_pin).unwrap();
                         let np_json = serde_json::to_string(&new_pin).unwrap();
-                        let ok_check = self
-                            .eval_host_js(&format!(
+                        let ok_check = session
+                            .host
+                            .evaluate(&format!(
                                 "return await window.__zaloConvActions.checkPin({op_json});"
                             ))
                             .await?;
                         if ok_check.as_bool() == Some(false) {
                             return Err("Mã PIN hiện tại không đúng.".to_string());
                         }
-                        let _ = self
-                            .eval_host_js(&format!(
+                        let _ = session
+                            .host
+                            .evaluate(&format!(
                                 "return await window.__zaloConvActions.setPin({np_json}, true);"
                             ))
                             .await?;
                     }
                     "reset" => {
-                        let _ = self
-                            .eval_host_js("return await window.__zaloConvActions.resetPin();")
+                        let _ = session
+                            .host
+                            .evaluate("return await window.__zaloConvActions.resetPin();")
                             .await?;
-                        self.engine_state.borrow_mut().conv_actions.relock();
+                        session.engine_state.borrow_mut().conv_actions.relock();
+                        session.sync_engine_state_mirror();
                     }
                     _ => {}
                 }
@@ -2893,8 +4263,9 @@ impl OlazAppWindow {
                 let qid_json = serde_json::to_string(&quote_id).unwrap();
                 let men_json = serde_json::to_string(&wire_mentions).unwrap();
 
-                let send_res = self
-                    .eval_host_js(&format!(
+                let send_res = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloChat && await window.__zaloChat.sendText({cid_json}, {txt_json}, {qid_json}, {men_json});"
                     ))
                     .await;
@@ -2907,11 +4278,12 @@ impl OlazAppWindow {
                         mentions: parsed_mentions.clone(),
                         reply_to: None,
                     };
-                    self.engine_state
+                    session
+                        .engine_state
                         .borrow_mut()
                         .failed_drafts
                         .stash(&conv_id, draft);
-                    if let Some((restored, _)) = self
+                    if let Some((restored, _)) = session
                         .engine_state
                         .borrow_mut()
                         .failed_drafts
@@ -2948,7 +4320,7 @@ impl OlazAppWindow {
                     .decode(b64.trim())
                     .map_err(|e| format!("Dữ liệu ảnh dán không hợp lệ: {e}"))?;
 
-                let paste_dir = self.platform.temp_dir().join("pasted");
+                let paste_dir = session.platform.temp_dir().join("pasted");
                 std::fs::create_dir_all(&paste_dir)
                     .map_err(|e| format!("Không tạo được thư mục tạm: {e}"))?;
                 let file_path = paste_dir.join(format!("clipboard-{}.png", uuid::Uuid::new_v4()));
@@ -2956,7 +4328,7 @@ impl OlazAppWindow {
                     .map_err(|e| format!("Không ghi được ảnh tạm: {e}"))?;
 
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
-                let _ = self
+                let _ = session
                     .host
                     .evaluate_providing_files(
                         &format!(
@@ -2991,7 +4363,7 @@ impl OlazAppWindow {
 
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
                 let fn_name = if media_only { "sendMedia" } else { "sendFiles" };
-                let _ = self
+                let _ = session
                     .host
                     .evaluate_providing_files(
                         &format!(
@@ -3020,7 +4392,7 @@ impl OlazAppWindow {
                     return Ok(json!({ "ok": true }));
                 }
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
-                let _ = self
+                let _ = session
                     .host
                     .evaluate_providing_files(
                         &format!(
@@ -3039,7 +4411,7 @@ impl OlazAppWindow {
                     .unwrap_or(false);
                 let conv_id = opt_str(&args, "convId")
                     .filter(|s| !s.is_empty())
-                    .or_else(|| self.engine_state.borrow().self_conversation_id.clone())
+                    .or_else(|| session.engine_state.borrow().self_conversation_id.clone())
                     .unwrap_or_default();
 
                 let (tx, rx) = oneshot::channel();
@@ -3063,7 +4435,7 @@ impl OlazAppWindow {
                 };
 
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
-                let _ = self
+                let _ = session
                     .host
                     .evaluate_providing_files(
                         &format!(
@@ -3083,8 +4455,9 @@ impl OlazAppWindow {
                     .unwrap_or_else(|| json!({ "id": args.get("stickerId").cloned().unwrap_or(Value::Null) }));
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
                 let stk_json = serde_json::to_string(&sticker_val).unwrap();
-                let _ = self
-                    .eval_host_js(&format!(
+                let _ = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloSticker && await window.__zaloSticker.send({cid_json}, {stk_json}, 'category');"
                     ))
                     .await?;
@@ -3099,8 +4472,9 @@ impl OlazAppWindow {
                 }
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
                 let kw_json = serde_json::to_string(&keyword).unwrap();
-                let items = self
-                    .eval_host_js(&format!(
+                let items = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloSticker ? await window.__zaloSticker.suggest({cid_json}, {kw_json}) : [];"
                     ))
                     .await
@@ -3118,8 +4492,9 @@ impl OlazAppWindow {
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
                 let mid_json = serde_json::to_string(&msg_id).unwrap();
                 let rxn_json = serde_json::to_string(&reaction).unwrap();
-                let _ = self
-                    .eval_host_js(&format!(
+                let _ = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloChat && await window.__zaloChat.react({cid_json}, {mid_json}, {rxn_json});"
                     ))
                     .await?;
@@ -3131,8 +4506,9 @@ impl OlazAppWindow {
                 let msg_id = req_str(&args, "msgId")?;
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
                 let mid_json = serde_json::to_string(&msg_id).unwrap();
-                let _ = self
-                    .eval_host_js(&format!(
+                let _ = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloMsgActions && await window.__zaloMsgActions.recall({cid_json}, {mid_json});"
                     ))
                     .await?;
@@ -3144,8 +4520,9 @@ impl OlazAppWindow {
                 let msg_id = req_str(&args, "msgId")?;
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
                 let mid_json = serde_json::to_string(&msg_id).unwrap();
-                let res = self
-                    .eval_host_js(&format!(
+                let res = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloMsgActions && await window.__zaloMsgActions.deleteForMe({cid_json}, {mid_json}, true);"
                     ))
                     .await?;
@@ -3171,8 +4548,9 @@ impl OlazAppWindow {
                     .unwrap_or_default();
                 if !undo_id.is_empty() {
                     let uid_json = serde_json::to_string(&undo_id).unwrap();
-                    let _ = self
-                        .eval_host_js(&format!(
+                    let _ = session
+                        .host
+                        .evaluate(&format!(
                             "return window.__zaloMsgActions && await window.__zaloMsgActions.undoDelete({uid_json});"
                         ))
                         .await?;
@@ -3207,8 +4585,9 @@ impl OlazAppWindow {
                 let targets_json = serde_json::to_string(&targets).unwrap();
                 for mid in msg_ids {
                     let mid_json = serde_json::to_string(&mid).unwrap();
-                    let _ = self
-                        .eval_host_js(&format!(
+                    let _ = session
+                        .host
+                        .evaluate(&format!(
                             "return window.__zaloMsgActions && await window.__zaloMsgActions.forward({cid_json}, {mid_json}, {targets_json});"
                         ))
                         .await?;
@@ -3223,8 +4602,9 @@ impl OlazAppWindow {
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
                 let mid_json = serde_json::to_string(&msg_id).unwrap();
                 let rep_json = serde_json::to_string(&replacing).unwrap();
-                let _ = self
-                    .eval_host_js(&format!(
+                let _ = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloMsgActions && await window.__zaloMsgActions.pin({cid_json}, {mid_json}, {rep_json});"
                     ))
                     .await?;
@@ -3238,8 +4618,9 @@ impl OlazAppWindow {
                     .unwrap_or_default();
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
                 let ref_json = serde_json::to_string(&pin_ref).unwrap();
-                let _ = self
-                    .eval_host_js(&format!(
+                let _ = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloMsgActions && await window.__zaloMsgActions.unpin({cid_json}, {ref_json});"
                     ))
                     .await?;
@@ -3255,8 +4636,9 @@ impl OlazAppWindow {
                     .unwrap_or(true);
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
                 let mid_json = serde_json::to_string(&msg_id).unwrap();
-                let _ = self
-                    .eval_host_js(&format!(
+                let _ = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloMsgActions && await window.__zaloMsgActions.star({cid_json}, {mid_json}, {starred});"
                     ))
                     .await?;
@@ -3270,8 +4652,9 @@ impl OlazAppWindow {
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
                 let mid_json = serde_json::to_string(&msg_id).unwrap();
                 let kind_json = serde_json::to_string(&kind).unwrap();
-                let out = self
-                    .eval_host_js(&format!(
+                let out = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloChat && await window.__zaloChat.resolveMedia({cid_json}, {mid_json}, {kind_json});"
                     ))
                     .await?;
@@ -3301,7 +4684,7 @@ impl OlazAppWindow {
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| "Thiếu tham số bắt buộc `url`".to_string())?;
                 let display_name = opt_str(&args, "name").unwrap_or_default();
-                let allowed_roots = ui_media_allowed_roots(&self.platform);
+                let allowed_roots = ui_media_allowed_roots(&session.platform);
 
                 if raw_url.starts_with('/') {
                     let confined =
@@ -3347,6 +4730,7 @@ impl OlazAppWindow {
                                     .map(|(_, v)| v.into_owned())
                                     .ok_or_else(|| "Thiếu tham số `url`.".to_string())?;
                                 self.open_remote_or_cached_media(
+                                    &session,
                                     &remote_url,
                                     &display_name,
                                     &allowed_roots,
@@ -3363,6 +4747,7 @@ impl OlazAppWindow {
                             lower.ends_with(".zdn.vn") || lower.ends_with(".zadn.vn")
                         });
                         self.open_remote_or_cached_media(
+                            &session,
                             &raw_url,
                             &display_name,
                             &allowed_roots,
@@ -3375,8 +4760,9 @@ impl OlazAppWindow {
             }
 
             "load_contacts" => {
-                let _ = self
-                    .eval_host_js("return window.__zaloContacts && await window.__zaloContacts.refresh();")
+                let _ = session
+                    .host
+                    .evaluate("return window.__zaloContacts && await window.__zaloContacts.refresh();")
                     .await;
                 Ok(json!({ "ok": true }))
             }
@@ -3398,7 +4784,7 @@ impl OlazAppWindow {
                     }
                     _ => return Ok(json!({ "ok": true })),
                 };
-                let _ = self.eval_host_js(&js).await?;
+                let _ = session.host.evaluate(&js).await?;
                 Ok(json!({ "ok": true }))
             }
 
@@ -3406,13 +4792,15 @@ impl OlazAppWindow {
                 let phone = opt_str(&args, "phone").unwrap_or_default();
                 let trimmed = phone.trim();
                 if trimmed.is_empty() {
-                    let _ = self
-                        .eval_host_js("return window.__zaloContacts && window.__zaloContacts.resetSearch();")
+                    let _ = session
+                        .host
+                        .evaluate("return window.__zaloContacts && window.__zaloContacts.resetSearch();")
                         .await;
                 } else {
                     let ph_json = serde_json::to_string(trimmed).unwrap();
-                    let _ = self
-                        .eval_host_js(&format!(
+                    let _ = session
+                        .host
+                        .evaluate(&format!(
                             "return window.__zaloContacts && await window.__zaloContacts.search({ph_json});"
                         ))
                         .await?;
@@ -3434,8 +4822,9 @@ impl OlazAppWindow {
                     .unwrap_or_default();
                 let spec = json!({ "name": name, "ids": ids });
                 let spec_json = serde_json::to_string(&spec).unwrap();
-                let out = self
-                    .eval_host_js(&format!(
+                let out = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloGroupCreate && await window.__zaloGroupCreate.create({spec_json});"
                     ))
                     .await?;
@@ -3453,8 +4842,9 @@ impl OlazAppWindow {
                 });
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
                 let spec_json = serde_json::to_string(&spec).unwrap();
-                let out = self
-                    .eval_host_js(&format!(
+                let out = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloPoll && await window.__zaloPoll.create({cid_json}, {spec_json});"
                     ))
                     .await?;
@@ -3463,7 +4853,7 @@ impl OlazAppWindow {
 
             "vote_poll" => {
                 let conv_id = opt_str(&args, "convId")
-                    .or_else(|| self.engine_state.borrow().open_conversation_id.clone())
+                    .or_else(|| session.engine_state.borrow().open_conversation_id.clone())
                     .unwrap_or_default();
                 let poll_id = req_str(&args, "pollId")?;
                 let voted_ids = args
@@ -3478,8 +4868,9 @@ impl OlazAppWindow {
                 let pid_json = serde_json::to_string(&poll_id).unwrap();
                 let new_json = serde_json::to_string(&new_options).unwrap();
                 let voted_json = serde_json::to_string(&voted_ids).unwrap();
-                let _ = self
-                    .eval_host_js(&format!(
+                let _ = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloPoll && await window.__zaloPoll.vote({cid_json}, {pid_json}, {new_json}, {voted_json});"
                     ))
                     .await?;
@@ -3487,15 +4878,16 @@ impl OlazAppWindow {
             }
 
             "load_zcloud" => {
-                let _ = self
-                    .eval_host_js("return window.__zaloCloud && await window.__zaloCloud.refresh();")
+                let _ = session
+                    .host
+                    .evaluate("return window.__zaloCloud && await window.__zaloCloud.refresh();")
                     .await;
                 Ok(json!({ "ok": true }))
             }
 
             "load_shared_media" => {
                 let conv_id = opt_str(&args, "convId")
-                    .or_else(|| self.engine_state.borrow().open_conversation_id.clone())
+                    .or_else(|| session.engine_state.borrow().open_conversation_id.clone())
                     .unwrap_or_default();
                 let kind = opt_str(&args, "kind").unwrap_or_else(|| "images".to_string());
                 let cursor = args.get("cursor").cloned().unwrap_or(Value::Null);
@@ -3505,8 +4897,9 @@ impl OlazAppWindow {
                 let cid_json = serde_json::to_string(&conv_id).unwrap();
                 let kind_json = serde_json::to_string(&kind).unwrap();
                 let cur_json = serde_json::to_string(&cursor).unwrap();
-                let page = self
-                    .eval_host_js(&format!(
+                let page = session
+                    .host
+                    .evaluate(&format!(
                         "return window.__zaloMediaStore ? await window.__zaloMediaStore.page({cid_json}, {kind_json}, {cur_json}, 40) : null;"
                     ))
                     .await
@@ -3527,13 +4920,14 @@ impl OlazAppWindow {
 
     async fn open_remote_or_cached_media(
         &self,
+        session: &AccountSession,
         remote_url: &str,
         display_name: &str,
         allowed_roots: &[PathBuf],
         prefer_local_cache: bool,
     ) -> Result<Value, String> {
         if prefer_local_cache {
-            let loader = self.main_process.media_loader().clone();
+            let loader = session.main_process.media_loader().clone();
             let remote_owned = remote_url.to_string();
             let (tx, rx) = oneshot::channel();
             self.tokio_handle.spawn(async move {
@@ -4464,68 +5858,11 @@ pub fn serialize_chat_message(msg: &olaz_linux::ChatMessage) -> Value {
     })
 }
 
-fn is_instance_socket_alive(sock_path: &Path) -> bool {
-    let Ok(mut stream) = UnixStream::connect(sock_path) else {
-        return false;
-    };
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-    if stream.write_all(b"ping\n").is_err() || stream.flush().is_err() {
-        return false;
-    }
-    let mut reader = BufReader::new(stream);
-    let mut reply = String::new();
-    reader.read_line(&mut reply).is_ok() && reply.trim() == "ok"
-}
-
-fn resolve_profiles_root(base_dir: &Path) -> PathBuf {
-    for ancestor in base_dir.ancestors() {
-        if ancestor.file_name().is_some_and(|n| n == "profiles") {
-            return ancestor.to_path_buf();
-        }
-    }
-    base_dir.join("profiles")
-}
-
-fn prepare_secondary_profile_dirs(
-    current_base_dir: &Path,
-    current_runtime_root: &Path,
-) -> std::io::Result<(PathBuf, PathBuf)> {
-    let profiles_root = resolve_profiles_root(current_base_dir);
-    let runtime_source = std::fs::read_link(current_runtime_root)
-        .unwrap_or_else(|_| current_runtime_root.to_path_buf());
-
-    for slot in 2..=32_u32 {
-        let slot_root = profiles_root.join(format!("profile-{slot}"));
-        let xdg_data_home = slot_root.join("share");
-        let xdg_cache_home = slot_root.join("cache");
-        let slot_olaz_dir = xdg_data_home.join("olaz");
-        if slot_olaz_dir == current_base_dir {
-            continue;
-        }
-        let sock = instance_socket_path(&slot_olaz_dir);
-        if is_instance_socket_alive(&sock) {
-            continue;
-        }
-
-        std::fs::create_dir_all(&slot_olaz_dir)?;
-        std::fs::create_dir_all(&xdg_cache_home)?;
-
-        let runtime_link = slot_olaz_dir.join("ZaloRuntime");
-        if std::fs::symlink_metadata(&runtime_link).is_err() && runtime_source.exists() {
-            let _ = std::os::unix::fs::symlink(&runtime_source, &runtime_link);
-        }
-        return Ok((xdg_data_home, xdg_cache_home));
-    }
-
-    Err(std::io::Error::other(
-        "all secondary profile slots (2..=32) are currently active",
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account_session::{link_shared_runtime_for_profile, load_legacy_tray_privacy};
+    use olaz_linux::TrayPrivacyState;
 
     #[test]
     fn snapshot_maps_phases_and_enforces_fail_closed_hidden_conversations() {
@@ -4722,27 +6059,25 @@ mod tests {
             block_typing: true,
             block_seen: true,
             block_delivered: false,
+            anti_recall: true,
         };
-        save_privacy_state(&priv_state, &priv_file);
-        assert_eq!(load_privacy_state(&priv_file), priv_state);
+        save_legacy_tray_privacy(&priv_state, &priv_file);
+        assert_eq!(load_legacy_tray_privacy(&priv_file), priv_state);
 
-        // Secondary profile helper allocates non-nested profile slots and links ZaloRuntime.
-        let primary_base = dir.join("olaz");
-        let primary_rt = primary_base.join("ZaloRuntime");
-        std::fs::create_dir_all(primary_rt.join("current")).unwrap();
+        // Multi-account shared runtime helper symlinks ZaloRuntime/current into secondary profiles cleanly.
+        let root = dir.join("olaz");
+        let rt_current = root.join("ZaloRuntime/current");
+        std::fs::create_dir_all(rt_current.join("Contents/Resources")).unwrap();
+        std::fs::write(rt_current.join("Contents/Info.plist"), b"<plist/>").unwrap();
+        std::fs::write(rt_current.join("Contents/Resources/app.asar"), b"asar").unwrap();
 
-        let (data_home_2, _cache_home_2) =
-            prepare_secondary_profile_dirs(&primary_base, &primary_rt).unwrap();
-        assert_eq!(data_home_2, primary_base.join("profiles/profile-2/share"));
-        assert!(data_home_2.join("olaz/ZaloRuntime/current").is_dir());
-
-        // Calling from inside profile-2 skips profile-2 itself and selects profile-3 without nesting.
-        let profile2_base = data_home_2.join("olaz");
-        let profile2_rt = profile2_base.join("ZaloRuntime");
-        let (data_home_3, _) =
-            prepare_secondary_profile_dirs(&profile2_base, &profile2_rt).unwrap();
-        assert_eq!(data_home_3, primary_base.join("profiles/profile-3/share"));
-        assert!(data_home_3.join("olaz/ZaloRuntime/current").is_dir());
+        let p2 = ZaloPlatform::from_options(Some("account-2"), Some(root.clone()), None).unwrap();
+        assert_eq!(resolve_instance_root_dir(&p2), root);
+        link_shared_runtime_for_profile(&p2, &root);
+        assert!(p2
+            .runtime_root()
+            .join("current/Contents/Resources/app.asar")
+            .is_file());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

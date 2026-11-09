@@ -1,7 +1,11 @@
 //! `OlazCallEngine`: async/thread-safe VoIP coordinator unifying `zalo-linux`'s `main-engine.js`
 //! signaling state machine with `ctdozlite`'s pure-Rust SRTP, H.264 video, screen-share, and Group SFU media.
 
-use crate::call::audio_io::{AudioDeviceList, AudioIoSession};
+use crate::call::audio_io::{AudioDeviceList, AudioIoSession, AudioTapPacket};
+use crate::call::recorder::{
+    build_recording_file_path, default_recordings_dir, CallRecorderHandle, RecordingChannelLayout,
+    RecordingFormat,
+};
 use crate::call::srtp::SrtpMode;
 use crate::call::video_io::{
     build_rtcp_pli, build_rtcp_rr, build_rtcp_sr_sdes_remb, packetize_zalo_h264_au,
@@ -19,8 +23,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::AbortHandle;
@@ -73,6 +79,13 @@ pub enum CallUiEvent {
         height: u32,
         rgba: Vec<u8>,
     },
+    SetRecording {
+        active: bool,
+        started_at_ms: Option<u64>,
+        path: Option<String>,
+        format: Option<String>,
+        error: Option<String>,
+    },
     CloseCall,
     CloseIncoming,
 }
@@ -110,6 +123,10 @@ pub trait CallMediaDriver: Send + Sync {
     fn set_input_device(&self, idx: i32);
     fn set_output_device(&self, idx: i32);
     fn set_video_mode(&self, camera_enabled: bool, screen_sharing: bool);
+    fn set_audio_tap(&self, _tap: Option<SyncSender<AudioTapPacket>>) {}
+    fn dropped_tap_frames(&self) -> u64 {
+        0
+    }
     fn inject_inbound_audio_for_test(&self, opus_payload: &[u8]);
     fn stop(&self);
 }
@@ -245,6 +262,14 @@ impl CallMediaDriver for LiveCallMediaDriver {
         }
     }
 
+    fn set_audio_tap(&self, tap: Option<SyncSender<AudioTapPacket>>) {
+        self.audio.set_audio_tap(tap);
+    }
+
+    fn dropped_tap_frames(&self) -> u64 {
+        self.audio.dropped_tap_frames()
+    }
+
     fn inject_inbound_audio_for_test(&self, opus_payload: &[u8]) {
         self.audio.push_inbound_opus(opus_payload);
     }
@@ -262,6 +287,7 @@ impl CallMediaDriver for LiveCallMediaDriver {
         if let Some(dec) = self.video_dec.lock().take() {
             dec.stop();
         }
+        self.audio.set_audio_tap(None);
         self.audio.stop();
         self.zrtc.close();
     }
@@ -454,6 +480,12 @@ pub struct CallEngineConfig {
     pub ring_timeout: Duration,
     pub close_ui_delay: Duration,
     pub call_id_generator: Option<Arc<dyn Fn() -> i32 + Send + Sync>>,
+    /// Optional per-profile recordings directory override (defaults to `~/.local/share/olaz/recordings`).
+    pub recordings_dir: Option<PathBuf>,
+    /// Default recording container format (`RecordingFormat::Wav`).
+    pub default_recording_format: RecordingFormat,
+    /// Default recording channel layout (`RecordingChannelLayout::StereoSplit`).
+    pub default_recording_layout: RecordingChannelLayout,
 }
 
 impl CallEngineConfig {
@@ -475,6 +507,9 @@ impl CallEngineConfig {
             ring_timeout: DEFAULT_RING_TIMEOUT,
             close_ui_delay: Duration::from_millis(900),
             call_id_generator: None,
+            recordings_dir: None,
+            default_recording_format: RecordingFormat::Wav,
+            default_recording_layout: RecordingChannelLayout::StereoSplit,
         }
     }
 }
@@ -501,6 +536,8 @@ struct ActiveCallState {
     prefer_endpoint: Option<String>,
     srtp_mode: SrtpMode,
     media: Option<Arc<dyn CallMediaDriver>>,
+    recorder: Option<CallRecorderHandle>,
+    record_when_ready: Option<(RecordingFormat, RecordingChannelLayout)>,
     ring_timer: Option<AbortHandle>,
 }
 
@@ -508,6 +545,7 @@ struct ActiveCallState {
 pub struct OlazCallEngine {
     cfg: CallEngineConfig,
     active: Mutex<Option<ActiveCallState>>,
+    recordings_dir_override: Mutex<Option<PathBuf>>,
 }
 
 impl OlazCallEngine {
@@ -516,7 +554,30 @@ impl OlazCallEngine {
         Arc::new(Self {
             cfg,
             active: Mutex::new(None),
+            recordings_dir_override: Mutex::new(None),
         })
+    }
+
+    /// Overrides the target directory where call recordings are saved (e.g. per account profile).
+    pub fn set_recordings_dir(&self, dir: PathBuf) {
+        *self.recordings_dir_override.lock() = Some(dir);
+    }
+
+    /// Resolves the active recordings directory (`set_recordings_dir` -> `cfg.recordings_dir` -> `~/.local/share/olaz/recordings`).
+    pub fn recordings_dir(&self) -> PathBuf {
+        self.recordings_dir_override
+            .lock()
+            .clone()
+            .or_else(|| self.cfg.recordings_dir.clone())
+            .unwrap_or_else(default_recordings_dir)
+    }
+
+    /// Returns `true` if call audio recording is currently active.
+    pub fn is_recording(&self) -> bool {
+        self.active
+            .lock()
+            .as_ref()
+            .is_some_and(|c| c.recorder.is_some())
     }
 
     /// Emits `("native-ready", {})` to notify the Zalo web renderer that native calling is active.
@@ -608,7 +669,7 @@ impl OlazCallEngine {
     /// Handles user actions originating from the Call / Incoming / Devices UI windows.
     pub fn handle_ui_action(self: &Arc<Self>, action: &str, value: Value) {
         match action {
-            "end" | "hangup" => self.user_hangup_or_cancel(),
+            "end" | "hangup" | "endCall" => self.user_hangup_or_cancel(),
             "accept" => self.user_accept_incoming(),
             "decline" => self.user_decline_incoming(),
             "mute" => {
@@ -629,6 +690,7 @@ impl OlazCallEngine {
             }
             "toggleCamera" | "toggleVideo" => self.user_toggle_camera(value.as_bool()),
             "toggleScreenShare" | "shareScreen" => self.user_toggle_screen_share(value.as_bool()),
+            "toggleRecord" => self.user_toggle_record(&value),
             "selectInput" => {
                 if let Some(idx) = value_to_i32(Some(&value)) {
                     if let Some(m) = self.active_media_driver() {
@@ -753,6 +815,8 @@ impl OlazCallEngine {
             prefer_endpoint: None,
             srtp_mode: SrtpMode::AesCm128HmacSha1_80,
             media: None,
+            recorder: None,
+            record_when_ready: None,
             ring_timer: None,
         });
 
@@ -891,7 +955,7 @@ impl OlazCallEngine {
             );
             let chosen_str = setup_res.chosen_relay.to_string();
 
-            {
+            let pending_rec = {
                 let mut guard = eng.active.lock();
                 let Some(ref mut c) = *guard else {
                     driver.stop();
@@ -906,6 +970,12 @@ impl OlazCallEngine {
                 }
                 c.media = Some(Arc::clone(&driver));
                 c.ring_timer = Some(eng.spawn_ring_timeout(call_id, true));
+                c.record_when_ready
+                    .take()
+                    .map(|(fmt, layout)| (c.call_id, c.partner.name.clone(), fmt, layout))
+            };
+            if let Some((cid, pname, fmt, layout)) = pending_rec {
+                eng.start_recorder_for_driver(cid, &pname, &driver, fmt, layout);
             }
 
             (eng.cfg.emit_ui_event)(CallUiEvent::SetDevices(setup_res.devices));
@@ -1203,6 +1273,8 @@ impl OlazCallEngine {
             prefer_endpoint: prefer_ep,
             srtp_mode,
             media: None,
+            recorder: None,
+            record_when_ready: None,
             ring_timer: Some(ring_timer),
         });
 
@@ -1302,7 +1374,7 @@ impl OlazCallEngine {
             let chosen_str = setup_res.chosen_relay.to_string();
             let now_ms = current_epoch_ms();
 
-            {
+            let pending_rec = {
                 let mut guard = eng.active.lock();
                 let Some(ref mut c) = *guard else {
                     driver.stop();
@@ -1317,6 +1389,12 @@ impl OlazCallEngine {
                 }
                 c.media = Some(Arc::clone(&driver));
                 c.connected_at_ms = Some(now_ms);
+                c.record_when_ready
+                    .take()
+                    .map(|(fmt, layout)| (c.call_id, c.partner.name.clone(), fmt, layout))
+            };
+            if let Some((cid, pname, fmt, layout)) = pending_rec {
+                eng.start_recorder_for_driver(cid, &pname, &driver, fmt, layout);
             }
 
             eng.emit_signal(
@@ -1556,6 +1634,216 @@ impl OlazCallEngine {
         }
     }
 
+    fn start_recorder_for_driver(
+        &self,
+        call_id: i32,
+        partner_name: &str,
+        driver: &Arc<dyn CallMediaDriver>,
+        req_fmt: RecordingFormat,
+        req_layout: RecordingChannelLayout,
+    ) {
+        let target_path = build_recording_file_path(&self.recordings_dir(), partner_name, req_fmt);
+        match CallRecorderHandle::start(target_path, req_fmt, req_layout) {
+            Ok(rec) => {
+                let started_at = rec.started_at_ms();
+                let path_str = rec.path().to_string_lossy().into_owned();
+                let fmt_str = rec.format().as_str().to_string();
+                let tap_tx = rec.tap_sender();
+
+                let attached = {
+                    let mut guard = self.active.lock();
+                    if let Some(ref mut c) = *guard {
+                        if c.call_id == call_id && c.recorder.is_none() && c.media.is_some() {
+                            driver.set_audio_tap(Some(tap_tx));
+                            c.recorder = Some(rec);
+                            None
+                        } else {
+                            Some(rec)
+                        }
+                    } else {
+                        Some(rec)
+                    }
+                };
+
+                if let Some(orphan) = attached {
+                    let _ = orphan.stop();
+                    return;
+                }
+
+                (self.cfg.emit_ui_event)(CallUiEvent::SetRecording {
+                    active: true,
+                    started_at_ms: Some(started_at),
+                    path: Some(path_str),
+                    format: Some(fmt_str),
+                    error: None,
+                });
+            }
+            Err(err) => {
+                (self.cfg.emit_ui_event)(CallUiEvent::SetRecording {
+                    active: false,
+                    started_at_ms: None,
+                    path: None,
+                    format: None,
+                    error: Some(err),
+                });
+            }
+        }
+    }
+
+    fn user_toggle_record(&self, value: &Value) {
+        let fmt_opt = value
+            .get("format")
+            .and_then(Value::as_str)
+            .or_else(|| value.as_str());
+        let layout_opt = value.get("layout").and_then(Value::as_str);
+        let req_fmt =
+            RecordingFormat::from_opt_str(fmt_opt).unwrap_or(self.cfg.default_recording_format);
+        let req_layout = RecordingChannelLayout::from_opt_str(layout_opt)
+            .unwrap_or(self.cfg.default_recording_layout);
+
+        enum RecordAction {
+            Stop {
+                recorder: CallRecorderHandle,
+                dropped: u64,
+            },
+            Start {
+                call_id: i32,
+                partner_name: String,
+                driver: Arc<dyn CallMediaDriver>,
+            },
+            Armed(RecordingFormat),
+            Disarmed,
+            NoActiveCall,
+        }
+
+        let action = {
+            let mut guard = self.active.lock();
+            if let Some(ref mut c) = *guard {
+                if let Some(rec) = c.recorder.take() {
+                    c.record_when_ready = None;
+                    let dropped = c.media.as_ref().map(|m| m.dropped_tap_frames()).unwrap_or(0);
+                    if let Some(ref m) = c.media {
+                        m.set_audio_tap(None);
+                    }
+                    RecordAction::Stop {
+                        recorder: rec,
+                        dropped,
+                    }
+                } else if let Some(ref m) = c.media {
+                    c.record_when_ready = None;
+                    RecordAction::Start {
+                        call_id: c.call_id,
+                        partner_name: c.partner.name.clone(),
+                        driver: Arc::clone(m),
+                    }
+                } else if c.record_when_ready.take().is_some() {
+                    RecordAction::Disarmed
+                } else {
+                    c.record_when_ready = Some((req_fmt, req_layout));
+                    RecordAction::Armed(req_fmt)
+                }
+            } else {
+                RecordAction::NoActiveCall
+            }
+        };
+
+        match action {
+            RecordAction::NoActiveCall => {
+                (self.cfg.emit_ui_event)(CallUiEvent::SetRecording {
+                    active: false,
+                    started_at_ms: None,
+                    path: None,
+                    format: None,
+                    error: Some("Chưa kết nối âm thanh cuộc gọi".to_string()),
+                });
+            }
+            RecordAction::Armed(fmt) => {
+                (self.cfg.emit_ui_event)(CallUiEvent::SetRecording {
+                    active: true,
+                    started_at_ms: None,
+                    path: None,
+                    format: Some(fmt.as_str().to_string()),
+                    error: None,
+                });
+            }
+            RecordAction::Disarmed => {
+                (self.cfg.emit_ui_event)(CallUiEvent::SetRecording {
+                    active: false,
+                    started_at_ms: None,
+                    path: None,
+                    format: None,
+                    error: None,
+                });
+            }
+            RecordAction::Stop { recorder, dropped } => match recorder.stop_with_dropped(dropped) {
+                Ok(summary) => {
+                    (self.cfg.emit_ui_event)(CallUiEvent::SetRecording {
+                        active: false,
+                        started_at_ms: None,
+                        path: Some(summary.path.to_string_lossy().into_owned()),
+                        format: Some(summary.format.as_str().to_string()),
+                        error: None,
+                    });
+                }
+                Err(err) => {
+                    (self.cfg.emit_ui_event)(CallUiEvent::SetRecording {
+                        active: false,
+                        started_at_ms: None,
+                        path: None,
+                        format: None,
+                        error: Some(err),
+                    });
+                }
+            },
+            RecordAction::Start {
+                call_id,
+                partner_name,
+                driver,
+            } => {
+                self.start_recorder_for_driver(call_id, &partner_name, &driver, req_fmt, req_layout);
+            }
+        }
+    }
+
+    fn stop_active_media_and_session(&self, c: &mut ActiveCallState, emit_ui: bool) {
+        if let Some(t) = c.ring_timer.take() {
+            t.abort();
+        }
+        let dropped = c.media.as_ref().map(|m| m.dropped_tap_frames()).unwrap_or(0);
+        if let Some(ref m) = c.media {
+            m.set_audio_tap(None);
+        }
+        if let Some(m) = c.media.take() {
+            m.stop();
+        }
+        if let Some(rec) = c.recorder.take() {
+            match rec.stop_with_dropped(dropped) {
+                Ok(summary) => {
+                    if emit_ui {
+                        (self.cfg.emit_ui_event)(CallUiEvent::SetRecording {
+                            active: false,
+                            started_at_ms: None,
+                            path: Some(summary.path.to_string_lossy().into_owned()),
+                            format: Some(summary.format.as_str().to_string()),
+                            error: None,
+                        });
+                    }
+                }
+                Err(err) => {
+                    if emit_ui {
+                        (self.cfg.emit_ui_event)(CallUiEvent::SetRecording {
+                            active: false,
+                            started_at_ms: None,
+                            path: None,
+                            format: None,
+                            error: Some(err),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     fn on_remote_terminate(&self, call_id_val: Option<&Value>) {
         let reason = {
             let guard = self.active.lock();
@@ -1573,19 +1861,14 @@ impl OlazCallEngine {
     }
 
     /// Strict teardown sequence:
-    /// 1. Stop timers & media streams and transition UI to `"ended"` / close windows.
+    /// 1. Stop timers, media streams & active call recorder, and transition UI to `"ended"` / close windows.
     /// 2. Emit `callState: "free"` **BEFORE** `bubble` so chat header `callRunning` resets first.
     /// 3. Emit `bubble` ONLY when `!incoming || answered` (preventing double-logged missed incoming calls).
     fn teardown(&self, reason: i32, outcome: Option<String>) {
         let Some(mut c) = self.active.lock().take() else {
             return;
         };
-        if let Some(t) = c.ring_timer.take() {
-            t.abort();
-        }
-        if let Some(m) = c.media.take() {
-            m.stop();
-        }
+        self.stop_active_media_and_session(&mut c, true);
 
         if c.incoming && !c.answered {
             (self.cfg.emit_ui_event)(CallUiEvent::CloseIncoming);
@@ -1638,6 +1921,14 @@ impl OlazCallEngine {
                     "calltype": if c.is_video { 1 } else { 0 },
                 }),
             );
+        }
+    }
+}
+
+impl Drop for OlazCallEngine {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.active.get_mut().take() {
+            self.stop_active_media_and_session(&mut c, false);
         }
     }
 }

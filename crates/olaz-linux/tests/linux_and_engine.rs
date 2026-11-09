@@ -43,9 +43,9 @@ use olaz_linux::portals::{
 };
 use olaz_linux::tray::{
     render_tray_icon_argb32, render_tray_pixmaps, OlazTray, OlazTrayEvent, PrivacyField,
-    TrayPrivacyState, LABEL_BLOCK_DELIVERED, LABEL_BLOCK_SEEN, LABEL_BLOCK_TYPING,
-    LABEL_NEW_PROFILE, LABEL_PRIVACY_MENU, LABEL_QUIT, LABEL_SCREENSHOT, LABEL_SHOW_OLAZ,
-    LABEL_STATUS_BUSY, LABEL_STATUS_MENU, LABEL_STATUS_ONLINE,
+    TrayPrivacyState, LABEL_ANTI_RECALL, LABEL_BLOCK_DELIVERED, LABEL_BLOCK_SEEN,
+    LABEL_BLOCK_TYPING, LABEL_NEW_PROFILE, LABEL_PRIVACY_MENU, LABEL_QUIT, LABEL_SCREENSHOT,
+    LABEL_SHOW_OLAZ, LABEL_STATUS_BUSY, LABEL_STATUS_MENU, LABEL_STATUS_ONLINE,
 };
 
 // ============================================================================
@@ -676,12 +676,16 @@ fn tray_icon_argb32_pixmaps_and_menu_actions() {
                 }
             }
             MenuItem::SubMenu(sub) if sub.label == LABEL_PRIVACY_MENU => {
-                assert_eq!(sub.submenu.len(), 3);
+                assert_eq!(sub.submenu.len(), 4);
                 let mut check_labels = Vec::new();
                 for sub_item in &mut sub.submenu {
                     match sub_item {
                         MenuItem::Checkmark(chk) => {
-                            assert!(!chk.checked);
+                            if chk.label == LABEL_ANTI_RECALL {
+                                assert!(chk.checked);
+                            } else {
+                                assert!(!chk.checked);
+                            }
                             check_labels.push(chk.label.clone());
                             (chk.activate)(&mut tray);
                         }
@@ -694,6 +698,7 @@ fn tray_icon_argb32_pixmaps_and_menu_actions() {
                         LABEL_BLOCK_TYPING.to_string(),
                         LABEL_BLOCK_SEEN.to_string(),
                         LABEL_BLOCK_DELIVERED.to_string(),
+                        LABEL_ANTI_RECALL.to_string(),
                     ]
                 );
             }
@@ -717,6 +722,7 @@ fn tray_icon_argb32_pixmaps_and_menu_actions() {
             block_typing: true,
             block_seen: true,
             block_delivered: true,
+            anti_recall: false,
         }
     );
     tray.set_online_busy_index(1);
@@ -735,7 +741,13 @@ fn tray_icon_argb32_pixmaps_and_menu_actions() {
         MenuItem::SubMenu(sub) => {
             for sub_item in &sub.submenu {
                 match sub_item {
-                    MenuItem::Checkmark(chk) => assert!(chk.checked),
+                    MenuItem::Checkmark(chk) => {
+                        if chk.label == LABEL_ANTI_RECALL {
+                            assert!(!chk.checked);
+                        } else {
+                            assert!(chk.checked);
+                        }
+                    }
                     other => panic!("expected CheckmarkItem, got {other:?}"),
                 }
             }
@@ -747,10 +759,12 @@ fn tray_icon_argb32_pixmaps_and_menu_actions() {
         block_typing: false,
         block_seen: true,
         block_delivered: false,
+        anti_recall: true,
     });
     assert!(!tray.privacy_state().get(PrivacyField::BlockTyping));
     assert!(tray.privacy_state().get(PrivacyField::BlockSeen));
     assert!(!tray.privacy_state().get(PrivacyField::BlockDelivered));
+    assert!(tray.privacy_state().get(PrivacyField::AntiRecall));
 
     let recorded = events.lock().unwrap().clone();
     assert_eq!(
@@ -771,6 +785,10 @@ fn tray_icon_argb32_pixmaps_and_menu_actions() {
             OlazTrayEvent::TogglePrivacy {
                 field: PrivacyField::BlockDelivered,
                 enabled: true,
+            },
+            OlazTrayEvent::TogglePrivacy {
+                field: PrivacyField::AntiRecall,
+                enabled: false,
             },
             OlazTrayEvent::Screenshot,
             OlazTrayEvent::LaunchSecondaryProfile,

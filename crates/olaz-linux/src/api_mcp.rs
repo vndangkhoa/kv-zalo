@@ -112,6 +112,276 @@ pub trait OlazControlBackend: Send + Sync + 'static {
         target_id: &'a str,
         video: bool,
     ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>>;
+
+    /// Lists all active/registered account profiles managed by this Olaz instance.
+    fn list_profiles<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut st = self.status().await?;
+            let slug = st
+                .get("profile")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            if let Some(obj) = st.as_object_mut() {
+                obj.insert("is_active".to_string(), json!(true));
+            }
+            Ok(json!({
+                "ok": true,
+                "active_profile": slug,
+                "profiles": [st],
+            }))
+        })
+    }
+
+    /// Resolves a profile-specific child backend when running in multi-account workspace mode.
+    fn resolve_profile_backend(&self, _profile: Option<&str>) -> Option<Arc<dyn OlazControlBackend>> {
+        None
+    }
+}
+
+/// Entry registered inside [`MultiAccountControlBackend`].
+#[derive(Clone)]
+struct MultiAccountEntry {
+    slug: String,
+    label: Option<String>,
+    backend: Arc<dyn OlazControlBackend>,
+}
+
+struct MultiAccountState {
+    active_slug: String,
+    entries: Vec<MultiAccountEntry>,
+}
+
+/// Workspace-wide [`OlazControlBackend`] multiplexing multiple in-window account sessions,
+/// routing calls to the active (or explicitly requested) account and exposing [`Self::list_profiles`].
+pub struct MultiAccountControlBackend {
+    state: RwLock<MultiAccountState>,
+}
+
+impl MultiAccountControlBackend {
+    pub fn new(active_slug: impl Into<String>) -> Self {
+        Self {
+            state: RwLock::new(MultiAccountState {
+                active_slug: active_slug.into(),
+                entries: Vec::new(),
+            }),
+        }
+    }
+
+    pub fn register_account(
+        &self,
+        slug: impl Into<String>,
+        label: Option<String>,
+        backend: Arc<dyn OlazControlBackend>,
+    ) {
+        let slug = slug.into();
+        let mut st = self.state.write();
+        if let Some(existing) = st.entries.iter_mut().find(|e| e.slug == slug) {
+            existing.label = label;
+            existing.backend = backend;
+        } else {
+            st.entries.push(MultiAccountEntry {
+                slug: slug.clone(),
+                label,
+                backend,
+            });
+        }
+        if st.entries.len() == 1 || st.active_slug.is_empty() {
+            st.active_slug = slug;
+        }
+    }
+
+    pub fn unregister_account(&self, slug: &str) {
+        let mut st = self.state.write();
+        st.entries.retain(|e| e.slug != slug);
+        if st.active_slug == slug {
+            st.active_slug = st
+                .entries
+                .first()
+                .map(|e| e.slug.clone())
+                .unwrap_or_else(|| "default".to_string());
+        }
+    }
+
+    pub fn set_active_slug(&self, slug: impl Into<String>) {
+        let slug = slug.into();
+        let mut st = self.state.write();
+        if st.entries.iter().any(|e| e.slug == slug) || st.entries.is_empty() {
+            st.active_slug = slug;
+        }
+    }
+
+    pub fn active_slug(&self) -> String {
+        self.state.read().active_slug.clone()
+    }
+
+    pub fn set_account_label(&self, slug: &str, label: Option<String>) {
+        let mut st = self.state.write();
+        if let Some(entry) = st.entries.iter_mut().find(|e| e.slug == slug) {
+            entry.label = label;
+        }
+    }
+
+    pub fn account_backend(&self, slug: Option<&str>) -> Result<Arc<dyn OlazControlBackend>> {
+        let st = self.state.read();
+        let target = slug
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(st.active_slug.as_str());
+        if let Some(found) = st.entries.iter().find(|e| e.slug == target) {
+            return Ok(Arc::clone(&found.backend));
+        }
+        if slug.is_none() {
+            if let Some(first) = st.entries.first() {
+                return Ok(Arc::clone(&first.backend));
+            }
+        }
+        bail!("account profile `{target}` is not open in this workspace")
+    }
+}
+
+impl OlazControlBackend for MultiAccountControlBackend {
+    fn status<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move {
+            let b = self.account_backend(None)?;
+            let mut val = b.status().await?;
+            let count = self.state.read().entries.len();
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("account_count".to_string(), json!(count));
+            }
+            Ok(val)
+        })
+    }
+
+    fn list_threads<'a>(
+        &'a self,
+        limit: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move { self.account_backend(None)?.list_threads(limit).await })
+    }
+
+    fn get_messages<'a>(
+        &'a self,
+        conv_id: &'a str,
+        limit: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move { self.account_backend(None)?.get_messages(conv_id, limit).await })
+    }
+
+    fn send_message<'a>(
+        &'a self,
+        conv_id: &'a str,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move { self.account_backend(None)?.send_message(conv_id, text).await })
+    }
+
+    fn list_scheduled<'a>(
+        &'a self,
+        conv_id: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move { self.account_backend(None)?.list_scheduled(conv_id).await })
+    }
+
+    fn schedule_message<'a>(
+        &'a self,
+        req: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move {
+            let prof = req.get("profile").and_then(Value::as_str);
+            self.account_backend(prof)?.schedule_message(req).await
+        })
+    }
+
+    fn cancel_scheduled<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move { self.account_backend(None)?.cancel_scheduled(id).await })
+    }
+
+    fn get_autoreply<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move { self.account_backend(None)?.get_autoreply().await })
+    }
+
+    fn set_autoreply<'a>(
+        &'a self,
+        req: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move {
+            let prof = req.get("profile").and_then(Value::as_str);
+            self.account_backend(prof)?.set_autoreply(req).await
+        })
+    }
+
+    fn get_privacy<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move { self.account_backend(None)?.get_privacy().await })
+    }
+
+    fn set_privacy<'a>(
+        &'a self,
+        req: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move {
+            let prof = req.get("profile").and_then(Value::as_str);
+            self.account_backend(prof)?.set_privacy(req).await
+        })
+    }
+
+    fn start_call<'a>(
+        &'a self,
+        target_id: &'a str,
+        video: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move { self.account_backend(None)?.start_call(target_id, video).await })
+    }
+
+    fn list_profiles<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move {
+            let (active_slug, snapshot) = {
+                let st = self.state.read();
+                (st.active_slug.clone(), st.entries.clone())
+            };
+            let mut profiles = Vec::with_capacity(snapshot.len());
+            for entry in snapshot {
+                match entry.backend.status().await {
+                    Ok(mut st_val) => {
+                        if let Some(obj) = st_val.as_object_mut() {
+                            obj.insert("slug".to_string(), json!(entry.slug));
+                            obj.insert("profile".to_string(), json!(entry.slug));
+                            obj.insert("label".to_string(), json!(entry.label));
+                            obj.insert("is_active".to_string(), json!(entry.slug == active_slug));
+                        }
+                        profiles.push(st_val);
+                    }
+                    Err(err) => {
+                        profiles.push(json!({
+                            "ok": false,
+                            "slug": entry.slug,
+                            "profile": entry.slug,
+                            "label": entry.label,
+                            "is_active": entry.slug == active_slug,
+                            "error": err.to_string(),
+                        }));
+                    }
+                }
+            }
+            Ok(json!({
+                "ok": true,
+                "active_profile": active_slug,
+                "profiles": profiles,
+            }))
+        })
+    }
+
+    fn resolve_profile_backend(&self, profile: Option<&str>) -> Option<Arc<dyn OlazControlBackend>> {
+        let slug = profile.map(str::trim).filter(|s| !s.is_empty())?;
+        let st = self.state.read();
+        st.entries
+            .iter()
+            .find(|e| e.slug == slug)
+            .map(|e| Arc::clone(&e.backend))
+    }
 }
 
 /// Live in-process implementation of [`OlazControlBackend`] backed by [`ZaloEngineState`],
@@ -610,43 +880,47 @@ impl OlazControlBackend for EngineControlBackend {
 pub async fn dispatch_control_rpc(backend: &Arc<dyn OlazControlBackend>, req: Value) -> Value {
     let op = req.get("op").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+    let target_backend = backend
+        .resolve_profile_backend(params.get("profile").and_then(Value::as_str))
+        .unwrap_or_else(|| Arc::clone(backend));
 
     let result: Result<Value> = match op {
-        "status" => backend.status().await,
+        "status" => target_backend.status().await,
+        "list_profiles" => backend.list_profiles().await,
         "list_threads" => {
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
-            backend.list_threads(limit).await
+            target_backend.list_threads(limit).await
         }
         "get_messages" => {
             let cid = params.get("conv_id").and_then(Value::as_str).unwrap_or("");
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
-            backend.get_messages(cid, limit).await
+            target_backend.get_messages(cid, limit).await
         }
         "send_message" => {
             let cid = params.get("conv_id").and_then(Value::as_str).unwrap_or("");
             let text = params.get("text").and_then(Value::as_str).unwrap_or("");
-            backend.send_message(cid, text).await
+            target_backend.send_message(cid, text).await
         }
         "list_scheduled" => {
             let cid = params.get("conv_id").and_then(Value::as_str);
-            backend.list_scheduled(cid).await
+            target_backend.list_scheduled(cid).await
         }
-        "schedule_message" => backend.schedule_message(&params).await,
+        "schedule_message" => target_backend.schedule_message(&params).await,
         "cancel_scheduled" => {
             let id = params.get("id").and_then(Value::as_str).unwrap_or("");
-            backend.cancel_scheduled(id).await
+            target_backend.cancel_scheduled(id).await
         }
-        "get_autoreply" => backend.get_autoreply().await,
-        "set_autoreply" => backend.set_autoreply(&params).await,
-        "get_privacy" => backend.get_privacy().await,
-        "set_privacy" => backend.set_privacy(&params).await,
+        "get_autoreply" => target_backend.get_autoreply().await,
+        "set_autoreply" => target_backend.set_autoreply(&params).await,
+        "get_privacy" => target_backend.get_privacy().await,
+        "set_privacy" => target_backend.set_privacy(&params).await,
         "start_call" => {
             let target_id = params
                 .get("target_id")
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let video = params.get("video").and_then(Value::as_bool).unwrap_or(false);
-            backend.start_call(target_id, video).await
+            target_backend.start_call(target_id, video).await
         }
         other => Err(anyhow::anyhow!("unknown control rpc op `{other}`")),
     };
@@ -797,14 +1071,28 @@ impl OlazControlBackend for SocketRpcBackend {
             json!({ "target_id": target_id, "video": video }),
         ))
     }
+
+    fn list_profiles<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(self.call_op("list_profiles", json!({})))
+    }
 }
 
-/// Returns the JSON Schema descriptor list for all 10 MCP tools exposed by Olaz.
+/// Returns the JSON Schema descriptor list for all MCP tools exposed by Olaz.
 pub fn mcp_tools_catalog() -> Value {
     json!([
         {
             "name": "zalo_status",
             "description": "Check Olaz session status, active profile, unread counts, and privacy/automation summary",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "profile": { "type": "string", "description": "Optional account profile slug" }
+                }
+            }
+        },
+        {
+            "name": "zalo_list_profiles",
+            "description": "List all Zalo account profiles open in the Olaz workspace with login and unread status",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -900,13 +1188,14 @@ pub fn mcp_tools_catalog() -> Value {
         },
         {
             "name": "zalo_set_privacy",
-            "description": "Update outbound typing, seen, and delivered privacy suppression flags",
+            "description": "Update outbound typing, seen, delivered privacy suppression and anti-recall (Xem tin thu hồi) flags",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "block_typing": { "type": "boolean" },
                     "block_seen": { "type": "boolean" },
-                    "block_delivered": { "type": "boolean" }
+                    "block_delivered": { "type": "boolean" },
+                    "anti_recall": { "type": "boolean" }
                 }
             }
         },
@@ -930,11 +1219,15 @@ async fn execute_mcp_tool(
     name: &str,
     args: &Value,
 ) -> (bool, Value) {
+    let target_backend = backend
+        .resolve_profile_backend(args.get("profile").and_then(Value::as_str))
+        .unwrap_or_else(|| Arc::clone(backend));
     let res: Result<Value> = match name {
-        "zalo_status" => backend.status().await,
+        "zalo_status" => target_backend.status().await,
+        "zalo_list_profiles" => backend.list_profiles().await,
         "zalo_list_threads" => {
             let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
-            backend.list_threads(limit).await
+            target_backend.list_threads(limit).await
         }
         "zalo_get_messages" => {
             let cid = args
@@ -943,7 +1236,7 @@ async fn execute_mcp_tool(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
-            backend.get_messages(cid, limit).await
+            target_backend.get_messages(cid, limit).await
         }
         "zalo_send_message" => {
             let cid = args
@@ -952,23 +1245,23 @@ async fn execute_mcp_tool(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let text = args.get("text").and_then(Value::as_str).unwrap_or("");
-            backend.send_message(cid, text).await
+            target_backend.send_message(cid, text).await
         }
-        "zalo_schedule_message" => backend.schedule_message(args).await,
+        "zalo_schedule_message" => target_backend.schedule_message(args).await,
         "zalo_list_scheduled" => {
             let cid = args.get("conv_id").and_then(Value::as_str);
-            backend.list_scheduled(cid).await
+            target_backend.list_scheduled(cid).await
         }
         "zalo_cancel_scheduled" => {
             let id = args.get("id").and_then(Value::as_str).unwrap_or("");
-            backend.cancel_scheduled(id).await
+            target_backend.cancel_scheduled(id).await
         }
-        "zalo_set_autoreply" => backend.set_autoreply(args).await,
-        "zalo_set_privacy" => backend.set_privacy(args).await,
+        "zalo_set_autoreply" => target_backend.set_autoreply(args).await,
+        "zalo_set_privacy" => target_backend.set_privacy(args).await,
         "zalo_start_call" => {
             let tid = args.get("target_id").and_then(Value::as_str).unwrap_or("");
             let video = args.get("video").and_then(Value::as_bool).unwrap_or(false);
-            backend.start_call(tid, video).await
+            target_backend.start_call(tid, video).await
         }
         unknown => Err(anyhow::anyhow!("unknown MCP tool `{unknown}`")),
     };
@@ -1176,14 +1469,21 @@ pub async fn handle_http_rest_request(
         })
     };
 
+    let query_backend = backend
+        .resolve_profile_backend(query.get("profile").map(String::as_str))
+        .unwrap_or_else(|| Arc::clone(backend));
+
     match (method, path) {
-        ("GET", "/api/v1/status") | ("GET", "/health") => map_backend_result(backend.status().await),
+        ("GET", "/api/v1/status") | ("GET", "/health") => {
+            map_backend_result(query_backend.status().await)
+        }
+        ("GET", "/api/v1/profiles") => map_backend_result(backend.list_profiles().await),
         ("GET", "/api/v1/threads") => {
             let limit = query
                 .get("limit")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(100);
-            map_backend_result(backend.list_threads(limit).await)
+            map_backend_result(query_backend.list_threads(limit).await)
         }
         ("GET", "/api/v1/messages") => {
             let conv_id = query
@@ -1195,7 +1495,7 @@ pub async fn handle_http_rest_request(
                 .get("limit")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(50);
-            map_backend_result(backend.get_messages(&conv_id, limit).await)
+            map_backend_result(query_backend.get_messages(&conv_id, limit).await)
         }
         ("GET", p) if p.starts_with("/api/v1/threads/") && p.ends_with("/messages") => {
             let conv_id = p
@@ -1207,31 +1507,39 @@ pub async fn handle_http_rest_request(
                 .get("limit")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(50);
-            map_backend_result(backend.get_messages(&decoded, limit).await)
+            map_backend_result(query_backend.get_messages(&decoded, limit).await)
         }
         ("POST", "/api/v1/send") => {
             let payload = match parse_json_body() {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
+            let target = backend
+                .resolve_profile_backend(
+                    payload
+                        .get("profile")
+                        .and_then(Value::as_str)
+                        .or_else(|| query.get("profile").map(String::as_str)),
+                )
+                .unwrap_or_else(|| Arc::clone(&query_backend));
             let conv_id = payload
                 .get("conv_id")
                 .or_else(|| payload.get("to_id"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
-            map_backend_result(backend.send_message(conv_id, text).await)
+            map_backend_result(target.send_message(conv_id, text).await)
         }
         ("GET", "/api/v1/schedule") => {
             let conv_id = query.get("conv_id").map(String::as_str);
-            map_backend_result(backend.list_scheduled(conv_id).await)
+            map_backend_result(query_backend.list_scheduled(conv_id).await)
         }
         ("POST", "/api/v1/schedule") => {
             let payload = match parse_json_body() {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
-            map_backend_result(backend.schedule_message(&payload).await)
+            map_backend_result(query_backend.schedule_message(&payload).await)
         }
         ("DELETE", "/api/v1/schedule") => {
             let id = if let Some(q_id) = query.get("id").filter(|s| !s.is_empty()) {
@@ -1247,33 +1555,49 @@ pub async fn handle_http_rest_request(
                     .unwrap_or("")
                     .to_string()
             };
-            map_backend_result(backend.cancel_scheduled(&id).await)
+            map_backend_result(query_backend.cancel_scheduled(&id).await)
         }
         ("DELETE", p) if p.starts_with("/api/v1/schedule/") => {
             let id = url_decode_param(p.trim_start_matches("/api/v1/schedule/").trim_matches('/'));
-            map_backend_result(backend.cancel_scheduled(&id).await)
+            map_backend_result(query_backend.cancel_scheduled(&id).await)
         }
-        ("GET", "/api/v1/autoreply") => map_backend_result(backend.get_autoreply().await),
+        ("GET", "/api/v1/autoreply") => map_backend_result(query_backend.get_autoreply().await),
         ("POST", "/api/v1/autoreply") => {
             let payload = match parse_json_body() {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
-            map_backend_result(backend.set_autoreply(&payload).await)
+            map_backend_result(query_backend.set_autoreply(&payload).await)
         }
-        ("GET", "/api/v1/privacy") => map_backend_result(backend.get_privacy().await),
+        ("GET", "/api/v1/privacy") => map_backend_result(query_backend.get_privacy().await),
         ("POST", "/api/v1/privacy") => {
             let payload = match parse_json_body() {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
-            map_backend_result(backend.set_privacy(&payload).await)
+            let target = backend
+                .resolve_profile_backend(
+                    payload
+                        .get("profile")
+                        .and_then(Value::as_str)
+                        .or_else(|| query.get("profile").map(String::as_str)),
+                )
+                .unwrap_or_else(|| Arc::clone(&query_backend));
+            map_backend_result(target.set_privacy(&payload).await)
         }
         ("POST", "/api/v1/call") => {
             let payload = match parse_json_body() {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
+            let target = backend
+                .resolve_profile_backend(
+                    payload
+                        .get("profile")
+                        .and_then(Value::as_str)
+                        .or_else(|| query.get("profile").map(String::as_str)),
+                )
+                .unwrap_or_else(|| Arc::clone(&query_backend));
             let target_id = payload
                 .get("target_id")
                 .and_then(Value::as_str)
@@ -1282,7 +1606,7 @@ pub async fn handle_http_rest_request(
                 .get("video")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            map_backend_result(backend.start_call(target_id, video).await)
+            map_backend_result(target.start_call(target_id, video).await)
         }
         ("POST", "/api/v1/mcp") => match serde_json::from_str::<Value>(body) {
             Ok(req) => match handle_mcp_jsonrpc(backend, &req).await {
@@ -1308,6 +1632,7 @@ pub async fn handle_http_rest_request(
                 "error": format!("Endpoint not found: {method} {path}"),
                 "available_endpoints": [
                     "GET /api/v1/status",
+                    "GET /api/v1/profiles",
                     "GET /api/v1/threads",
                     "GET /api/v1/messages?conv_id=...&limit=...",
                     "POST /api/v1/send",

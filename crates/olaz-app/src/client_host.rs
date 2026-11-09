@@ -8,8 +8,8 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
@@ -724,13 +724,11 @@ impl ZaloWebRuntime {
 
         let asar_slot = Arc::new(RwLock::new(initial_asar));
 
-        // Start loopback HTTP 206 media proxy BEFORE creating `WebContext` so `OLAZ_GST_MEDIA_PROXY_BASE`
-        // is inherited by WebKit's `WebKitWebProcess` when playing `<audio>`/`<video>` via `olazmediasrc`.
-        start_gst_media_proxy(
-            Arc::clone(platform),
-            Arc::clone(&asar_slot),
-            tokio_handle,
-        );
+        // Register this account's `ZaloPlatform` & `AsarArchive` slot on the process-wide
+        // loopback HTTP 206 media proxy and ensure the accept loop is running so `WebKitWebProcess`
+        // can stream `<audio>`/`<video>` via `OLAZ_GST_MEDIA_PROXY_BASE` across all open accounts.
+        register_gst_media_proxy_platform(Arc::clone(platform), Arc::clone(&asar_slot));
+        ensure_gst_media_proxy_running(tokio_handle);
 
         let data_manager = WebsiteDataManager::builder()
             .base_data_directory(data_dir.to_string_lossy().as_ref())
@@ -1156,55 +1154,137 @@ fn slice_in_memory_range(
     )
 }
 
-fn start_gst_media_proxy(
-    platform: Arc<ZaloPlatform>,
-    asar_slot: Arc<RwLock<Option<Arc<AsarArchive>>>>,
-    tokio_handle: &tokio::runtime::Handle,
-) {
+struct GstMediaProxyRegistry {
+    listener: Mutex<Option<std::net::TcpListener>>,
+    token: String,
+    started: AtomicBool,
+    platforms: RwLock<Vec<Arc<ZaloPlatform>>>,
+    asar_slots: RwLock<Vec<Arc<RwLock<Option<Arc<AsarArchive>>>>>>,
+}
+
+static GST_MEDIA_PROXY_REGISTRY: OnceLock<Option<Arc<GstMediaProxyRegistry>>> = OnceLock::new();
+
+fn build_gst_media_proxy_registry() -> Option<Arc<GstMediaProxyRegistry>> {
     if std::env::var_os("OLAZ_GST_MEDIA_PROXY_BASE").is_some() {
-        return;
+        return None;
     }
     let Ok(std_listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
         tracing::warn!("failed to bind 127.0.0.1:0 for GStreamer media proxy");
-        return;
+        return None;
     };
     if std_listener.set_nonblocking(true).is_err() {
-        return;
+        return None;
     }
     let Ok(local_addr) = std_listener.local_addr() else {
-        return;
+        return None;
     };
     let port = local_addr.port();
     let token = uuid::Uuid::new_v4().simple().to_string();
     let base_url = format!("http://127.0.0.1:{port}/{token}");
     std::env::set_var("OLAZ_GST_MEDIA_PROXY_BASE", &base_url);
-    tracing::debug!(port, "started loopback HTTP 206 GStreamer media proxy");
+    tracing::debug!(port, "bound loopback HTTP 206 GStreamer media proxy listener");
 
+    Some(Arc::new(GstMediaProxyRegistry {
+        listener: Mutex::new(Some(std_listener)),
+        token,
+        started: AtomicBool::new(false),
+        platforms: RwLock::new(Vec::new()),
+        asar_slots: RwLock::new(Vec::new()),
+    }))
+}
+
+/// Binds the process-wide loopback HTTP 206 GStreamer media proxy listener and exports
+/// `OLAZ_GST_MEDIA_PROXY_BASE` **before** spawning the multi-threaded Tokio runtime so
+/// `std::env::set_var` executes while the process is strictly single-threaded.
+pub fn init_gst_media_proxy_listener() {
+    let _ = GST_MEDIA_PROXY_REGISTRY.get_or_init(build_gst_media_proxy_registry);
+}
+
+/// Registers an account session's `ZaloPlatform` and `AsarArchive` slot with the process-wide
+/// GStreamer loopback proxy so `zfile://` media paths from any open account tab are authorized.
+pub fn register_gst_media_proxy_platform(
+    platform: Arc<ZaloPlatform>,
+    asar_slot: Arc<RwLock<Option<Arc<AsarArchive>>>>,
+) {
+    let Some(reg) = GST_MEDIA_PROXY_REGISTRY
+        .get_or_init(build_gst_media_proxy_registry)
+        .as_ref()
+    else {
+        return;
+    };
+    {
+        let mut platforms = reg.platforms.write();
+        if !platforms.iter().any(|p| p.base_dir() == platform.base_dir()) {
+            platforms.push(platform);
+        }
+    }
+    {
+        let mut slots = reg.asar_slots.write();
+        if !slots.iter().any(|s| Arc::ptr_eq(s, &asar_slot)) {
+            slots.push(asar_slot);
+        }
+    }
+}
+
+fn ensure_gst_media_proxy_running(tokio_handle: &tokio::runtime::Handle) {
+    let Some(reg) = GST_MEDIA_PROXY_REGISTRY
+        .get_or_init(build_gst_media_proxy_registry)
+        .as_ref()
+        .cloned()
+    else {
+        return;
+    };
+    if reg
+        .started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let Some(std_listener) = reg.listener.lock().take() else {
+        return;
+    };
+    let _enter = tokio_handle.enter();
     let Ok(listener) = tokio::net::TcpListener::from_std(std_listener) else {
         return;
     };
-
+    let prefix = format!("/{}/", reg.token);
     tokio_handle.spawn(async move {
-        let prefix = format!("/{token}/");
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
-            let platform = Arc::clone(&platform);
-            let asar_slot = Arc::clone(&asar_slot);
-            let prefix = prefix.clone();
+            let reg_conn = Arc::clone(&reg);
+            let prefix_conn = prefix.clone();
             tokio::spawn(async move {
-                let _ = handle_gst_proxy_conn(&mut stream, &prefix, &platform, &asar_slot).await;
+                let _ = handle_gst_proxy_conn(&mut stream, &prefix_conn, &reg_conn).await;
             });
         }
     });
 }
 
+fn gst_proxy_allowed_roots_union(registry: &GstMediaProxyRegistry) -> Vec<PathBuf> {
+    let platforms = registry.platforms.read();
+    let mut union = Vec::new();
+    for p in platforms.iter() {
+        for root in zfile_allowed_roots(p) {
+            if !union.contains(&root) {
+                union.push(root);
+            }
+        }
+    }
+    union
+}
+
+fn gst_proxy_active_asar(registry: &GstMediaProxyRegistry) -> Option<Arc<AsarArchive>> {
+    let slots = registry.asar_slots.read();
+    slots.iter().find_map(|slot| slot.read().clone())
+}
+
 async fn handle_gst_proxy_conn(
     stream: &mut tokio::net::TcpStream,
     prefix: &str,
-    platform: &ZaloPlatform,
-    asar_slot: &Arc<RwLock<Option<Arc<AsarArchive>>>>,
+    registry: &GstMediaProxyRegistry,
 ) -> std::io::Result<()> {
     let mut req_buf = Vec::with_capacity(2048);
     let mut chunk = [0u8; 2048];
@@ -1309,7 +1389,7 @@ async fn handle_gst_proxy_conn(
             } else {
                 PathBuf::from(format!("/{decoded}"))
             };
-            let allowed = zfile_allowed_roots(platform);
+            let allowed = gst_proxy_allowed_roots_union(registry);
             match open_local_media_range(&abs_path, range_header.as_deref(), &allowed, !is_head) {
                 Ok(media) => {
                     write_http_stream_response(stream, media, is_head).await?;
@@ -1344,7 +1424,7 @@ async fn handle_gst_proxy_conn(
                     .await?;
                     return Ok(());
                 };
-                let allowed = zfile_allowed_roots(platform);
+                let allowed = gst_proxy_allowed_roots_union(registry);
                 match open_local_media_range(&abs_path, range_header.as_deref(), &allowed, !is_head)
                 {
                     Ok(media) => {
@@ -1383,7 +1463,7 @@ async fn handle_gst_proxy_conn(
                 .await?;
                 return Ok(());
             }
-            let Some(asar) = asar_slot.read().clone() else {
+            let Some(asar) = gst_proxy_active_asar(registry) else {
                 write_http_response(
                     stream,
                     503,

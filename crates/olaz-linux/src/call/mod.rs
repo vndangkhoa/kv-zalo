@@ -3,6 +3,7 @@
 pub mod audio_io;
 pub mod engine;
 pub mod opus_ffi;
+pub mod recorder;
 pub mod srtp;
 pub mod ui_assets;
 pub mod video_io;
@@ -12,8 +13,8 @@ pub mod zrtc;
 pub use audio_io::{
     apply_mic_gain_and_level, downmix_to_mono_i16, enumerate_audio_devices,
     is_ignored_audio_device, is_pulse_simple_available, resample_mono_i16, AudioDeviceEntry,
-    AudioDeviceList, AudioIoSession, PlaybackJitterBuffer, DEFAULT_MIC_GAIN,
-    MAX_PLAYBACK_JITTER_SAMPLES,
+    AudioDeviceList, AudioIoSession, AudioTapPacket, PlaybackJitterBuffer, TapSource,
+    AUDIO_FRAME_SAMPLES, AUDIO_SAMPLE_RATE_HZ, DEFAULT_MIC_GAIN, MAX_PLAYBACK_JITTER_SAMPLES,
 };
 pub use engine::{
     map_nonzero_answer_status, unpack_send_to_native_args, BoxMediaSetupFuture, CallEngineConfig,
@@ -22,8 +23,16 @@ pub use engine::{
     OPUS_CODEC_DESCRIPTOR,
 };
 pub use opus_ffi::{
-    is_opus_available, OpusError, OpusVoipDecoder, OpusVoipEncoder, OPUS_VOIP_CHANNELS,
+    is_opus_available, OpusError, OpusPcmDecoder, OpusPcmEncoder, OpusVoipDecoder,
+    OpusVoipEncoder, OPUS_APPLICATION_AUDIO, OPUS_RECORDING_DEFAULT_BITRATE, OPUS_VOIP_CHANNELS,
     OPUS_VOIP_DEFAULT_BITRATE, OPUS_VOIP_FRAME_SAMPLES, OPUS_VOIP_SAMPLE_RATE,
+};
+pub use recorder::{
+    build_recording_file_path, default_recordings_dir, ogg_crc32, sanitize_partner_slug,
+    soft_clip_mono_sum, CallRecorderHandle, DriftAligner, RecordingChannelLayout, RecordingFormat,
+    RecordingSummary, ALIGNER_FRAME_SAMPLES, ALIGNER_LAG_THRESHOLD_SAMPLES,
+    ALIGNER_MAX_QUEUE_SAMPLES, OGG_OPUS_GRANULE_STEP_20MS, OGG_OPUS_PRE_SKIP,
+    RECORDER_CHANNEL_CAPACITY, WAV_HEADER_BYTES, WAV_SYNC_INTERVAL_FRAMES,
 };
 pub use srtp::{
     build_srtp_iv, build_zavi_no_seq_iv, extract_master_material, rtp_header_layout, SrtpContext,

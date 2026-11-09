@@ -3431,3 +3431,982 @@ fn utility_media_port_jxl_tasks_and_live_privacy_receipt_blocker_work_in_node() 
     assert_eq!(res["encJxlFallback"], true);
 }
 
+// ============================================================================
+// 8. Track B (Anti-Recall): `dal-worker` IndexedDB Guard & `LINUX_DIRECT_UI_SCRIPT`
+// ============================================================================
+
+#[test]
+fn anti_recall_dal_worker_idb_put_tombstone_and_quote_preservation_in_node() {
+    let prelude = worker_prelude();
+    let script = format!(
+        r#"
+(async () => {{
+  const bcPeers = new Map();
+  class MockBroadcastChannel {{
+    constructor(name) {{
+      this.name = name;
+      this.onmessage = null;
+      if (!bcPeers.has(name)) bcPeers.set(name, new Set());
+      bcPeers.get(name).add(this);
+    }}
+    postMessage(data) {{
+      const set = bcPeers.get(this.name) || new Set();
+      for (const peer of set) {{
+        if (peer !== this && typeof peer.onmessage === 'function') {{
+          setTimeout(() => peer.onmessage({{ data }}), 0);
+        }}
+      }}
+    }}
+    close() {{
+      const set = bcPeers.get(this.name);
+      if (set) set.delete(this);
+    }}
+  }}
+
+  const makeAsyncReq = (resultVal) => {{
+    const listeners = {{ success: [], error: [] }};
+    const req = {{
+      result: undefined,
+      error: null,
+      readyState: 'pending',
+      onsuccess: null,
+      onerror: null,
+      addEventListener(type, fn) {{
+        if (listeners[type]) listeners[type].push(fn);
+      }},
+    }};
+    setTimeout(() => {{
+      req.result = resultVal;
+      req.readyState = 'done';
+      const ev = {{ type: 'success', target: req }};
+      if (typeof req.onsuccess === 'function') req.onsuccess(ev);
+      for (const fn of listeners.success) fn(ev);
+    }}, 0);
+    return req;
+  }};
+
+  class MockIDBDatabase {{
+    transaction() {{
+      return {{ addEventListener() {{}} }};
+    }}
+  }}
+  class MockIDBObjectStore {{
+    constructor(name, keyPath = 'msgId') {{
+      this.name = name;
+      this.keyPath = keyPath;
+      this._rows = new Map();
+    }}
+    _k(val, explicitKey) {{
+      if (explicitKey !== undefined) return JSON.stringify(explicitKey);
+      if (Array.isArray(this.keyPath)) return JSON.stringify(this.keyPath.map((k) => val[k]));
+      return JSON.stringify(val[this.keyPath || 'msgId']);
+    }}
+    get(lookupKey) {{
+      const raw = this._rows.get(JSON.stringify(lookupKey));
+      return makeAsyncReq(raw ? JSON.parse(JSON.stringify(raw)) : undefined);
+    }}
+    put(val, explicitKey) {{
+      const k = this._k(val, explicitKey);
+      this._rows.set(k, JSON.parse(JSON.stringify(val)));
+      return makeAsyncReq(explicitKey !== undefined ? explicitKey : val[this.keyPath || 'msgId']);
+    }}
+    add(val, explicitKey) {{
+      return this.put(val, explicitKey);
+    }}
+  }}
+
+  const workerPings = [];
+  const mainBc = new MockBroadcastChannel('olaz_privacy');
+  mainBc.onmessage = (ev) => {{
+    workerPings.push(ev.data);
+    if (ev.data && ev.data.type === 'request_privacy') {{
+      mainBc.postMessage({{ type: 'privacy_update', anti_recall: true }});
+    }}
+  }};
+
+  globalThis.self = globalThis;
+  globalThis.BroadcastChannel = MockBroadcastChannel;
+  globalThis.IDBFactory = class {{
+    open() {{ return makeAsyncReq(null); }}
+  }};
+  globalThis.IDBDatabase = MockIDBDatabase;
+  globalThis.IDBObjectStore = MockIDBObjectStore;
+  globalThis.postMessage = () => {{}};
+  globalThis.addEventListener = () => {{}};
+
+  {prelude}
+
+  await new Promise((r) => setTimeout(r, 15));
+  const syncedEnabled = self.__olazGetAntiRecall();
+
+  const waitReq = (req) => new Promise((resolve, reject) => {{
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }});
+
+  const msgStore = new MockIDBObjectStore('message', 'msgId');
+
+  // 1. Store original text/media message, then incoming msgType=20 chat.undo tombstone
+  await waitReq(msgStore.put({{
+    msgId: 'm_100',
+    msgType: 1,
+    message: 'Bí mật không được thu hồi',
+    thumb: 'https://cdn.zalo.me/thumb100.jpg',
+    localPath: '/tmp/zalo/photo100.jpg',
+    e2eeStatus: 1,
+  }}));
+  await waitReq(msgStore.put({{
+    msgId: 'm_100',
+    msgType: 20,
+    originMsgType: 'chat.undo',
+    message: '[Tin nhắn đã được thu hồi]',
+  }}));
+  const preserved20 = await waitReq(msgStore.get('m_100'));
+
+  // 2. Store another message and recall with msgType=-27
+  await waitReq(msgStore.put({{
+    msgId: 'm_101',
+    msgType: 3,
+    message: 'Ghi âm quan trọng',
+    folderPath: '/tmp/zalo/voice101.aac',
+  }}));
+  await waitReq(msgStore.put({{
+    msgId: 'm_101',
+    msgType: -27,
+    message: '',
+  }}));
+  const preservedNeg27 = await waitReq(msgStore.get('m_101'));
+
+  // 3. Reply quote-wiping protection (`quote.cliMsgType === 20`)
+  await waitReq(msgStore.put({{
+    msgId: 'm_reply_1',
+    msgType: 1,
+    message: ' Mình trả lời câu này nhé',
+    quote: {{ cliMsgType: 1, msg: 'Nội dung gốc trong trích dẫn', ownerId: 'u_9' }},
+  }}));
+  await waitReq(msgStore.put({{
+    msgId: 'm_reply_1',
+    msgType: 1,
+    message: ' Mình trả lời câu này nhé',
+    quote: {{ cliMsgType: 20, msg: '', ownerId: 'u_9' }},
+  }}));
+  const preservedQuoteMsg = await waitReq(msgStore.get('m_reply_1'));
+
+  // 4. Composite keyPath support (`['convId', 'msgId']`)
+  const compositeStore = new MockIDBObjectStore('message', ['convId', 'msgId']);
+  await waitReq(compositeStore.put({{
+    convId: 'c_1',
+    msgId: 'm_comp',
+    msgType: 1,
+    message: 'Composite key message',
+  }}));
+  await waitReq(compositeStore.put({{
+    convId: 'c_1',
+    msgId: 'm_comp',
+    msgType: 20,
+    message: '[Tin nhắn đã được thu hồi]',
+  }}));
+  const preservedComp = await waitReq(compositeStore.get(['c_1', 'm_comp']));
+
+  // 5. Turn anti_recall OFF via BroadcastChannel -> recall tombstones overwrite normally
+  mainBc.postMessage({{ type: 'privacy_update', anti_recall: false }});
+  await new Promise((r) => setTimeout(r, 10));
+  const syncedDisabled = self.__olazGetAntiRecall();
+  await waitReq(msgStore.put({{
+    msgId: 'm_off',
+    msgType: 1,
+    message: 'Cho phép thu hồi khi tắt',
+  }}));
+  await waitReq(msgStore.put({{
+    msgId: 'm_off',
+    msgType: 20,
+    message: '[Tin nhắn đã được thu hồi]',
+  }}));
+  const overwrittenWhenOff = await waitReq(msgStore.get('m_off'));
+
+  console.log(JSON.stringify({{
+    workerPings,
+    syncedEnabled,
+    preserved20,
+    preservedNeg27,
+    preservedQuoteMsg,
+    preservedComp,
+    syncedDisabled,
+    overwrittenWhenOff,
+  }}));
+  process.exit(0);
+}})();
+"#,
+        prelude = prelude,
+    );
+
+    let res = run_node_json(&script);
+    assert_eq!(res["workerPings"][0]["type"], "request_privacy");
+    assert_eq!(res["syncedEnabled"], true);
+
+    assert_eq!(res["preserved20"]["msgType"], 1);
+    assert_eq!(res["preserved20"]["message"], "Bí mật không được thu hồi");
+    assert_eq!(
+        res["preserved20"]["thumb"],
+        "https://cdn.zalo.me/thumb100.jpg"
+    );
+    assert_eq!(res["preserved20"]["localPath"], "/tmp/zalo/photo100.jpg");
+    assert_eq!(res["preserved20"]["e2eeStatus"], 1);
+    assert_eq!(res["preserved20"]["__olazPresalledType"], 20);
+    assert_eq!(res["preserved20"]["__olazRecalled"], true);
+    assert_eq!(res["preserved20"]["__olazPreserved"], true);
+
+    assert_eq!(res["preservedNeg27"]["msgType"], 3);
+    assert_eq!(res["preservedNeg27"]["message"], "Ghi âm quan trọng");
+    assert_eq!(res["preservedNeg27"]["folderPath"], "/tmp/zalo/voice101.aac");
+    assert_eq!(res["preservedNeg27"]["__olazRecalled"], true);
+
+    assert_eq!(res["preservedQuoteMsg"]["quote"]["cliMsgType"], 1);
+    assert_eq!(
+        res["preservedQuoteMsg"]["quote"]["msg"],
+        "Nội dung gốc trong trích dẫn"
+    );
+    assert_eq!(
+        res["preservedQuoteMsg"]["quote"]["__olazQuoteRecalled"],
+        true
+    );
+
+    assert_eq!(res["preservedComp"]["msgType"], 1);
+    assert_eq!(res["preservedComp"]["message"], "Composite key message");
+    assert_eq!(res["preservedComp"]["__olazRecalled"], true);
+
+    assert_eq!(res["syncedDisabled"], false);
+    assert_eq!(res["overwrittenWhenOff"]["msgType"], 20);
+    assert_eq!(
+        res["overwrittenWhenOff"]["message"],
+        "[Tin nhắn đã được thu hồi]"
+    );
+}
+
+#[test]
+fn anti_recall_direct_ui_shadow_redux_guard_dom_badge_and_zstate_in_node() {
+    let tmp = TempDir::new().unwrap();
+    let platform = ZaloPlatform::with_root(tmp.path(), "26.10.20");
+    let scripts = olaz_core::direct_ui_user_scripts(&platform, false);
+    let find_script = |name: &str| -> String {
+        scripts
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_else(|| panic!("missing script {name}"))
+    };
+
+    let script = format!(
+        r#"
+(async () => {{
+  const bcPeers = new Map();
+  class MockBroadcastChannel {{
+    constructor(name) {{
+      this.name = name;
+      this.onmessage = null;
+      if (!bcPeers.has(name)) bcPeers.set(name, new Set());
+      bcPeers.get(name).add(this);
+    }}
+    postMessage(data) {{
+      const set = bcPeers.get(this.name) || new Set();
+      for (const peer of set) {{
+        if (peer !== this && typeof peer.onmessage === 'function') {{
+          peer.onmessage({{ data }});
+        }}
+      }}
+    }}
+  }}
+
+  // Minimal DOM tree supporting `.chat-message[id^="bb_msg_id_"]`, `.zmenu-body`, `#main-tab`, and events
+  class MockElement {{
+    constructor(tag) {{
+      this.tagName = String(tag || 'DIV').toUpperCase();
+      this.id = '';
+      this.textContent = '';
+      this.children = [];
+      this.parentNode = null;
+      this._attrs = {{}};
+      this._listeners = {{}};
+      this._classes = new Set();
+      this.classList = {{
+        add: (...cs) => cs.forEach((c) => this._classes.add(c)),
+        remove: (...cs) => cs.forEach((c) => this._classes.delete(c)),
+        contains: (c) => this._classes.has(c),
+        toggle: (c, f) => {{
+          const on = f === undefined ? !this._classes.has(c) : Boolean(f);
+          if (on) this._classes.add(c); else this._classes.delete(c);
+          return on;
+        }},
+      }};
+    }}
+    set className(v) {{
+      this._classes = new Set(String(v || '').split(/\s+/).filter(Boolean));
+    }}
+    get className() {{
+      return Array.from(this._classes).join(' ');
+    }}
+    get firstChild() {{ return this.children[0] || null; }}
+    get firstElementChild() {{ return this.children[0] || null; }}
+    get previousElementSibling() {{
+      if (!this.parentNode) return null;
+      const idx = this.parentNode.children.indexOf(this);
+      return idx > 0 ? this.parentNode.children[idx - 1] : null;
+    }}
+    get nextSibling() {{
+      if (!this.parentNode) return null;
+      const idx = this.parentNode.children.indexOf(this);
+      return idx >= 0 && idx + 1 < this.parentNode.children.length ? this.parentNode.children[idx + 1] : null;
+    }}
+    appendChild(child) {{
+      if (child.parentNode) child.parentNode.removeChild(child);
+      child.parentNode = this;
+      this.children.push(child);
+      return child;
+    }}
+    insertBefore(child, refNode) {{
+      if (!refNode) return this.appendChild(child);
+      if (child.parentNode) child.parentNode.removeChild(child);
+      const idx = this.children.indexOf(refNode);
+      child.parentNode = this;
+      if (idx >= 0) this.children.splice(idx, 0, child);
+      else this.children.push(child);
+      return child;
+    }}
+    removeChild(child) {{
+      const idx = this.children.indexOf(child);
+      if (idx >= 0) this.children.splice(idx, 1);
+      child.parentNode = null;
+      return child;
+    }}
+    remove() {{
+      if (this.parentNode) this.parentNode.removeChild(this);
+    }}
+    contains(target) {{
+      let cur = target;
+      while (cur) {{
+        if (cur === this) return true;
+        cur = cur.parentNode;
+      }}
+      return false;
+    }}
+    closest(sel) {{
+      let cur = this;
+      while (cur) {{
+        if (typeof cur._matches === 'function' && cur._matches(sel)) return cur;
+        cur = cur.parentNode;
+      }}
+      return null;
+    }}
+    hasAttribute(k) {{ return Object.prototype.hasOwnProperty.call(this._attrs, k); }}
+    getAttribute(k) {{ return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; }}
+    setAttribute(k, v) {{
+      this._attrs[k] = String(v);
+      if (k === 'id') this.id = String(v);
+    }}
+    addEventListener(type, fn) {{
+      if (!this._listeners[type]) this._listeners[type] = [];
+      this._listeners[type].push(fn);
+    }}
+    dispatchEvent(ev) {{
+      const fns = this._listeners[ev && ev.type] || [];
+      for (const fn of fns) fn(ev);
+      return true;
+    }}
+    click() {{
+      this.dispatchEvent({{ type: 'click', preventDefault() {{}}, stopPropagation() {{}} }});
+    }}
+    _matches(sel) {{
+      if (sel === '.chat-message[id^="bb_msg_id_"]') {{
+        return this._classes.has('chat-message') && String(this.id).startsWith('bb_msg_id_');
+      }}
+      if (sel === '[data-id^="div_CX_"]') {{
+        return String(this._attrs['data-id'] || '').startsWith('div_CX_');
+      }}
+      const exactAttr = sel.match(/^\[([a-zA-Z0-9_-]+)="([^"]+)"\]$/);
+      if (exactAttr) {{
+        return this._attrs[exactAttr[1]] === exactAttr[2];
+      }}
+      if (sel.startsWith('#')) return this.id === sel.slice(1);
+      if (sel.startsWith('.')) {{
+        return sel.slice(1).split('.').filter(Boolean).every((c) => this._classes.has(c));
+      }}
+      return false;
+    }}
+    querySelectorAll(sel) {{
+      const parts = sel.split(',').map((s) => s.trim()).filter(Boolean);
+      const out = [];
+      const walk = (node) => {{
+        for (const ch of node.children) {{
+          if (parts.some((p) => ch._matches(p))) out.push(ch);
+          walk(ch);
+        }}
+      }};
+      walk(this);
+      return out;
+    }}
+    querySelector(sel) {{
+      return this.querySelectorAll(sel)[0] || null;
+    }}
+  }}
+
+  const docRoot = new MockElement('html');
+  const headEl = docRoot.appendChild(new MockElement('head'));
+  const bodyEl = docRoot.appendChild(new MockElement('body'));
+
+  // Left navigation sidebar (`#main-tab > div > .nav__tabs__top` + `.nav__tabs__bottom`)
+  const mainTab = bodyEl.appendChild(new MockElement('nav'));
+  mainTab.id = 'main-tab';
+  const mainTabTopGroup = mainTab.appendChild(new MockElement('div'));
+  const navZalo = mainTabTopGroup.appendChild(new MockElement('div'));
+  navZalo.className = 'nav__tabs__zalo';
+  const navTabsTop = mainTabTopGroup.appendChild(new MockElement('div'));
+  navTabsTop.className = 'nav__tabs__top';
+  const navTabsBottom = mainTab.appendChild(new MockElement('div'));
+  navTabsBottom.className = 'nav__tabs__bottom';
+
+  const msgView = bodyEl.appendChild(new MockElement('div'));
+  msgView.id = 'messageView';
+
+  const bubbleNormal = msgView.appendChild(new MockElement('div'));
+  bubbleNormal.className = 'chat-message';
+  bubbleNormal.id = 'bb_msg_id_m_500';
+  const cardNormal = bubbleNormal.appendChild(new MockElement('div'));
+  cardNormal.className = 'card';
+
+  const bubbleUndo = msgView.appendChild(new MockElement('div'));
+  bubbleUndo.className = 'chat-message';
+  bubbleUndo.id = 'bb_msg_id_m_500';
+  const cardUndo = bubbleUndo.appendChild(new MockElement('div'));
+  cardUndo.className = 'card card--undo';
+
+  // Chat bubble `"..."` context menu portal mounted under `document.body`
+  const cxMenu = bodyEl.appendChild(new MockElement('div'));
+  cxMenu.className = 'zmenu-body expand';
+  const cxOuter = cxMenu.appendChild(new MockElement('div'));
+  const cxList = cxOuter.appendChild(new MockElement('div'));
+  const cxSelectWrap = cxList.appendChild(new MockElement('div'));
+  cxSelectWrap.className = 'rel';
+  const cxSelect = cxSelectWrap.appendChild(new MockElement('div'));
+  cxSelect.className = 'zmenu-item';
+  cxSelect.setAttribute('data-id', 'div_CX_Select');
+  const cxSep = cxList.appendChild(new MockElement('div'));
+  cxSep.className = 'zmenu-separator';
+  const cxDelete = cxList.appendChild(new MockElement('div'));
+  cxDelete.className = 'zmenu-item --DANGER';
+  cxDelete.setAttribute('data-id', 'div_CX_Delete');
+
+  // Call Settings modal (`Cài đặt` -> `Cài đặt cuộc gọi`) DOM container
+  const callSettingsBottom = bodyEl.appendChild(new MockElement('div'));
+  callSettingsBottom.className = 'setting--bottom';
+  const notifySection = callSettingsBottom.appendChild(new MockElement('div'));
+  notifySection.className = 'setting-section';
+  const notifySwitch = notifySection.appendChild(new MockElement('div'));
+  notifySwitch.id = 'settingNotifyCall';
+  notifySwitch.setAttribute('data-id', 'idsettingNotifyCall');
+  const camSection = callSettingsBottom.appendChild(new MockElement('div'));
+  camSection.className = 'setting-section';
+
+  const zstateEvents = [];
+  globalThis.window = globalThis;
+  globalThis.BroadcastChannel = MockBroadcastChannel;
+  globalThis.MutationObserver = class {{
+    constructor(cb) {{ this.cb = cb; }}
+    observe() {{}}
+    disconnect() {{}}
+  }};
+  globalThis.requestAnimationFrame = (cb) => setTimeout(cb, 0);
+  globalThis.location = {{ protocol: 'zalo-app:', href: 'zalo-app://local/index.html', pathname: '/index.html' }};
+  globalThis.document = {{
+    readyState: 'complete',
+    head: headEl,
+    body: bodyEl,
+    documentElement: docRoot,
+    createElement: (tag) => new MockElement(tag),
+    getElementById: (id) => docRoot.querySelector('#' + id),
+    querySelector: (sel) => docRoot.querySelector(sel),
+    querySelectorAll: (sel) => docRoot.querySelectorAll(sel),
+    addEventListener() {{}},
+  }};
+  globalThis.addEventListener = () => {{}};
+  globalThis.fetch = async () => new Response('{{}}', {{ status: 200 }});
+  globalThis.__zaloNativeXHR = class {{
+    open() {{}}
+    send() {{ this.responseText = JSON.stringify({{ value: null }}); }}
+  }};
+  globalThis.webkit = {{
+    messageHandlers: {{
+      zlog: {{ postMessage() {{}} }},
+      zstate: {{ postMessage(raw) {{ zstateEvents.push(typeof raw === 'string' ? JSON.parse(raw) : raw); }} }},
+      __olaz_win_drag: {{ postMessage() {{}} }},
+      zbridge: {{ postMessage() {{ return Promise.resolve(null); }} }},
+    }},
+  }};
+
+  // Set up mock Redux store + message recall service in `__zaloRequire`
+  let deletedFiles = 0;
+  const recallService = {{
+    deleteMessageResourceIfExists(m) {{
+      deletedFiles += 1;
+      return true;
+    }},
+    convertToRecalled(m) {{
+      m.msgType = 20;
+      m.message = '[Tin nhắn đã được thu hồi]';
+      return m;
+    }},
+    mergeUndo(m) {{
+      m.msgType = 20;
+      m.message = '[Tin nhắn đã được thu hồi]';
+      return m;
+    }},
+  }};
+
+  const subscribers = new Set();
+  const state = {{
+    user: {{ userId: 'u_me_1', displayName: 'Khoa' }},
+    conversations: {{
+      alls: {{
+        conv_1: {{
+          messages: [
+            {{
+              msgId: 'm_500',
+              cliMsgId: 'c_500',
+              fromUid: 'u_friend_9',
+              dName: 'Bạn Bè',
+              msgType: 1,
+              status: 0,
+              sendDttm: 1762000123000,
+              message: 'Tin nhắn gốc sẽ bị thu hồi',
+              localPath: '/tmp/zalo/voice_500.aac',
+              quote: {{ cliMsgType: 1, msg: 'Trích dẫn ban đầu' }},
+            }},
+            {{
+              msgId: 'm_501',
+              cliMsgId: 'c_501',
+              fromUid: 'u_friend_9',
+              dName: 'Bạn Bè',
+              msgType: 1,
+              status: 0,
+              sendDttm: 1762000124000,
+              message: 'Tin trả lời không bị thu hồi',
+              quote: {{ cliMsgType: 1, msg: 'Câu được trích dẫn' }},
+            }},
+          ],
+        }},
+      }},
+    }},
+  }};
+  const reduxStore = {{
+    getState: () => state,
+    subscribe: (fn) => {{ subscribers.add(fn); return () => subscribers.delete(fn); }},
+    dispatch(action) {{
+      if (action && action.type === 'SIMULATE_UNDO') {{
+        const msg = state.conversations.alls.conv_1.messages[0];
+        msg.msgType = 20;
+        msg.status = -27;
+        msg.message = '[Tin nhắn đã được thu hồi]';
+        msg.quote = {{ cliMsgType: 20, msg: '' }};
+        const replyMsg = state.conversations.alls.conv_1.messages[1];
+        replyMsg.quote = {{ cliMsgType: 20, msg: '' }};
+      }}
+      for (const fn of subscribers) fn();
+      return action;
+    }},
+  }};
+
+  globalThis.__zaloRequire = {{
+    c: {{
+      1: {{ exports: reduxStore }},
+      2: {{ exports: recallService }},
+    }},
+  }};
+
+  const workerBcMessages = [];
+  const workerBc = new MockBroadcastChannel('olaz_privacy');
+  workerBc.onmessage = (ev) => workerBcMessages.push(ev.data);
+
+  {bridge_spec}
+  {local_modules}
+  {direct_ui}
+  {bridge_js}
+
+  // Verify default `antiRecall === true` out-of-the-box + BroadcastChannel worker ping reply
+  const defaultAntiRecallOnBoot = Boolean(window.__olazPrivacy && window.__olazPrivacy.antiRecall);
+  workerBc.postMessage({{ type: 'request_privacy' }});
+  const workerAntiRecallWhileOn = workerBcMessages[workerBcMessages.length - 1]?.anti_recall;
+  const workerBcCountWhileOn = workerBcMessages.length;
+
+  // 1. Verify `deleteMessageResourceIfExists` is suppressed while antiRecall=true
+  await recallService.deleteMessageResourceIfExists({{ msgId: 'm_500' }});
+  const deletedWhileOn = deletedFiles;
+
+  // 2. Verify `convertToRecalled` marks `__olazRecalled` without clobbering text
+  const sampleConvert = {{ msgId: 'm_conv', cliMsgId: 'c_conv', msgType: 1, message: 'Giữ nguyên chữ' }};
+  const convertedOut = recallService.convertToRecalled(sampleConvert);
+
+  // 3. Dispatch SIMULATE_UNDO on Redux store -> shadow cache restores original text, quote, localPath
+  reduxStore.dispatch({{ type: 'SIMULATE_UNDO' }});
+  const afterUndoMsg = state.conversations.alls.conv_1.messages[0];
+  const afterUndoReply = state.conversations.alls.conv_1.messages[1];
+
+  // Wait for `flushStoreSync` (250ms debounce)
+  await new Promise((r) => setTimeout(r, 320));
+
+  // 4. Run DOM pass and verify:
+  //    - `.olaz-is-recalled`, `.olaz-recalled-badge`, `.olaz-recovered-text`
+  //    - `"Giữ thu hồi"` `menuitemcheckbox` injected inside `.zmenu-body` before `div_CX_Delete`
+  //    - `#olaz-sidebar-accounts` + `#olaz-sidebar-add-account` injected inside `#main-tab`
+  window.__olazSetAccounts({{
+    selfSlug: 'default',
+    activeSlug: 'default',
+    accounts: [
+      {{ slug: 'default', name: 'Khv', initials: 'KH', unread: 0, shortcutIndex: 1 }},
+      {{ slug: 'account-2', name: 'Shop Phụ', initials: 'SP', unread: 5, shortcutIndex: 2 }},
+    ],
+  }});
+  window.__olazSetCallRecording({{
+    dir: '/mnt/data/CallRecordings',
+    defaultDir: '/home/user/.local/share/olaz/recordings',
+    isCustom: true,
+  }});
+  window.__olazRefreshAntiRecallDom();
+
+  const hasStyleTag = Boolean(document.getElementById('olaz-anti-recall-style'));
+  const hasLegacyTitlebarTools = Boolean(document.getElementById('olaz-titlebar-tools'));
+  const badgeOnNormal = cardNormal.querySelector('.olaz-recalled-badge');
+  const recoveredOnUndo = cardUndo.querySelector('.olaz-recovered-text');
+  const classWhileOn = bubbleNormal.classList.contains('olaz-is-recalled');
+
+  const cxBtn = cxMenu.querySelector('.olaz-cx-antirecall');
+  const cxRole = cxBtn ? cxBtn.getAttribute('role') : null;
+  const cxCheckedInitial = cxBtn ? cxBtn.getAttribute('aria-checked') : null;
+  const cxLabel = cxBtn && cxBtn.querySelector('.olaz-cx-label') ? cxBtn.querySelector('.olaz-cx-label').textContent : null;
+  const cxBtnIdx = cxBtn ? cxList.children.indexOf(cxBtn) : -1;
+  const cxDelIdx = cxList.children.indexOf(cxDelete);
+
+  const sidebarWrap = document.getElementById('olaz-sidebar-accounts');
+  const sidebarParentIsMainTop = Boolean(sidebarWrap && sidebarWrap.parentNode === mainTabTopGroup);
+  const sidebarAddBtn = document.getElementById('olaz-sidebar-add-account');
+  const sidebarOtherBtn = sidebarWrap ? sidebarWrap.querySelector('[data-account-slug="account-2"]') : null;
+  const sidebarBadgeText = sidebarOtherBtn && sidebarOtherBtn.querySelector('.olaz-sidebar-badge')
+    ? sidebarOtherBtn.querySelector('.olaz-sidebar-badge').textContent
+    : null;
+  if (sidebarOtherBtn) sidebarOtherBtn.click();
+  if (sidebarAddBtn) sidebarAddBtn.click();
+
+  const callRecSec = document.getElementById('olaz-call-recording-section');
+  const callRecMountedAfterCamera = Boolean(
+    callRecSec
+    && callRecSec.parentNode === callSettingsBottom
+    && callSettingsBottom.children.indexOf(callRecSec) > callSettingsBottom.children.indexOf(camSection)
+  );
+  const callRecPathText = document.getElementById('olaz-call-recording-path')?.textContent || null;
+  const callRecOpenBtn = callRecSec ? callRecSec.querySelector('[data-action="open"]') : null;
+  const callRecChangeBtn = callRecSec ? callRecSec.querySelector('[data-action="change"]') : null;
+  const callRecResetBtn = callRecSec ? callRecSec.querySelector('[data-action="reset"]') : null;
+  if (callRecOpenBtn) callRecOpenBtn.click();
+  if (callRecChangeBtn) callRecChangeBtn.click();
+  if (callRecResetBtn) callRecResetBtn.click();
+
+  // 5. Click `"Giữ thu hồi"` in the `"..."` bubble menu -> toggles antiRecall OFF, updates aria-checked,
+  //    removes badges & classes, emits `uiAction: 'toggleAntiRecall'`, and restores deleteMessageResourceIfExists!
+  if (cxBtn) cxBtn.click();
+  const cxCheckedAfterClick = cxBtn ? cxBtn.getAttribute('aria-checked') : null;
+  const classAfterOff = bubbleNormal.classList.contains('olaz-is-recalled');
+  const badgesAfterOff = document.querySelectorAll('.olaz-recalled-badge, .olaz-recovered-text').length;
+  await recallService.deleteMessageResourceIfExists({{ msgId: 'm_500' }});
+  const deletedAfterOff = deletedFiles;
+
+  const uiActions = zstateEvents.filter((e) => e && e.uiAction).map((e) => e);
+  const chatEvents = zstateEvents.filter((e) => e && e.chat && e.chat.convId === 'conv_1');
+  const lastChatMsg = chatEvents.length ? chatEvents[chatEvents.length - 1].chat.messages[0] : null;
+
+  console.log(JSON.stringify({{
+    defaultAntiRecallOnBoot,
+    workerBcCountWhileOn,
+    workerAntiRecallWhileOn,
+    workerAntiRecallAfterOff: workerBcMessages[workerBcMessages.length - 1]?.anti_recall,
+    shadowHasMsgId: window.__olazMsgShadow.has('m_500'),
+    shadowHasCliId: window.__olazMsgShadow.has('c_500'),
+    deletedWhileOn,
+    deletedAfterOff,
+    convertedOut,
+    afterUndoMsg,
+    afterUndoReply,
+    recalledIdRecorded: window.__olazRecalledIds.has('m_500') && window.__olazRecalledIds.has('c_500'),
+    hasStyleTag,
+    hasLegacyTitlebarTools,
+    classWhileOn,
+    badgeText: badgeOnNormal ? badgeOnNormal.textContent : null,
+    recoveredText: recoveredOnUndo ? recoveredOnUndo.textContent : null,
+    cxRole,
+    cxCheckedInitial,
+    cxCheckedAfterClick,
+    cxLabel,
+    cxBeforeDelete: cxBtnIdx > 0 && cxBtnIdx < cxDelIdx,
+    sidebarParentIsMainTop,
+    hasSidebarAddBtn: Boolean(sidebarAddBtn),
+    sidebarBadgeText,
+    callRecMountedAfterCamera,
+    callRecPathText,
+    uiActions,
+    classAfterOff,
+    badgesAfterOff,
+    lastChatMsg,
+  }}));
+  process.exit(0);
+}})();
+"#,
+        bridge_spec = find_script("bridge-spec"),
+        local_modules = find_script("local-modules"),
+        direct_ui = find_script("linux-direct-ui"),
+        bridge_js = find_script("bridge"),
+    );
+
+    let res = run_node_json(&script);
+    assert_eq!(res["defaultAntiRecallOnBoot"], true);
+    assert!(res["workerBcCountWhileOn"].as_u64().unwrap() >= 2);
+    assert_eq!(res["workerAntiRecallWhileOn"], true);
+    assert_eq!(res["workerAntiRecallAfterOff"], false);
+    assert_eq!(res["shadowHasMsgId"], true);
+    assert_eq!(res["shadowHasCliId"], true);
+    assert_eq!(res["deletedWhileOn"], 0);
+    assert_eq!(res["deletedAfterOff"], 1);
+
+    assert_eq!(res["convertedOut"]["msgType"], 1);
+    assert_eq!(res["convertedOut"]["message"], "Giữ nguyên chữ");
+    assert_eq!(res["convertedOut"]["__olazRecalled"], true);
+
+    assert_eq!(res["afterUndoMsg"]["msgType"], 1);
+    assert_eq!(
+        res["afterUndoMsg"]["message"],
+        "Tin nhắn gốc sẽ bị thu hồi"
+    );
+    assert_eq!(
+        res["afterUndoMsg"]["localPath"],
+        "/tmp/zalo/voice_500.aac"
+    );
+    assert_eq!(
+        res["afterUndoMsg"]["quote"]["msg"],
+        "Trích dẫn ban đầu"
+    );
+    assert_eq!(res["afterUndoMsg"]["__olazRecalled"], true);
+    assert_eq!(
+        res["afterUndoReply"]["quote"]["msg"],
+        "Câu được trích dẫn"
+    );
+    assert_eq!(res["afterUndoReply"]["quote"]["__olazQuoteRecalled"], true);
+    assert_eq!(res["recalledIdRecorded"], true);
+
+    assert_eq!(res["hasStyleTag"], true);
+    assert_eq!(res["hasLegacyTitlebarTools"], false);
+    assert_eq!(res["classWhileOn"], true);
+    assert_eq!(res["badgeText"], "Đã thu hồi");
+    assert_eq!(res["recoveredText"], "Tin nhắn gốc sẽ bị thu hồi");
+    assert_eq!(res["cxRole"], "menuitemcheckbox");
+    assert_eq!(res["cxCheckedInitial"], "true");
+    assert_eq!(res["cxCheckedAfterClick"], "false");
+    assert_eq!(res["cxLabel"], "Giữ thu hồi");
+    assert_eq!(res["cxBeforeDelete"], true);
+    assert_eq!(res["sidebarParentIsMainTop"], true);
+    assert_eq!(res["hasSidebarAddBtn"], true);
+    assert_eq!(res["sidebarBadgeText"], "5");
+    assert_eq!(res["callRecMountedAfterCamera"], true);
+    assert_eq!(res["callRecPathText"], "/mnt/data/CallRecordings");
+    assert_eq!(
+        res["uiActions"],
+        json!([
+            { "uiAction": "queryCallRecordingsDir" },
+            { "uiAction": "switchAccount", "slug": "account-2" },
+            { "uiAction": "addAccount" },
+            { "uiAction": "openCallRecordingsDir" },
+            { "uiAction": "chooseCallRecordingsDir" },
+            { "uiAction": "resetCallRecordingsDir" },
+            { "uiAction": "toggleAntiRecall", "enabled": false },
+        ])
+    );
+    assert_eq!(res["classAfterOff"], false);
+    assert_eq!(res["badgesAfterOff"], 0);
+
+    // `flushStoreSync` preserves text while marking `recalled: true` so autoreply ignores it!
+    assert_eq!(
+        res["lastChatMsg"]["text"],
+        "Tin nhắn gốc sẽ bị thu hồi"
+    );
+    assert_eq!(res["lastChatMsg"]["recalled"], true);
+}
+
+// ============================================================================
+// 9. Track C (Multi-Account): `ProfileRegistry` & Profile-Scoped `KeychainCipher`
+// ============================================================================
+
+#[test]
+fn profile_registry_persistence_slug_allocation_discovery_and_legacy_migration() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("olaz");
+
+    // 1. Seed a legacy split-brain `profiles/profile-2/share/olaz/ZaloData` directory AND a CLI `work` profile
+    let legacy_zdata = root.join("profiles/profile-2/share/olaz/ZaloData");
+    std::fs::create_dir_all(&legacy_zdata).unwrap();
+    std::fs::write(legacy_zdata.join("Partitions.json"), b"{\"migrated\":true}").unwrap();
+
+    let cli_work_zdata = root.join("profiles/work/ZaloData");
+    std::fs::create_dir_all(&cli_work_zdata).unwrap();
+
+    // 2. `load_or_discover` migrates legacy `share/olaz/ZaloData` -> `profiles/profile-2/ZaloData` and merges CLI profiles
+    let mut reg = olaz_core::ProfileRegistry::load_or_discover(&root);
+    assert!(
+        root.join("profiles/profile-2/ZaloData/Partitions.json")
+            .is_file(),
+        "legacy split-brain ZaloData must be migrated into profiles/profile-2/ZaloData"
+    );
+
+    let slugs: Vec<String> = reg.profiles.iter().map(|p| p.slug.clone()).collect();
+    assert!(slugs.contains(&"default".to_string()));
+    assert!(slugs.contains(&"profile-2".to_string()));
+    assert!(slugs.contains(&"work".to_string()));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let reg_path = olaz_core::ProfileRegistry::registry_path(&root);
+        assert!(reg_path.is_file());
+        let mode = std::fs::metadata(&reg_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "profiles.json must be saved with 0600 permissions");
+    }
+
+    // 3. Allocate fresh sequential slugs (`account-2`, `account-3`)
+    let s2 = reg.allocate_new_slug();
+    assert_eq!(s2, "account-2");
+    reg.ensure_profile(&s2).unwrap();
+    let s3 = reg.allocate_new_slug();
+    assert_eq!(s3, "account-3");
+    reg.ensure_profile(&s3).unwrap();
+
+    // 4. Identity update, duplicate-UID detection (`find_other_by_uid`), labels & initials
+    assert!(reg.update_identity(
+        "account-2",
+        Some("zuid_888"),
+        Some("Nguyễn Văn B"),
+        Some("https://ava.zalo.me/b.jpg"),
+    ));
+    assert_eq!(
+        reg.find_other_by_uid("account-3", "zuid_888")
+            .map(|p| p.slug.as_str()),
+        Some("account-2")
+    );
+    assert!(reg.find_other_by_uid("account-2", "zuid_888").is_none());
+
+    let meta_acc2 = reg.profiles.iter().find(|p| p.slug == "account-2").unwrap();
+    assert_eq!(meta_acc2.effective_name(), "Nguyễn Văn B");
+    assert_eq!(meta_acc2.initials(), "NB");
+
+    reg.set_label("account-2", Some("Shop Phụ".into()));
+    reg.active_slug = "account-2".to_string();
+    reg.save_to(&root).unwrap();
+
+    let reloaded = olaz_core::ProfileRegistry::load_or_discover(&root);
+    assert_eq!(reloaded.active_slug, "account-2");
+    let reloaded_acc2 = reloaded
+        .profiles
+        .iter()
+        .find(|p| p.slug == "account-2")
+        .unwrap();
+    assert_eq!(reloaded_acc2.effective_name(), "Shop Phụ");
+    assert_eq!(reloaded_acc2.zalo_uid.as_deref(), Some("zuid_888"));
+}
+
+#[tokio::test]
+async fn keychain_cipher_with_profile_isolates_accounts_and_keeps_default_backward_compatible() {
+    // Subprocess branch for headless `LinuxSecretBackend::with_profile` keyfile isolation
+    if std::env::var("OLAZ_SUBTEST_PROFILE_KEYFILE").as_deref() == Ok("1") {
+        let dir = PathBuf::from(std::env::var("OLAZ_SUBTEST_DIR").unwrap());
+        let c_def = KeychainCipher::with_profile(&dir, "default");
+        let c_acc2 = KeychainCipher::with_profile(&dir, "account-2");
+
+        let ct_def = c_def.encrypt("headless", &[b"default-secret"]).await.unwrap();
+        let ct_acc2 = c_acc2.encrypt("headless", &[b"acc2-secret"]).await.unwrap();
+
+        assert!(dir.join("keys/zprotocol.headless.key").is_file());
+        assert!(
+            dir.join("keys/profile.account-2.zprotocol.headless.key")
+                .is_file()
+        );
+        assert!(c_acc2.decrypt("headless", &ct_def).await.is_err());
+        assert_eq!(
+            c_acc2.decrypt("headless", &ct_acc2).await.unwrap()[0],
+            b"acc2-secret"
+        );
+        return;
+    }
+
+    // 1. In-memory shared `SecretBackend` verifying backward-compatible `"default"` attribute
+    //    (`"zprotocol.<id>"`) vs isolated secondary profile (`"profile.<slug>.zprotocol.<id>"`).
+    let shared_mem = Arc::new(MemorySecretBackend::new());
+    let cipher_legacy = KeychainCipher::new(Arc::clone(&shared_mem));
+    let cipher_default = KeychainCipher::new_with_profile(Arc::clone(&shared_mem), "default");
+    let cipher_acc2 = KeychainCipher::new_with_profile(Arc::clone(&shared_mem), "account-2");
+
+    assert_eq!(
+        cipher_default.account_for_identifier("ZaloDB"),
+        "zprotocol.zalodb"
+    );
+    assert_eq!(
+        cipher_acc2.account_for_identifier("ZaloDB"),
+        "profile.account-2.zprotocol.zalodb"
+    );
+
+    let sealed_legacy = cipher_legacy
+        .encrypt("ZaloDB", &[b"legacy-default-db-key"])
+        .await
+        .unwrap();
+    // `with_profile(..., "default")` is 100% compatible with existing `KeychainCipher::new` vaults!
+    let opened_by_default = cipher_default
+        .decrypt("ZaloDB", &sealed_legacy)
+        .await
+        .unwrap();
+    assert_eq!(opened_by_default[0], b"legacy-default-db-key");
+
+    // Secondary profile mints its own independent key and cannot read or overwrite `"default"`'s key!
+    let sealed_acc2 = cipher_acc2
+        .encrypt("ZaloDB", &[b"account-2-db-key"])
+        .await
+        .unwrap();
+    assert!(matches!(
+        cipher_acc2.decrypt("ZaloDB", &sealed_legacy).await,
+        Err(VaultError::InvalidMac)
+    ));
+    assert_eq!(
+        cipher_acc2.decrypt("ZaloDB", &sealed_acc2).await.unwrap()[0],
+        b"account-2-db-key"
+    );
+    // And `"default"`'s key is still intact!
+    assert_eq!(
+        cipher_default
+            .decrypt("ZaloDB", &sealed_legacy)
+            .await
+            .unwrap()[0],
+        b"legacy-default-db-key"
+    );
+
+    // 2. Verify headless `LinuxSecretBackend::with_profile` file scoping in an isolated non-DBus subprocess
+    let tmp = TempDir::new().unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let status = Command::new(exe)
+        .arg("--exact")
+        .arg("keychain_cipher_with_profile_isolates_accounts_and_keeps_default_backward_compatible")
+        .env("OLAZ_SUBTEST_PROFILE_KEYFILE", "1")
+        .env("OLAZ_SUBTEST_DIR", tmp.path())
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/nonexistent/olaz-no-dbus.sock",
+        )
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "profile-scoped headless keyfile subprocess test failed"
+    );
+}
+
+

@@ -5,6 +5,7 @@ members = [
     "crates/olaz-net",
     "crates/olaz-linux",
     "crates/olaz-app",
+    "crates/olaz-web",
 ]
 default-members = ["crates/olaz-app"]
 

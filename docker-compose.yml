@@ -1,0 +1,65 @@
+# ==============================================================================
+# Olaz Web (`olaz-web`) — Turnkey Zero-Server-Persistence Docker Compose Stack
+# ==============================================================================
+#
+# Quick start:
+#   OLAZ_WEB_TOKEN="your-secret-passphrase" docker compose up -d --build
+#
+# How zero-persistence is enforced:
+#   1. `olaz-asar-init` runs once at startup to fetch & SHA-256 verify the
+#      official VNG `app.asar` client bundle into the `olaz_bundle` volume, then exits.
+#   2. `olaz-web` runs with `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`,
+#      `core: 0`, and mounts `olaz_bundle` strictly `:ro` (read-only) — zero writable
+#      disks or volumes exist inside the running server container. All login cookies,
+#      keys, and chat history live exclusively in your browser (IndexedDB/OPFS).
+# ==============================================================================
+
+services:
+  olaz-asar-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: olaz-web:latest
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        if [ ! -s /bundle/current/Contents/Resources/app.asar ]; then
+          /usr/local/bin/olaz-web --fetch-asar /bundle
+          chmod -R a+rX /bundle
+        fi
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=1536m
+    volumes:
+      - olaz_bundle:/bundle
+    restart: "no"
+
+  olaz-web:
+    image: olaz-web:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      olaz-asar-init:
+        condition: service_completed_successfully
+    read_only: true
+    user: "65532:65532"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core: 0
+    environment:
+      OLAZ_WEB_LISTEN: "0.0.0.0:8080"
+      OLAZ_ASAR_PATH: "/opt/olaz-bundle/current/Contents/Resources/app.asar"
+      OLAZ_WEB_TOKEN: "${OLAZ_WEB_TOKEN:-}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    ports:
+      - "${OLAZ_WEB_BIND:-127.0.0.1:8080}:8080"
+    volumes:
+      - olaz_bundle:/opt/olaz-bundle:ro
+    restart: unless-stopped
+
+volumes:
+  olaz_bundle:

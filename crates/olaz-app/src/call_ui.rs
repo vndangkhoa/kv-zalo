@@ -1,5 +1,5 @@
 //! Self-contained GTK3 + WebKit2GTK VoIP Call UI controller (`CallUiController`) managing the
-//! 3 frameless call windows (`call`: `456x720` / `640x720` video `always_on_top`,
+//! 3 frameless call windows (`call`: `496x720` / `640x720` video `always_on_top`,
 //! `incoming`: `360x560` `always_on_top`, `devices`: `420x600`).
 
 #![allow(dead_code)]
@@ -8,13 +8,15 @@ use base64::Engine as _;
 use gtk::prelude::*;
 use javascriptcore::ValueExt as JscValueExt;
 use olaz_linux::call::{
-    get_ui_asset, AudioDeviceList, CallPartnerInfo, CallUiEvent, OlazCallEngine, CALL_UI_CALL_URL,
-    CALL_UI_DEVICES_URL, CALL_UI_INCOMING_URL, CALL_UI_SCHEME, PRELOAD_BRIDGE_JS,
+    default_recordings_dir, get_ui_asset, AudioDeviceList, CallPartnerInfo, CallUiEvent,
+    OlazCallEngine, CALL_UI_CALL_URL, CALL_UI_DEVICES_URL, CALL_UI_INCOMING_URL, CALL_UI_SCHEME,
+    PRELOAD_BRIDGE_JS,
 };
 use serde_json::{json, Value};
 use soup::{MessageHeaders, MessageHeadersType};
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,8 +28,8 @@ use webkit2gtk::{
     UserScriptInjectionTime, WebContext, WebContextExt, WebView, WebViewExt,
 };
 
-/// Audio call window dimensions (`456x720`).
-pub const CALL_WINDOW_AUDIO_WIDTH: i32 = 456;
+/// Audio call window dimensions (`496x720`).
+pub const CALL_WINDOW_AUDIO_WIDTH: i32 = 496;
 pub const CALL_WINDOW_HEIGHT: i32 = 720;
 /// Video / screen-share call window dimensions (`640x720`).
 pub const CALL_WINDOW_VIDEO_WIDTH: i32 = 640;
@@ -90,6 +92,7 @@ pub struct CallUiController {
     last_partner: RefCell<Option<CallPartnerInfo>>,
     last_state: RefCell<Option<Value>>,
     last_devices: RefCell<Option<AudioDeviceList>>,
+    last_recording: RefCell<Option<Value>>,
     last_local_frame_at: Cell<Option<Instant>>,
     last_remote_frame_at: Cell<Option<Instant>>,
 }
@@ -108,6 +111,7 @@ impl CallUiController {
             last_partner: RefCell::new(None),
             last_state: RefCell::new(None),
             last_devices: RefCell::new(None),
+            last_recording: RefCell::new(None),
             last_local_frame_at: Cell::new(None),
             last_remote_frame_at: Cell::new(None),
         })
@@ -275,6 +279,25 @@ impl CallUiController {
                 });
                 dispatch_to_window(w, "videoFrame", &payload);
             }
+            CallUiEvent::SetRecording {
+                active,
+                started_at_ms,
+                path,
+                format,
+                error,
+            } => {
+                let payload = json!({
+                    "active": active,
+                    "startedAtMs": started_at_ms,
+                    "path": path,
+                    "format": format,
+                    "error": error,
+                });
+                *self.last_recording.borrow_mut() = Some(payload.clone());
+                if let Some(ref w) = *self.call_win.borrow() {
+                    dispatch_to_window(w, "recording", &payload);
+                }
+            }
             CallUiEvent::CloseIncoming => {
                 if let Some(w) = self.incoming_win.borrow_mut().take() {
                     w.destroy_quietly();
@@ -289,6 +312,7 @@ impl CallUiController {
                 }
                 *self.last_partner.borrow_mut() = None;
                 *self.last_state.borrow_mut() = None;
+                *self.last_recording.borrow_mut() = None;
             }
         }
     }
@@ -426,6 +450,11 @@ impl CallUiController {
                     }
                 }
             }
+            if matches!(kind, ManagedWindowKind::Call) {
+                if let Some(ref rec) = *ctrl.last_recording.borrow() {
+                    dispatch_to_window(&mw, "recording", rec);
+                }
+            }
         });
 
         // Route `window.zcallUI.action(action, value)` via `UserContentManager` `"zcallUi"`.
@@ -546,6 +575,9 @@ impl CallUiController {
                 self.handle_event(CallUiEvent::OpenDevices);
                 self.emit_action("openDevices", Value::Null);
             }
+            "openRecordingFolder" => {
+                open_recording_parent_folder(&value);
+            }
             other => {
                 self.emit_action(other, value);
             }
@@ -558,6 +590,40 @@ impl CallUiController {
             h(action, value);
         }
     }
+}
+
+fn open_recording_parent_folder(value: &Value) {
+    let raw_path = value
+        .as_str()
+        .or_else(|| value.get("path").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let target_dir = match raw_path {
+        Some(raw) => {
+            let p = Path::new(raw);
+            if p.is_dir() {
+                p.to_path_buf()
+            } else {
+                p.parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(default_recordings_dir)
+            }
+        }
+        None => default_recordings_dir(),
+    };
+
+    if !target_dir.exists() {
+        return;
+    }
+
+    let _ = Command::new("xdg-open")
+        .arg(&target_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 fn dispatch_to_window(win: &ManagedCallWindow, channel: &str, payload: &Value) {

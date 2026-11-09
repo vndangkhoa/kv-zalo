@@ -1,0 +1,51 @@
+[package]
+name = "olaz-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Olaz — Stateless zero-server-persistence self-hosted web relay & browser host runtime"
+default-run = "olaz-web"
+
+[[bin]]
+name = "olaz-web"
+path = "src/main.rs"
+
+[dependencies]
+olaz-core.workspace = true
+olaz-net.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+once_cell.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+mime_guess.workspace = true
+uuid.workspace = true
+regex.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true
+cookie_store.workspace = true
+cookie.workspace = true
+tokio-tungstenite.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+hickory-resolver.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+md-5.workspace = true
+digest.workspace = true
+subtle.workspace = true
+base64.workspace = true
+hex.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

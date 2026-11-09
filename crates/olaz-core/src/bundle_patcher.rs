@@ -77,6 +77,22 @@ pub const WORKER_PRELUDE_BASE: &str = r#"(() => {
     const imp = self.importScripts;
     self.importScripts = function (...urls) { const r = imp.apply(this, urls); if (urls.some((u) => /sync-v2-sub-worker/.test(String(u)))) ensureDatabaseClient(); return r; };
   }
+  let __olazAntiRecall = self.__olazAntiRecall !== undefined ? Boolean(self.__olazAntiRecall) : true;
+  self.__olazSetAntiRecall = (v) => { __olazAntiRecall = Boolean(v); return __olazAntiRecall; };
+  self.__olazGetAntiRecall = () => __olazAntiRecall;
+  if (typeof BroadcastChannel === 'function') {
+    try {
+      const bc = new BroadcastChannel('olaz_privacy');
+      if (typeof bc.unref === 'function') bc.unref();
+      bc.onmessage = (ev) => {
+        const d = ev && ev.data;
+        if (d && d.type === 'privacy_update') {
+          __olazAntiRecall = Boolean(d.anti_recall !== undefined ? d.anti_recall : d.antiRecall);
+        }
+      };
+      bc.postMessage({ type: 'request_privacy' });
+    } catch {}
+  }
   if (typeof IDBDatabase !== 'undefined') {
     const tx = IDBDatabase.prototype.transaction;
     IDBDatabase.prototype.transaction = function (...a) {
@@ -84,11 +100,187 @@ pub const WORKER_PRELUDE_BASE: &str = r#"(() => {
       t.addEventListener('abort', () => fwd('idb-abort', errText(t.error)));
       return t;
     };
-    for (const m of ['add', 'put']) {
-      const o = IDBObjectStore.prototype[m];
-      IDBObjectStore.prototype[m] = function (...a) {
-        try { const r = o.apply(this, a); r.addEventListener('error', () => fwd('idb-' + m + '-error', this.name + ' ' + errText(r.error))); return r; }
-        catch (e) { fwd('idb-' + m + '-throw', this.name + ' ' + errText(e)); throw e; }
+    const origAdd = IDBObjectStore.prototype.add;
+    if (typeof origAdd === 'function') {
+      IDBObjectStore.prototype.add = function (...a) {
+        try {
+          const r = origAdd.apply(this, a);
+          if (r && typeof r.addEventListener === 'function') {
+            r.addEventListener('error', () => fwd('idb-add-error', this.name + ' ' + errText(r.error)));
+          }
+          return r;
+        } catch (e) {
+          fwd('idb-add-throw', this.name + ' ' + errText(e));
+          throw e;
+        }
+      };
+    }
+    const origPut = IDBObjectStore.prototype.put;
+    if (typeof origPut === 'function') {
+      const callOrigPut = (store, val, k, hasKey) => {
+        try {
+          const r = hasKey && k !== undefined ? origPut.call(store, val, k) : origPut.call(store, val);
+          if (r && typeof r.addEventListener === 'function') {
+            r.addEventListener('error', () => fwd('idb-put-error', store.name + ' ' + errText(r.error)));
+          }
+          return r;
+        } catch (e) {
+          fwd('idb-put-throw', store.name + ' ' + errText(e));
+          throw e;
+        }
+      };
+      const attachIdbHandlers = (req, onDone, onFail) => {
+        let settled = false;
+        const done = (ev) => {
+          if (settled) return;
+          settled = true;
+          onDone(req ? req.result : undefined, ev);
+        };
+        const fail = (ev) => {
+          if (settled) return;
+          settled = true;
+          onFail((req && req.error) || (ev && ev.error) || new Error('IDB request failed'), ev);
+        };
+        if (!req) {
+          done(null);
+          return;
+        }
+        if (req.readyState === 'done') {
+          if (req.error) fail(null);
+          else done(null);
+          return;
+        }
+        if (typeof req.addEventListener === 'function') {
+          req.addEventListener('success', done);
+          req.addEventListener('error', fail);
+        }
+        const prevSucc = req.onsuccess;
+        req.onsuccess = function (ev) {
+          if (typeof prevSucc === 'function') { try { prevSucc.call(this, ev); } catch {} }
+          done(ev);
+        };
+        const prevErr = req.onerror;
+        req.onerror = function (ev) {
+          if (typeof prevErr === 'function') { try { prevErr.call(this, ev); } catch {} }
+          fail(ev);
+        };
+      };
+      const createDeferredIdbRequest = (store) => {
+        const listeners = { success: [], error: [] };
+        let onsuccessFn = null;
+        let onerrorFn = null;
+        const proxy = {
+          source: store,
+          transaction: store.transaction || null,
+          readyState: 'pending',
+          result: undefined,
+          error: null,
+          get onsuccess() { return onsuccessFn; },
+          set onsuccess(fn) { onsuccessFn = typeof fn === 'function' ? fn : null; },
+          get onerror() { return onerrorFn; },
+          set onerror(fn) { onerrorFn = typeof fn === 'function' ? fn : null; },
+          addEventListener(type, fn) {
+            if (typeof fn === 'function' && listeners[type]) listeners[type].push(fn);
+          },
+          removeEventListener(type, fn) {
+            if (listeners[type]) {
+              const idx = listeners[type].indexOf(fn);
+              if (idx >= 0) listeners[type].splice(idx, 1);
+            }
+          },
+        };
+        const resolveProxy = (res) => {
+          proxy.readyState = 'done';
+          proxy.result = res;
+          const ev = { type: 'success', target: proxy, currentTarget: proxy };
+          for (const fn of listeners.success.slice()) { try { fn.call(proxy, ev); } catch {} }
+          if (onsuccessFn) { try { onsuccessFn.call(proxy, ev); } catch {} }
+        };
+        const rejectProxy = (err) => {
+          proxy.readyState = 'done';
+          proxy.error = err;
+          const ev = { type: 'error', error: err, target: proxy, currentTarget: proxy };
+          for (const fn of listeners.error.slice()) { try { fn.call(proxy, ev); } catch {} }
+          if (onerrorFn) { try { onerrorFn.call(proxy, ev); } catch {} }
+        };
+        return { proxy, resolveProxy, rejectProxy };
+      };
+      IDBObjectStore.prototype.put = function (value, key) {
+        const store = this;
+        const hasKey = arguments.length >= 2 && key !== undefined;
+        if (__olazAntiRecall && store && store.name === 'message' && value && typeof value === 'object' && typeof store.get === 'function') {
+          const isRecallTombstone = (Number(value.msgType) === 20 || Number(value.msgType) === -27 || value.originMsgType === 'chat.undo') && !value.__olazPreserved;
+          const isQuoteWiping = Boolean(value.quote && (Number(value.quote.cliMsgType) === 20 || Number(value.quote.cliMsgType) === -27) && !value.__olazQuoteChecked);
+          if (isRecallTombstone || isQuoteWiping) {
+            const lookupKey = key !== undefined
+              ? key
+              : (Array.isArray(store.keyPath) ? store.keyPath.map((k) => value[k]) : value[store.keyPath || 'msgId']);
+            const validKey = Array.isArray(lookupKey)
+              ? lookupKey.every((part) => part !== undefined && part !== null)
+              : (lookupKey !== undefined && lookupKey !== null);
+            if (validKey) {
+              try {
+                const { proxy, resolveProxy, rejectProxy } = createDeferredIdbRequest(store);
+                const getReq = store.get(lookupKey);
+                attachIdbHandlers(
+                  getReq,
+                  (prev) => {
+                    let nextVal = value;
+                    if (isRecallTombstone) {
+                      if (prev && Number(prev.msgType) !== 20 && Number(prev.msgType) !== -27 && prev.message !== undefined) {
+                        nextVal = Object.assign({}, nextVal, {
+                          msgType: prev.msgType,
+                          message: prev.message,
+                          properties: prev.properties !== undefined ? prev.properties : nextVal.properties,
+                          thumb: prev.thumb || nextVal.thumb,
+                          localPath: prev.localPath || nextVal.localPath,
+                          folderPath: prev.folderPath || nextVal.folderPath,
+                          quote: prev.quote || nextVal.quote,
+                          mentions: prev.mentions || nextVal.mentions,
+                          e2eeStatus: prev.e2eeStatus,
+                          __olazPresalledType: Number(value.msgType),
+                          __olazRecalled: true,
+                          __olazRecalledAt: Date.now(),
+                          __olazPreserved: true,
+                        });
+                      } else {
+                        nextVal = Object.assign({}, nextVal, { __olazPreserved: true });
+                      }
+                    }
+                    if (nextVal.quote && (Number(nextVal.quote.cliMsgType) === 20 || Number(nextVal.quote.cliMsgType) === -27) && !nextVal.__olazQuoteChecked) {
+                      if (prev && prev.quote && Number(prev.quote.cliMsgType) !== 20 && Number(prev.quote.cliMsgType) !== -27 && prev.quote.msg) {
+                        nextVal = Object.assign({}, nextVal, {
+                          quote: Object.assign({}, prev.quote, { __olazQuoteRecalled: true }),
+                          __olazQuoteChecked: true,
+                        });
+                      } else {
+                        nextVal = Object.assign({}, nextVal, { __olazQuoteChecked: true });
+                      }
+                    }
+                    try {
+                      const putReq = callOrigPut(store, nextVal, key, hasKey);
+                      attachIdbHandlers(putReq, resolveProxy, rejectProxy);
+                    } catch (putErr) {
+                      rejectProxy(putErr);
+                    }
+                  },
+                  () => {
+                    try {
+                      const putReq = callOrigPut(store, value, key, hasKey);
+                      attachIdbHandlers(putReq, resolveProxy, rejectProxy);
+                    } catch (putErr) {
+                      rejectProxy(putErr);
+                    }
+                  },
+                );
+                return proxy;
+              } catch (guardErr) {
+                fwd('idb-antirecall-fallback', errText(guardErr));
+              }
+            }
+          }
+        }
+        return callOrigPut(store, value, key, hasKey);
       };
     }
     const open = IDBFactory.prototype.open;
@@ -822,16 +1014,1231 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
   }
   const path = local['$znode.path'];
 
-  // 0. Live Privacy Receipt Blocker (`window.__olazPrivacy` / `window.__olazSetPrivacy`)
+  // 0. Live Privacy Receipt Blocker + Anti-Recall Engine (`window.__olazPrivacy` / `window.__olazSetPrivacy`)
   const PRIVACY_OK_BODY = '{"error_code":0,"error_message":"Successful.","data":""}';
-  window.__olazPrivacy = Object.assign(
-    { blockTyping: false, blockSeen: false, blockDelivered: false },
-    (window.__olazPrivacy && typeof window.__olazPrivacy === 'object') ? window.__olazPrivacy : {},
+  const nativeFetchBase = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+  const normalizePrivacyState = (target, src) => {
+    const t = target || {};
+    const s = (src && typeof src === 'object') ? src : {};
+    if ('blockTyping' in s || 'block_typing' in s) {
+      const v = Boolean(s.blockTyping !== undefined ? s.blockTyping : s.block_typing);
+      t.blockTyping = v;
+      t.block_typing = v;
+    }
+    if ('blockSeen' in s || 'block_seen' in s) {
+      const v = Boolean(s.blockSeen !== undefined ? s.blockSeen : s.block_seen);
+      t.blockSeen = v;
+      t.block_seen = v;
+    }
+    if ('blockDelivered' in s || 'block_delivered' in s) {
+      const v = Boolean(s.blockDelivered !== undefined ? s.blockDelivered : s.block_delivered);
+      t.blockDelivered = v;
+      t.block_delivered = v;
+    }
+    if ('antiRecall' in s || 'anti_recall' in s) {
+      const v = Boolean(s.antiRecall !== undefined ? s.antiRecall : s.anti_recall);
+      t.antiRecall = v;
+      t.anti_recall = v;
+    }
+    return t;
+  };
+  const initialPriv = (window.__olazPrivacy && typeof window.__olazPrivacy === 'object') ? window.__olazPrivacy : {};
+  window.__olazPrivacy = normalizePrivacyState(
+    {
+      blockTyping: false,
+      block_typing: false,
+      blockSeen: false,
+      block_seen: false,
+      blockDelivered: false,
+      block_delivered: false,
+      antiRecall: true,
+      anti_recall: true,
+    },
+    initialPriv,
   );
+
+  const SHADOW_MAX_ENTRIES = 10000;
+  const RECALLED_IDS_MAX = 20000;
+  const MEDIA_CACHE_MAX_ENTRIES = 150;
+  const MEDIA_CACHE_MAX_BYTES = 15 * 1024 * 1024;
+  if (!(window.__olazMsgShadow instanceof Map)) window.__olazMsgShadow = new Map();
+  if (!(window.__olazRecalledIds instanceof Map)) window.__olazRecalledIds = new Map();
+  const antiRecallMediaMem = new Map();
+  const antiRecallMediaPending = new Set();
+  let antiRecallMediaDbPromise = null;
+  let antiRecallRafPending = false;
+  let antiRecallObserver = null;
+
+  const privacyBc = typeof BroadcastChannel === 'function'
+    ? safe(() => new BroadcastChannel('olaz_privacy'), null)
+    : null;
+  const broadcastPrivacyToWorkers = () => {
+    if (!privacyBc) return;
+    const ar = Boolean(window.__olazPrivacy && window.__olazPrivacy.antiRecall);
+    try {
+      privacyBc.postMessage({ type: 'privacy_update', anti_recall: ar, antiRecall: ar });
+    } catch {}
+  };
+  if (privacyBc) {
+    if (typeof privacyBc.unref === 'function') privacyBc.unref();
+    privacyBc.onmessage = (ev) => {
+      const d = ev && ev.data;
+      if (d && d.type === 'request_privacy') broadcastPrivacyToWorkers();
+    };
+    broadcastPrivacyToWorkers();
+  }
+
+  const isRecalledMsgShape = (m) => Boolean(m && typeof m === 'object') && (
+    Number(m.msgType) === 20
+    || Number(m.msgType) === -27
+    || Number(m.status) === -27
+    || m.originMsgType === 'chat.undo'
+    || m.message === '[Tin nhắn đã được thu hồi]'
+  );
+
+  const setShadowEntry = (id, snap) => {
+    const k = String(id || '').trim();
+    if (!k || k === '0' || k === 'undefined' || k === 'null') return;
+    const map = window.__olazMsgShadow;
+    if (map.has(k)) map.delete(k);
+    while (map.size >= SHADOW_MAX_ENTRIES) {
+      const oldest = map.keys().next();
+      if (oldest.done) break;
+      map.delete(oldest.value);
+    }
+    map.set(k, snap);
+  };
+
+  const recordRecalledMsgIds = (m, kindOverride) => {
+    if (!m || typeof m !== 'object') return;
+    const map = window.__olazRecalledIds;
+    const rec = {
+      at: Number(m.__olazRecalledAt) || Date.now(),
+      kind: Number(kindOverride !== undefined ? kindOverride : (m.__olazPresalledType || m.msgType || 20)),
+    };
+    for (const raw of [m.msgId, m.cliMsgId]) {
+      const k = String(raw || '').trim();
+      if (!k || k === '0' || k === 'undefined' || k === 'null') continue;
+      if (!map.has(k)) {
+        while (map.size >= RECALLED_IDS_MAX) {
+          const oldest = map.keys().next();
+          if (oldest.done) break;
+          map.delete(oldest.value);
+        }
+        map.set(k, rec);
+      }
+    }
+  };
+
+  const openAntiRecallMediaDb = () => {
+    if (antiRecallMediaDbPromise) return antiRecallMediaDbPromise;
+    if (typeof indexedDB === 'undefined' || !indexedDB || typeof indexedDB.open !== 'function') {
+      return Promise.resolve(null);
+    }
+    antiRecallMediaDbPromise = new Promise((resolve) => {
+      try {
+        const req = indexedDB.open('olaz_anti_recall_media', 1);
+        req.onupgradeneeded = () => {
+          try {
+            const db = req.result;
+            if (db && !db.objectStoreNames.contains('media')) {
+              const os = db.createObjectStore('media', { keyPath: 'url' });
+              if (typeof os.createIndex === 'function') os.createIndex('ts', 'ts', { unique: false });
+            }
+          } catch {}
+        };
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => { antiRecallMediaDbPromise = null; resolve(null); };
+      } catch {
+        antiRecallMediaDbPromise = null;
+        resolve(null);
+      }
+    });
+    return antiRecallMediaDbPromise;
+  };
+
+  const storeMediaBlobLru = async (url, msgId, blob) => {
+    if (!url || !blob) return;
+    if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+      if (!antiRecallMediaMem.has(url)) {
+        while (antiRecallMediaMem.size >= MEDIA_CACHE_MAX_ENTRIES) {
+          const oldest = antiRecallMediaMem.entries().next();
+          if (oldest.done) break;
+          antiRecallMediaMem.delete(oldest.value[0]);
+          try { URL.revokeObjectURL(oldest.value[1]); } catch {}
+        }
+        try { antiRecallMediaMem.set(url, URL.createObjectURL(blob)); } catch {}
+      }
+    }
+    const db = await openAntiRecallMediaDb();
+    if (!db) return;
+    await new Promise((resolve) => {
+      try {
+        const tx = db.transaction('media', 'readwrite');
+        const store = tx.objectStore('media');
+        store.put({ url, msgId: String(msgId || ''), blob, size: Number(blob.size) || 0, ts: Date.now() });
+        if (typeof store.getAll === 'function') {
+          const allReq = store.getAll();
+          allReq.onsuccess = () => {
+            try {
+              const items = Array.isArray(allReq.result) ? allReq.result : [];
+              if (items.length > MEDIA_CACHE_MAX_ENTRIES) {
+                items.sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0));
+                const excess = items.length - MEDIA_CACHE_MAX_ENTRIES;
+                for (let i = 0; i < excess; i++) {
+                  if (items[i] && items[i].url) store.delete(items[i].url);
+                }
+              }
+            } catch {}
+          };
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+        tx.onabort = () => resolve();
+      } catch {
+        resolve();
+      }
+    });
+  };
+
+  const resolveCachedMediaBlobUrl = async (url) => {
+    const key = String(url || '').trim();
+    if (!key) return null;
+    if (antiRecallMediaMem.has(key)) return antiRecallMediaMem.get(key);
+    const db = await openAntiRecallMediaDb();
+    if (!db) return null;
+    return await new Promise((resolve) => {
+      try {
+        const tx = db.transaction('media', 'readonly');
+        const req = tx.objectStore('media').get(key);
+        req.onsuccess = () => {
+          const rec = req.result;
+          if (rec && rec.blob && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+            try {
+              const objUrl = URL.createObjectURL(rec.blob);
+              antiRecallMediaMem.set(key, objUrl);
+              resolve(objUrl);
+              return;
+            } catch {}
+          }
+          resolve(null);
+        };
+        req.onerror = () => resolve(null);
+      } catch {
+        resolve(null);
+      }
+    });
+  };
+
+  const extractMsgMediaUrls = (m) => {
+    const urls = [];
+    const collect = (obj) => {
+      if (!obj || typeof obj !== 'object') return;
+      for (const field of ['thumbUrl', 'normalUrl', 'hdUrl', 'href']) {
+        const v = obj[field];
+        if (typeof v === 'string' && /^https?:\/\//i.test(v)) urls.push(v);
+      }
+    };
+    collect(m);
+    if (m && m.message && typeof m.message === 'object') collect(m.message);
+    if (m && m.content && typeof m.content === 'object') collect(m.content);
+    return urls;
+  };
+
+  const maybeCacheAntiRecallMedia = (m) => {
+    if (!window.__olazPrivacy || !window.__olazPrivacy.antiRecall || !nativeFetchBase) return;
+    const urls = extractMsgMediaUrls(m);
+    if (!urls.length) return;
+    const msgId = String((m && (m.msgId || m.cliMsgId)) || '');
+    for (const u of urls) {
+      if (antiRecallMediaMem.has(u) || antiRecallMediaPending.has(u)) continue;
+      antiRecallMediaPending.add(u);
+      (async () => {
+        try {
+          const res = await nativeFetchBase(u);
+          if (!res || !res.ok || typeof res.blob !== 'function') return;
+          const cl = res.headers && typeof res.headers.get === 'function' ? Number(res.headers.get('content-length') || 0) : 0;
+          if (cl > MEDIA_CACHE_MAX_BYTES) return;
+          const blob = await res.blob();
+          if (blob && blob.size > 0 && blob.size < MEDIA_CACHE_MAX_BYTES) {
+            await storeMediaBlobLru(u, msgId, blob);
+          }
+        } catch {} finally {
+          antiRecallMediaPending.delete(u);
+        }
+      })();
+    }
+  };
+  window.__olazAntiRecallMedia = {
+    cacheMessage: maybeCacheAntiRecallMedia,
+    resolveUrl: resolveCachedMediaBlobUrl,
+    memUrls: antiRecallMediaMem,
+  };
+
+  const lookupShadowForMsg = (m) => {
+    if (!m || typeof m !== 'object') return null;
+    const k1 = String(m.msgId || '').trim();
+    if (k1 && k1 !== '0' && window.__olazMsgShadow.has(k1)) return window.__olazMsgShadow.get(k1);
+    const k2 = String(m.cliMsgId || '').trim();
+    if (k2 && k2 !== '0' && window.__olazMsgShadow.has(k2)) return window.__olazMsgShadow.get(k2);
+    return null;
+  };
+
+  const snapshotMessageForAntiRecall = (m) => {
+    if (!m || typeof m !== 'object') return;
+    if (m.__olazRecalled) {
+      recordRecalledMsgIds(m, m.__olazPresalledType || 20);
+    }
+    if (isRecalledMsgShape(m)) return;
+    const prevSnap = lookupShadowForMsg(m);
+    let snapQuote = (m.quote && typeof m.quote === 'object') ? Object.assign({}, m.quote) : m.quote;
+    if (snapQuote && (Number(snapQuote.cliMsgType) === 20 || Number(snapQuote.cliMsgType) === -27)
+        && prevSnap && prevSnap.quote
+        && Number(prevSnap.quote.cliMsgType) !== 20 && Number(prevSnap.quote.cliMsgType) !== -27
+        && prevSnap.quote.msg) {
+      snapQuote = Object.assign({}, prevSnap.quote);
+    }
+    const snap = {
+      msgType: m.msgType,
+      message: m.message,
+      content: m.content,
+      quote: snapQuote,
+      mentions: m.mentions,
+      thumb: m.thumb,
+      localPath: m.localPath,
+      folderPath: m.folderPath,
+      properties: m.properties,
+    };
+    setShadowEntry(m.msgId, snap);
+    setShadowEntry(m.cliMsgId, snap);
+    maybeCacheAntiRecallMedia(m);
+  };
+
+  const restoreRecalledMsgFromShadow = (m, snap) => {
+    if (!m || typeof m !== 'object' || !snap) return m;
+    const origKind = Number(m.__olazPresalledType || m.msgType || 20);
+    const restoredFields = {
+      msgType: snap.msgType,
+      message: snap.message,
+      content: snap.content !== undefined ? snap.content : m.content,
+      quote: snap.quote !== undefined ? snap.quote : m.quote,
+      mentions: snap.mentions !== undefined ? snap.mentions : m.mentions,
+      thumb: snap.thumb || m.thumb,
+      localPath: snap.localPath || m.localPath,
+      folderPath: snap.folderPath || m.folderPath,
+      properties: snap.properties !== undefined ? snap.properties : m.properties,
+      __olazPresalledType: origKind,
+      __olazRecalled: true,
+      __olazRecalledAt: Number(m.__olazRecalledAt) || Date.now(),
+    };
+    if (Number(m.status) === -27) restoredFields.status = 0;
+    let target = m;
+    try {
+      if (Object.isFrozen(m)) {
+        target = Object.assign({}, m, restoredFields);
+      } else {
+        Object.assign(m, restoredFields);
+      }
+    } catch {
+      target = Object.assign({}, m, restoredFields);
+    }
+    recordRecalledMsgIds(target, origKind);
+    return target;
+  };
+
+  const extractPlainTextFromSnap = (val) => {
+    if (typeof val === 'string') return val;
+    if (Array.isArray(val)) {
+      for (const item of val) {
+        const t = item && (item.title || item.description || item.text);
+        if (typeof t === 'string' && t) return t;
+      }
+      return '';
+    }
+    if (val && typeof val === 'object') {
+      const t = val.title || val.description || val.text || val.msg || val.message;
+      return typeof t === 'string' ? t : '';
+    }
+    return '';
+  };
+
+  const ensureAntiRecallStyles = () => {
+    if (typeof document === 'undefined' || !document || typeof document.createElement !== 'function') return;
+    if (typeof document.getElementById === 'function' && document.getElementById('olaz-anti-recall-style')) return;
+    const parent = document.head || document.documentElement;
+    if (!parent || typeof parent.appendChild !== 'function') return;
+    const style = document.createElement('style');
+    style.id = 'olaz-anti-recall-style';
+    style.textContent = [
+      '.chat-message.olaz-is-recalled .card { border: 1px dashed rgba(220, 38, 38, 0.45) !important; background-color: rgba(239, 68, 68, 0.04) !important; }',
+      '.olaz-recalled-badge { display: inline-flex; align-items: center; margin-top: 4px; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; line-height: 1.4; color: #dc2626; background: rgba(239, 68, 68, 0.12); user-select: none; }',
+      '.olaz-recovered-text { margin-top: 4px; padding: 4px 8px; border-left: 2px solid #dc2626; font-size: 13px; white-space: pre-wrap; word-break: break-word; }',
+      '.zmenu-separator.olaz-cx-sep { border: 0; height: 1px; background: var(--divider-subtle, rgba(0, 0, 0, 0.08)); margin: 4px; }',
+      '.zmenu-item.olaz-cx-antirecall { width: 100%; height: 36px; min-width: 112px; padding: 0 10px; margin: 4px 0; border: 0; border-radius: 4px; display: flex; align-items: center; justify-content: flex-start; box-sizing: border-box; background-color: var(--layer-background, transparent); color: var(--text-primary, #081b3a); font-family: inherit; font-size: .875rem; font-weight: 400; line-height: 20px; text-align: left; cursor: pointer; user-select: none; appearance: none; -webkit-appearance: none; }',
+      '.zmenu-item.olaz-cx-antirecall:hover { background-color: var(--layer-background-hover, rgba(0, 0, 0, 0.05)); }',
+      '.zmenu-item.olaz-cx-antirecall:focus-visible { outline: 2px solid var(--border-focused, #0068ff); outline-offset: -2px; background-color: var(--layer-background-hover, rgba(0, 0, 0, 0.05)); }',
+      '.olaz-cx-icon { width: 20px; height: 20px; margin-right: 12px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; color: var(--icon-primary, currentColor); }',
+      '.olaz-cx-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 12px; }',
+      '.olaz-cx-switch { position: relative; width: 30px; height: 17px; border-radius: 999px; background-color: rgba(148, 163, 184, 0.55); flex-shrink: 0; transition: background-color 140ms cubic-bezier(0.2, 0, 0, 1); }',
+      '.olaz-cx-antirecall[aria-checked="true"] .olaz-cx-switch { background-color: var(--button-primary-normal, #0068ff); }',
+      '.olaz-cx-switch-thumb { position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: #ffffff; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.22); transition: transform 140ms cubic-bezier(0.2, 0, 0, 1); }',
+      '.olaz-cx-antirecall[aria-checked="true"] .olaz-cx-switch-thumb { transform: translateX(13px); }',
+      '#olaz-sidebar-accounts { display: flex; flex-direction: column; align-items: center; width: 100%; -webkit-app-region: no-drag; }',
+      '.olaz-sidebar-sep { width: 28px; height: 1px; margin: 6px auto 4px; background: rgba(255, 255, 255, 0.22); border-radius: 1px; pointer-events: none; }',
+      '.leftbar-tab.olaz-sidebar-btn { width: 64px; height: 56px; padding: 0; margin: 0; border: 0; background: transparent; color: var(--icon-navbar-normal, #ffffff); font-family: inherit; cursor: pointer; appearance: none; -webkit-appearance: none; -webkit-app-region: no-drag; }',
+      '.leftbar-tab.olaz-sidebar-btn:focus-visible .mmi-icon-wr { outline: 2px solid #ffffff; outline-offset: -2px; }',
+      '.leftbar-tab.olaz-sidebar-btn .mmi-icon-wr { position: relative; width: calc(100% - 16px); height: calc(100% - 8px); border-radius: 6px; display: flex; align-items: center; justify-content: center; transition: background-color 120ms cubic-bezier(0.2, 0, 0, 1); }',
+      '.leftbar-tab.olaz-sidebar-btn:hover .mmi-icon-wr { background-color: var(--layer-background-navbar-hover, rgba(255, 255, 255, 0.16)); }',
+      '.leftbar-tab.olaz-sidebar-btn:active .mmi-icon-wr { background-color: var(--layer-background-navbar-selected, rgba(0, 0, 0, 0.18)); }',
+      '.olaz-sidebar-ava { width: 32px; height: 32px; border-radius: 50%; box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.88); background: rgba(255, 255, 255, 0.18); color: #ffffff; font-size: 11px; font-weight: 700; letter-spacing: 0.02em; display: flex; align-items: center; justify-content: center; overflow: hidden; user-select: none; }',
+      '.olaz-sidebar-ava-img { width: 100%; height: 100%; object-fit: cover; display: block; border-radius: 50%; }',
+      '.olaz-sidebar-badge { position: absolute; top: 4px; right: 4px; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px; background: #ef4444; color: #ffffff; font-size: 10px; font-weight: 700; line-height: 16px; text-align: center; box-sizing: border-box; box-shadow: 0 0 0 2px var(--layer-background-navbar-normal, #0068ff); pointer-events: none; user-select: none; }',
+      '.olaz-call-rec-card { display: flex; flex-direction: column; gap: 10px; background-color: var(--layer-background, rgba(128, 128, 128, 0.08)); }',
+      '.olaz-call-rec-sub { color: var(--text-secondary, #7589a3); font-size: .8125rem; line-height: 1.4; }',
+      '.olaz-call-rec-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }',
+      '.olaz-call-rec-path { flex: 1 1 220px; min-width: 0; height: 36px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--border-subtle, rgba(128, 128, 128, 0.22)); background-color: var(--layer-background-subtle, rgba(128, 128, 128, 0.08)); color: var(--text-primary, inherit); font-size: .8125rem; line-height: 34px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; box-sizing: border-box; user-select: text; }',
+      '.olaz-call-rec-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }',
+      '.olaz-call-rec-btn { height: 36px; padding: 0 14px; border-radius: 6px; border: 1px solid var(--border-subtle, rgba(128, 128, 128, 0.22)); background-color: var(--button-neutral-normal, rgba(128, 128, 128, 0.16)); color: var(--text-primary, inherit); font-family: inherit; font-size: .8125rem; font-weight: 500; line-height: 34px; cursor: pointer; white-space: nowrap; box-sizing: border-box; appearance: none; -webkit-appearance: none; transition: background-color 120ms cubic-bezier(0.2, 0, 0, 1); }',
+      '.olaz-call-rec-btn:hover { background-color: var(--button-neutral-hover, rgba(128, 128, 128, 0.24)); }',
+      '.olaz-call-rec-btn.is-primary { border-color: transparent; background-color: var(--button-primary-normal, #0068ff); color: #ffffff; }',
+      '.olaz-call-rec-btn.is-primary:hover { background-color: var(--button-primary-hover, #005ae0); }',
+      '.olaz-call-rec-btn:focus-visible { outline: 2px solid var(--border-focused, #66a6ff); outline-offset: 2px; }',
+      '@media (prefers-reduced-motion: reduce) { .olaz-cx-switch, .olaz-cx-switch-thumb, .leftbar-tab.olaz-sidebar-btn .mmi-icon-wr, .olaz-call-rec-btn { transition: none !important; } }',
+    ].join('\n');
+    try { parent.appendChild(style); } catch {}
+  };
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const createSvgNode = (tag, attrs) => {
+    const el = (typeof document.createElementNS === 'function')
+      ? document.createElementNS(SVG_NS, tag)
+      : document.createElement(tag);
+    if (attrs && el && typeof el.setAttribute === 'function') {
+      for (const k of Object.keys(attrs)) el.setAttribute(k, attrs[k]);
+    }
+    return el;
+  };
+
+  const buildAntiRecallMenuIcon = () => {
+    const wrap = document.createElement('span');
+    wrap.className = 'menu-icon left mn-html olaz-cx-icon';
+    const svg = createSvgNode('svg', {
+      'aria-hidden': 'true',
+      width: '20',
+      height: '20',
+      viewBox: '0 0 24 24',
+      fill: 'none',
+      stroke: 'currentColor',
+      'stroke-width': '1.7',
+      'stroke-linecap': 'round',
+      'stroke-linejoin': 'round',
+    });
+    svg.appendChild(createSvgNode('path', { d: 'M3 12a9 9 0 1 0 3-6.7L3 8' }));
+    svg.appendChild(createSvgNode('path', { d: 'M3 3v5h5' }));
+    svg.appendChild(createSvgNode('path', { d: 'M9.5 12.5l2 2 3.5-4' }));
+    wrap.appendChild(svg);
+    return wrap;
+  };
+
+  const buildUserPlusSidebarIcon = () => {
+    const svg = createSvgNode('svg', {
+      'aria-hidden': 'true',
+      width: '26',
+      height: '26',
+      viewBox: '0 0 24 24',
+      fill: 'none',
+      stroke: 'currentColor',
+      'stroke-width': '1.8',
+      'stroke-linecap': 'round',
+      'stroke-linejoin': 'round',
+    });
+    svg.appendChild(createSvgNode('path', { d: 'M15 19c0-2.761-2.686-5-6-5s-6 2.239-6 5' }));
+    svg.appendChild(createSvgNode('circle', { cx: '9', cy: '7.5', r: '3.5' }));
+    svg.appendChild(createSvgNode('path', { d: 'M19 8v6' }));
+    svg.appendChild(createSvgNode('path', { d: 'M16 11h6' }));
+    return svg;
+  };
+
+  const resolveBubbleMenuListContainer = (menu, cxItems) => {
+    const sep = typeof menu.querySelector === 'function' ? menu.querySelector('.zmenu-separator') : null;
+    if (sep && sep.parentNode) return sep.parentNode;
+    if (cxItems.length >= 2) {
+      const ancestors = new Set();
+      let cur = cxItems[0] && cxItems[0].parentNode;
+      while (cur) {
+        ancestors.add(cur);
+        if (cur === menu) break;
+        cur = cur.parentNode;
+      }
+      let probe = cxItems[1] && cxItems[1].parentNode;
+      while (probe) {
+        if (ancestors.has(probe)) return probe;
+        if (probe === menu) break;
+        probe = probe.parentNode;
+      }
+    }
+    const inner = menu.firstElementChild && menu.firstElementChild.firstElementChild;
+    if (inner && cxItems[0] && typeof inner.contains === 'function' && inner.contains(cxItems[0])) {
+      return inner;
+    }
+    return (cxItems[0] && cxItems[0].parentNode) || menu;
+  };
+
+  const syncOpenBubbleMenuAntiRecallState = () => {
+    if (typeof document === 'undefined' || !document || typeof document.querySelectorAll !== 'function') return;
+    const on = Boolean(window.__olazPrivacy && window.__olazPrivacy.antiRecall);
+    for (const btn of Array.from(document.querySelectorAll('.olaz-cx-antirecall'))) {
+      if (btn && typeof btn.setAttribute === 'function') {
+        btn.setAttribute('aria-checked', on ? 'true' : 'false');
+      }
+    }
+  };
+
+  const injectBubbleMenuAntiRecall = () => {
+    if (typeof document === 'undefined' || !document || typeof document.querySelectorAll !== 'function' || typeof document.createElement !== 'function') return;
+    const menus = document.querySelectorAll('.zmenu-body');
+    for (const menu of Array.from(menus)) {
+      if (!menu) continue;
+      if (menu.classList && typeof menu.classList.contains === 'function' && menu.classList.contains('content-only')) {
+        continue;
+      }
+      const cxItems = typeof menu.querySelectorAll === 'function'
+        ? Array.from(menu.querySelectorAll('[data-id^="div_CX_"]')).filter((el) => {
+          const did = typeof el.getAttribute === 'function' ? el.getAttribute('data-id') : '';
+          return did !== 'div_CX_OlazAntiRecall';
+        })
+        : [];
+      if (!cxItems.length) continue;
+
+      ensureAntiRecallStyles();
+      const existing = typeof menu.querySelector === 'function' ? menu.querySelector('.olaz-cx-antirecall') : null;
+      if (existing) {
+        existing.setAttribute('aria-checked', (window.__olazPrivacy && window.__olazPrivacy.antiRecall) ? 'true' : 'false');
+        continue;
+      }
+
+      const listContainer = resolveBubbleMenuListContainer(menu, cxItems);
+      if (!listContainer || typeof listContainer.appendChild !== 'function') continue;
+
+      const on = Boolean(window.__olazPrivacy && window.__olazPrivacy.antiRecall);
+      const sep = document.createElement('hr');
+      sep.className = 'zmenu-separator olaz-cx-sep';
+
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'zmenu-item --NORMAL md olaz-cx-antirecall';
+      btn.setAttribute('role', 'menuitemcheckbox');
+      btn.setAttribute('aria-checked', on ? 'true' : 'false');
+      btn.setAttribute('data-id', 'div_CX_OlazAntiRecall');
+
+      const labelEl = document.createElement('span');
+      labelEl.className = 'truncate flx-1 olaz-cx-label';
+      labelEl.textContent = 'Giữ thu hồi';
+
+      const sw = document.createElement('span');
+      sw.className = 'olaz-cx-switch';
+      sw.setAttribute('aria-hidden', 'true');
+      const thumb = document.createElement('span');
+      thumb.className = 'olaz-cx-switch-thumb';
+      sw.appendChild(thumb);
+
+      btn.appendChild(buildAntiRecallMenuIcon());
+      btn.appendChild(labelEl);
+      btn.appendChild(sw);
+
+      const stopMouse = (ev) => { if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation(); };
+      if (typeof btn.addEventListener === 'function') {
+        btn.addEventListener('mousedown', stopMouse);
+        btn.addEventListener('mouseup', stopMouse);
+        btn.addEventListener('click', (ev) => {
+          if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+          if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation();
+          const next = !(window.__olazPrivacy && window.__olazPrivacy.antiRecall);
+          btn.setAttribute('aria-checked', next ? 'true' : 'false');
+          window.__olazSetPrivacy({ antiRecall: next });
+          postState({ uiAction: 'toggleAntiRecall', enabled: next });
+          const closeTimer = setTimeout(() => {
+            if (!btn.parentNode) return;
+            try {
+              if (typeof KeyboardEvent === 'function' && typeof document.dispatchEvent === 'function') {
+                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+              }
+            } catch {}
+            try {
+              const target = (typeof document.getElementById === 'function' && document.getElementById('messageViewScroll')) || document.body;
+              if (target && typeof target.dispatchEvent === 'function' && typeof MouseEvent === 'function') {
+                target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+              } else if (target && typeof target.click === 'function') {
+                target.click();
+              }
+            } catch {}
+          }, 300);
+          if (closeTimer && typeof closeTimer.unref === 'function') closeTimer.unref();
+        });
+      }
+
+      let dangerRow = typeof menu.querySelector === 'function'
+        ? menu.querySelector('[data-id="div_CX_Recall"], [data-id="div_CX_Delete"]')
+        : null;
+      while (dangerRow && dangerRow.parentNode && dangerRow.parentNode !== listContainer) {
+        dangerRow = dangerRow.parentNode;
+      }
+      if (dangerRow && dangerRow.parentNode === listContainer && typeof listContainer.insertBefore === 'function') {
+        const prev = dangerRow.previousElementSibling || null;
+        const prevIsSep = Boolean(prev && prev.classList && typeof prev.classList.contains === 'function' && prev.classList.contains('zmenu-separator'));
+        const anchor = prevIsSep ? prev : dangerRow;
+        if (anchor.previousElementSibling) {
+          listContainer.insertBefore(sep, anchor);
+        }
+        listContainer.insertBefore(btn, anchor);
+        if (!prevIsSep) {
+          const dangerSep = document.createElement('hr');
+          dangerSep.className = 'zmenu-separator olaz-cx-sep';
+          listContainer.insertBefore(dangerSep, dangerRow);
+        }
+      } else {
+        if (listContainer.children && listContainer.children.length > 0) {
+          listContainer.appendChild(sep);
+        }
+        listContainer.appendChild(btn);
+      }
+    }
+  };
+
+  if (!window.__olazAccountsState || typeof window.__olazAccountsState !== 'object') {
+    window.__olazAccountsState = { selfSlug: 'default', activeSlug: 'default', accounts: [] };
+  }
+
+  const syncSidebarAccountTools = () => {
+    if (typeof document === 'undefined' || !document || typeof document.getElementById !== 'function' || typeof document.createElement !== 'function') return false;
+    const legacyTitleTools = document.getElementById('olaz-titlebar-tools');
+    if (legacyTitleTools) {
+      try { if (typeof legacyTitleTools.remove === 'function') legacyTitleTools.remove(); } catch {}
+    }
+    const mainTab = document.getElementById('main-tab');
+    if (!mainTab || typeof mainTab.querySelector !== 'function') return false;
+    const topTabs = mainTab.querySelector('.nav__tabs__top');
+    const hostParent = (topTabs && topTabs.parentNode) || mainTab;
+    if (!hostParent || typeof hostParent.appendChild !== 'function') return false;
+
+    ensureAntiRecallStyles();
+    const st = (window.__olazAccountsState && typeof window.__olazAccountsState === 'object')
+      ? window.__olazAccountsState
+      : { selfSlug: 'default', accounts: [] };
+    const selfSlug = String(st.selfSlug || 'default');
+    const rawAccounts = Array.isArray(st.accounts) ? st.accounts : [];
+    const otherAccounts = rawAccounts.filter((a) => a && typeof a === 'object' && String(a.slug || '') && String(a.slug) !== selfSlug);
+    const sig = JSON.stringify({ s: selfSlug, a: otherAccounts });
+
+    let wrap = document.getElementById('olaz-sidebar-accounts');
+    if (wrap && wrap.parentNode === hostParent && wrap.__olazSig === sig) {
+      return true;
+    }
+    if (!wrap) {
+      wrap = document.createElement('div');
+      wrap.id = 'olaz-sidebar-accounts';
+      wrap.className = 'olaz-sidebar-accounts no-drag';
+      wrap.setAttribute('role', 'group');
+      wrap.setAttribute('aria-label', 'Tài khoản Zalo');
+    } else {
+      while (wrap.firstChild) {
+        try { wrap.removeChild(wrap.firstChild); } catch { break; }
+      }
+    }
+    wrap.__olazSig = sig;
+
+    const sep = document.createElement('div');
+    sep.className = 'olaz-sidebar-sep';
+    sep.setAttribute('aria-hidden', 'true');
+    wrap.appendChild(sep);
+
+    for (const acc of otherAccounts) {
+      const slug = String(acc.slug);
+      const name = String(acc.name || slug);
+      const initials = String(acc.initials || 'Z').slice(0, 3);
+      const unread = Math.max(0, Number(acc.unread) || 0);
+      const avatarUrl = typeof acc.avatar === 'string' ? acc.avatar.trim() : '';
+      const idxHint = typeof acc.shortcutIndex === 'number' && acc.shortcutIndex >= 1 && acc.shortcutIndex <= 9
+        ? ' (Ctrl+' + acc.shortcutIndex + ')'
+        : '';
+      const labelText = unread > 0
+        ? name + ' — ' + unread + ' tin chưa đọc' + idxHint
+        : 'Chuyển sang ' + name + idxHint;
+
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'clickable leftbar-tab flx flx-col flx-al-c flx-center rel olaz-sidebar-btn olaz-sidebar-acct-btn';
+      btn.setAttribute('data-account-slug', slug);
+      btn.setAttribute('aria-label', labelText);
+      btn.title = labelText + ' · Chuột phải để tùy chọn';
+
+      const iconWr = document.createElement('div');
+      iconWr.className = 'mmi-icon-wr';
+
+      const ava = document.createElement('span');
+      ava.className = 'olaz-sidebar-ava';
+      ava.setAttribute('aria-hidden', 'true');
+      if (avatarUrl && (/^https?:\/\//i.test(avatarUrl) || avatarUrl.startsWith('data:'))) {
+        const img = document.createElement('img');
+        img.className = 'olaz-sidebar-ava-img';
+        img.setAttribute('alt', '');
+        img.src = avatarUrl;
+        if (typeof img.addEventListener === 'function') {
+          img.addEventListener('error', () => {
+            try { if (img.parentNode) img.parentNode.removeChild(img); } catch {}
+            ava.textContent = initials;
+          });
+        }
+        ava.appendChild(img);
+      } else {
+        ava.textContent = initials;
+      }
+      iconWr.appendChild(ava);
+
+      if (unread > 0) {
+        const badge = document.createElement('span');
+        badge.className = 'olaz-sidebar-badge';
+        badge.setAttribute('aria-hidden', 'true');
+        badge.textContent = unread > 99 ? '99+' : String(unread);
+        iconWr.appendChild(badge);
+      }
+
+      btn.appendChild(iconWr);
+      if (typeof btn.addEventListener === 'function') {
+        btn.addEventListener('click', (ev) => {
+          if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+          if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation();
+          postState({ uiAction: 'switchAccount', slug });
+        });
+        btn.addEventListener('contextmenu', (ev) => {
+          if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+          if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation();
+          postState({ uiAction: 'accountContextMenu', slug });
+        });
+      }
+      wrap.appendChild(btn);
+    }
+
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.id = 'olaz-sidebar-add-account';
+    addBtn.className = 'clickable leftbar-tab flx flx-col flx-al-c flx-center rel olaz-sidebar-btn';
+    addBtn.setAttribute('aria-label', 'Thêm tài khoản Zalo');
+    addBtn.title = 'Thêm tài khoản Zalo (Ctrl+Shift+N)';
+    const addIconWr = document.createElement('div');
+    addIconWr.className = 'mmi-icon-wr';
+    addIconWr.appendChild(buildUserPlusSidebarIcon());
+    addBtn.appendChild(addIconWr);
+    if (typeof addBtn.addEventListener === 'function') {
+      addBtn.addEventListener('click', (ev) => {
+        if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+        if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation();
+        postState({ uiAction: 'addAccount' });
+      });
+    }
+    wrap.appendChild(addBtn);
+
+    if (wrap.parentNode !== hostParent) {
+      if (topTabs && topTabs.nextSibling && typeof hostParent.insertBefore === 'function') {
+        hostParent.insertBefore(wrap, topTabs.nextSibling);
+      } else {
+        hostParent.appendChild(wrap);
+      }
+    }
+    return true;
+  };
+
+  window.__olazSetAccounts = (payload) => {
+    if (payload && typeof payload === 'object') {
+      window.__olazAccountsState = payload;
+    }
+    startAntiRecallDomObserver();
+    syncSidebarAccountTools();
+    return window.__olazAccountsState;
+  };
+
+  if (!window.__olazCallRecording || typeof window.__olazCallRecording !== 'object') {
+    const baseGuess = (() => {
+      try {
+        const ud = window.$zplatform && typeof window.$zplatform.userData === 'string'
+          ? window.$zplatform.userData
+          : '';
+        if (ud && ud.endsWith('/ZaloData')) {
+          return ud.slice(0, -9) + '/recordings';
+        }
+      } catch {}
+      return '';
+    })();
+    window.__olazCallRecording = { dir: baseGuess, defaultDir: baseGuess, isCustom: false };
+  }
+  let callRecQueriedOnce = false;
+
+  const syncCallSettingsRecordingSection = () => {
+    if (typeof document === 'undefined' || !document || typeof document.createElement !== 'function') return false;
+    const notifyEl = (typeof document.getElementById === 'function' && document.getElementById('settingNotifyCall'))
+      || (typeof document.querySelector === 'function' && document.querySelector('[data-id="idsettingNotifyCall"]'));
+    if (!notifyEl) return false;
+    const refSection = typeof notifyEl.closest === 'function' ? notifyEl.closest('.setting-section') : null;
+    const host = (refSection && refSection.parentNode)
+      || (typeof notifyEl.closest === 'function' && notifyEl.closest('.setting--bottom'))
+      || null;
+    if (!host || typeof host.appendChild !== 'function') return false;
+
+    ensureAntiRecallStyles();
+    const st = (window.__olazCallRecording && typeof window.__olazCallRecording === 'object')
+      ? window.__olazCallRecording
+      : { dir: '', defaultDir: '', isCustom: false };
+    if (!st.dir && !callRecQueriedOnce) {
+      callRecQueriedOnce = true;
+      postState({ uiAction: 'queryCallRecordingsDir' });
+    }
+    const dirText = String(st.dir || st.defaultDir || '~/.local/share/olaz/recordings');
+    const isCustom = Boolean(st.isCustom);
+    const sig = JSON.stringify({ d: dirText, c: isCustom });
+
+    let sec = typeof document.getElementById === 'function'
+      ? document.getElementById('olaz-call-recording-section')
+      : null;
+    if (sec && sec.parentNode === host && sec.__olazSig === sig) {
+      return true;
+    }
+    if (!sec) {
+      sec = document.createElement('div');
+      sec.id = 'olaz-call-recording-section';
+      sec.className = 'setting-section olaz-call-rec-section';
+    } else {
+      while (sec.firstChild) {
+        try { sec.removeChild(sec.firstChild); } catch { break; }
+      }
+    }
+    sec.__olazSig = sig;
+
+    const label = document.createElement('div');
+    label.className = 'setting-section-label';
+    const labelSpan = document.createElement('span');
+    labelSpan.textContent = 'Ghi âm cuộc gọi';
+    label.appendChild(labelSpan);
+    sec.appendChild(label);
+
+    const card = document.createElement('div');
+    card.className = 'setting-section-content single-no-click olaz-call-rec-card';
+
+    const sub = document.createElement('div');
+    sub.className = 'olaz-call-rec-sub';
+    sub.textContent = 'Thư mục lưu file ghi âm cuộc gọi (.wav)';
+    card.appendChild(sub);
+
+    const row = document.createElement('div');
+    row.className = 'olaz-call-rec-row';
+
+    const pathBox = document.createElement('div');
+    pathBox.className = 'olaz-call-rec-path';
+    pathBox.id = 'olaz-call-recording-path';
+    pathBox.title = dirText;
+    pathBox.textContent = dirText;
+    row.appendChild(pathBox);
+
+    const actions = document.createElement('div');
+    actions.className = 'olaz-call-rec-actions';
+
+    if (isCustom) {
+      const resetBtn = document.createElement('button');
+      resetBtn.type = 'button';
+      resetBtn.className = 'olaz-call-rec-btn';
+      resetBtn.setAttribute('data-action', 'reset');
+      resetBtn.textContent = 'Mặc định';
+      if (typeof resetBtn.addEventListener === 'function') {
+        resetBtn.addEventListener('click', (ev) => {
+          if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+          if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation();
+          postState({ uiAction: 'resetCallRecordingsDir' });
+        });
+      }
+      actions.appendChild(resetBtn);
+    }
+
+    const openBtn = document.createElement('button');
+    openBtn.type = 'button';
+    openBtn.className = 'olaz-call-rec-btn';
+    openBtn.setAttribute('data-action', 'open');
+    openBtn.textContent = 'Mở thư mục';
+    if (typeof openBtn.addEventListener === 'function') {
+      openBtn.addEventListener('click', (ev) => {
+        if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+        if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation();
+        postState({ uiAction: 'openCallRecordingsDir' });
+      });
+    }
+    actions.appendChild(openBtn);
+
+    const changeBtn = document.createElement('button');
+    changeBtn.type = 'button';
+    changeBtn.className = 'olaz-call-rec-btn is-primary';
+    changeBtn.setAttribute('data-action', 'change');
+    changeBtn.textContent = 'Thay đổi';
+    if (typeof changeBtn.addEventListener === 'function') {
+      changeBtn.addEventListener('click', (ev) => {
+        if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+        if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation();
+        postState({ uiAction: 'chooseCallRecordingsDir' });
+      });
+    }
+    actions.appendChild(changeBtn);
+
+    row.appendChild(actions);
+    card.appendChild(row);
+    sec.appendChild(card);
+
+    if (sec.parentNode !== host) {
+      host.appendChild(sec);
+    }
+    return true;
+  };
+
+  window.__olazSetCallRecording = (payload) => {
+    if (payload && typeof payload === 'object') {
+      window.__olazCallRecording = Object.assign({}, window.__olazCallRecording, payload);
+    }
+    startAntiRecallDomObserver();
+    syncCallSettingsRecordingSection();
+    return window.__olazCallRecording;
+  };
+
+  const findFiberMessageOnNode = (node) => {
+    if (!node || typeof node !== 'object') return null;
+    let fiber = null;
+    for (const k of Object.keys(node)) {
+      if (k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')) {
+        fiber = node[k];
+        break;
+      }
+    }
+    let hops = 0;
+    while (fiber && hops < 10) {
+      const p = fiber.memoizedProps || fiber.pendingProps;
+      if (p && typeof p === 'object') {
+        const cand = p.message || p.msg || p.data || p.item;
+        if (cand && typeof cand === 'object' && (cand.msgId !== undefined || cand.cliMsgId !== undefined || cand.__olazRecalled)) {
+          return cand;
+        }
+      }
+      fiber = fiber.return;
+      hops += 1;
+    }
+    return null;
+  };
+
+  const isOlazInjectedNode = (n) => {
+    if (!n || n.nodeType !== 1) return false;
+    const id = String(n.id || '');
+    if (
+      id === 'olaz-sidebar-accounts'
+      || id === 'olaz-anti-recall-style'
+      || id === 'olaz-sidebar-add-account'
+      || id === 'olaz-call-recording-section'
+    ) {
+      return true;
+    }
+    const cls = String(n.className || '');
+    return cls.includes('olaz-recalled-badge')
+      || cls.includes('olaz-recovered-text')
+      || cls.includes('olaz-cx-antirecall')
+      || cls.includes('olaz-cx-sep')
+      || cls.includes('olaz-sidebar-')
+      || cls.includes('olaz-call-rec-');
+  };
+
+  const applyAntiRecallBadgesNow = () => {
+    antiRecallRafPending = false;
+    syncSidebarAccountTools();
+    injectBubbleMenuAntiRecall();
+    syncCallSettingsRecordingSection();
+    if (typeof document === 'undefined' || !document || typeof document.querySelectorAll !== 'function') return;
+    const enabled = Boolean(window.__olazPrivacy && window.__olazPrivacy.antiRecall);
+    if (!enabled) {
+      for (const el of Array.from(document.querySelectorAll('.olaz-recalled-badge, .olaz-recovered-text'))) {
+        try { if (typeof el.remove === 'function') el.remove(); else if (el.parentNode) el.parentNode.removeChild(el); } catch {}
+      }
+      for (const row of Array.from(document.querySelectorAll('.chat-message.olaz-is-recalled'))) {
+        try { row.classList.remove('olaz-is-recalled'); } catch {}
+      }
+      return;
+    }
+    ensureAntiRecallStyles();
+    const rows = document.querySelectorAll('.chat-message[id^="bb_msg_id_"]');
+    for (const row of Array.from(rows)) {
+      if (!row) continue;
+      const rawId = String(row.id || '').startsWith('bb_msg_id_') ? String(row.id).slice(10) : '';
+      const fiberMsg = findFiberMessageOnNode(row);
+      const recalledByFiber = Boolean(fiberMsg && fiberMsg.__olazRecalled);
+      const recalledById = Boolean(rawId && window.__olazRecalledIds.has(rawId))
+        || Boolean(fiberMsg && fiberMsg.msgId && window.__olazRecalledIds.has(String(fiberMsg.msgId)))
+        || Boolean(fiberMsg && fiberMsg.cliMsgId && window.__olazRecalledIds.has(String(fiberMsg.cliMsgId)));
+      if (!recalledByFiber && !recalledById) continue;
+
+      try { row.classList.add('olaz-is-recalled'); } catch {}
+      const card = (typeof row.querySelector === 'function' && row.querySelector('.card')) || row;
+      const isUndoCard = Boolean(
+        (card.classList && typeof card.classList.contains === 'function' && card.classList.contains('card--undo'))
+        || (typeof row.querySelector === 'function' && row.querySelector('.card--undo'))
+      );
+      if (isUndoCard) {
+        const snap = (rawId && window.__olazMsgShadow.get(rawId)) || lookupShadowForMsg(fiberMsg);
+        const preservedText = (fiberMsg && !isRecalledMsgShape(fiberMsg) && extractPlainTextFromSnap(fiberMsg.message || fiberMsg.content))
+          || (snap && extractPlainTextFromSnap(snap.message !== undefined ? snap.message : snap.content))
+          || '';
+        if (preservedText && preservedText !== '[Tin nhắn đã được thu hồi]') {
+          let recEl = typeof card.querySelector === 'function' ? card.querySelector('.olaz-recovered-text') : null;
+          if (!recEl) {
+            recEl = document.createElement('div');
+            recEl.className = 'olaz-recovered-text';
+            card.appendChild(recEl);
+          }
+          if (recEl.textContent !== preservedText) recEl.textContent = preservedText;
+        }
+      }
+      const existingBadge = typeof card.querySelector === 'function' ? card.querySelector('.olaz-recalled-badge') : null;
+      if (!existingBadge) {
+        const badge = document.createElement('div');
+        badge.className = 'olaz-recalled-badge';
+        badge.textContent = 'Đã thu hồi';
+        card.appendChild(badge);
+      }
+    }
+  };
+
+  const scheduleAntiRecallDomPass = () => {
+    if (antiRecallRafPending) return;
+    antiRecallRafPending = true;
+    if (typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(applyAntiRecallBadgesNow);
+    } else {
+      const tid = setTimeout(applyAntiRecallBadgesNow, 16);
+      if (tid && typeof tid.unref === 'function') tid.unref();
+    }
+  };
+
+  const startAntiRecallDomObserver = () => {
+    if (antiRecallObserver || typeof MutationObserver !== 'function' || typeof document === 'undefined' || !document) return;
+    const root = document.documentElement || document.body;
+    if (!root) return;
+    antiRecallObserver = new MutationObserver((mutations) => {
+      let relevant = false;
+      for (const mut of mutations) {
+        if (mut && mut.type === 'attributes') {
+          const tc = String((mut.target && mut.target.className) || '');
+          if (tc.includes('zmenu-body')) {
+            relevant = true;
+            break;
+          }
+          continue;
+        }
+        for (const list of [mut.addedNodes, mut.removedNodes]) {
+          if (!list) continue;
+          for (const n of Array.from(list)) {
+            if (!n || n.nodeType !== 1 || isOlazInjectedNode(n)) continue;
+            relevant = true;
+            break;
+          }
+          if (relevant) break;
+        }
+        if (relevant) break;
+      }
+      if (relevant) scheduleAntiRecallDomPass();
+    });
+    try {
+      antiRecallObserver.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+    } catch {
+      antiRecallObserver = null;
+    }
+  };
+  startAntiRecallDomObserver();
+  if (typeof document !== 'undefined' && document) {
+    if (document.readyState === 'loading' && typeof document.addEventListener === 'function') {
+      document.addEventListener('DOMContentLoaded', () => {
+        startAntiRecallDomObserver();
+        applyAntiRecallBadgesNow();
+      }, { once: true });
+    } else {
+      scheduleAntiRecallDomPass();
+    }
+  }
+  if (typeof document !== 'undefined' && document && typeof document.addEventListener === 'function') {
+    document.addEventListener('error', (ev) => {
+      if (!window.__olazPrivacy || !window.__olazPrivacy.antiRecall) return;
+      const t = ev && ev.target;
+      if (!t || !t.tagName) return;
+      const tag = String(t.tagName).toUpperCase();
+      if (tag !== 'IMG' && tag !== 'AUDIO' && tag !== 'VIDEO') return;
+      if (typeof t.closest === 'function' && !t.closest('.chat-message')) return;
+      const failedSrc = String(t.getAttribute('src') || t.src || '');
+      if (!/^https?:\/\//i.test(failedSrc) || t.__olazBlobSwapped) return;
+      resolveCachedMediaBlobUrl(failedSrc).then((blobUrl) => {
+        if (blobUrl && !t.__olazBlobSwapped) {
+          t.__olazBlobSwapped = true;
+          t.src = blobUrl;
+        }
+      }).catch(() => {});
+    }, true);
+  }
+
+  const patchAntiRecallTarget = (obj) => {
+    if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return false;
+    let patched = false;
+    if (typeof obj.deleteMessageResourceIfExists === 'function' && !obj.deleteMessageResourceIfExists.__olazAr) {
+      const origDel = obj.deleteMessageResourceIfExists;
+      const wrappedDel = function () {
+        if (window.__olazPrivacy && window.__olazPrivacy.antiRecall) {
+          return Promise.resolve(false);
+        }
+        return origDel.apply(this, arguments);
+      };
+      wrappedDel.__olazAr = true;
+      try { obj.deleteMessageResourceIfExists = wrappedDel; patched = true; } catch {}
+    }
+    if (typeof obj.convertToRecalled === 'function' && !obj.convertToRecalled.__olazAr) {
+      const origConv = obj.convertToRecalled;
+      const wrappedConv = function (m) {
+        if (window.__olazPrivacy && window.__olazPrivacy.antiRecall && m && typeof m === 'object') {
+          snapshotMessageForAntiRecall(m);
+          const snap = lookupShadowForMsg(m);
+          if (!isRecalledMsgShape(m)) {
+            m.__olazPresalledType = Number(m.__olazPresalledType || 20);
+            m.__olazRecalled = true;
+            m.__olazRecalledAt = Number(m.__olazRecalledAt) || Date.now();
+            recordRecalledMsgIds(m, 20);
+            scheduleAntiRecallDomPass();
+            return m;
+          }
+          if (snap) {
+            const restored = restoreRecalledMsgFromShadow(m, snap);
+            scheduleAntiRecallDomPass();
+            return restored;
+          }
+        }
+        return origConv.apply(this, arguments);
+      };
+      wrappedConv.__olazAr = true;
+      try { obj.convertToRecalled = wrappedConv; patched = true; } catch {}
+    }
+    for (const fnName of ['mergeUndo', 'mergeUndoMulti']) {
+      if (typeof obj[fnName] === 'function' && !obj[fnName].__olazAr) {
+        const origMerge = obj[fnName];
+        const wrappedMerge = function () {
+          if (window.__olazPrivacy && window.__olazPrivacy.antiRecall) {
+            for (const arg of Array.from(arguments)) {
+              if (Array.isArray(arg)) {
+                for (const it of arg) snapshotMessageForAntiRecall(it);
+              } else if (arg && typeof arg === 'object') {
+                snapshotMessageForAntiRecall(arg);
+              }
+            }
+            const res = origMerge.apply(this, arguments);
+            const fixOne = (item) => {
+              if (!item || typeof item !== 'object') return item;
+              if (isRecalledMsgShape(item) || item.__olazRecalled) {
+                const snap = lookupShadowForMsg(item);
+                if (snap) return restoreRecalledMsgFromShadow(item, snap);
+                recordRecalledMsgIds(item, item.msgType || 20);
+              }
+              return item;
+            };
+            let out = res;
+            if (Array.isArray(res)) {
+              for (let i = 0; i < res.length; i++) res[i] = fixOne(res[i]);
+            } else if (res && typeof res === 'object') {
+              out = fixOne(res);
+            }
+            for (const arg of Array.from(arguments)) {
+              if (Array.isArray(arg)) {
+                for (let i = 0; i < arg.length; i++) arg[i] = fixOne(arg[i]);
+              } else if (arg && typeof arg === 'object') {
+                fixOne(arg);
+              }
+            }
+            scheduleAntiRecallDomPass();
+            return out;
+          }
+          return origMerge.apply(this, arguments);
+        };
+        wrappedMerge.__olazAr = true;
+        try { obj[fnName] = wrappedMerge; patched = true; } catch {}
+      }
+    }
+    return patched;
+  };
+
+  const scanStoreConversationsForAntiRecall = (st, recoverIfRecalled) => {
+    const alls = (st && st.conversations && st.conversations.alls) || {};
+    let recoveredAny = false;
+    for (const cid of Object.keys(alls)) {
+      const convObj = alls[cid];
+      const msgs = convObj && convObj.messages;
+      if (!Array.isArray(msgs)) continue;
+      for (let i = 0; i < msgs.length; i++) {
+        const m = msgs[i];
+        if (!m || typeof m !== 'object') continue;
+        if (!isRecalledMsgShape(m)) {
+          if (recoverIfRecalled && m.quote && (Number(m.quote.cliMsgType) === 20 || Number(m.quote.cliMsgType) === -27) && !m.quote.__olazQuoteRecalled) {
+            const snap = lookupShadowForMsg(m);
+            if (snap && snap.quote && Number(snap.quote.cliMsgType) !== 20 && Number(snap.quote.cliMsgType) !== -27 && snap.quote.msg) {
+              try {
+                m.quote = Object.assign({}, snap.quote, { __olazQuoteRecalled: true });
+              } catch {}
+            }
+          }
+          snapshotMessageForAntiRecall(m);
+        } else if (recoverIfRecalled) {
+          const snap = lookupShadowForMsg(m);
+          if (snap) {
+            msgs[i] = restoreRecalledMsgFromShadow(m, snap);
+            recoveredAny = true;
+          } else {
+            recordRecalledMsgIds(m, m.msgType || 20);
+          }
+        }
+      }
+    }
+    if (recoveredAny) scheduleAntiRecallDomPass();
+    return recoveredAny;
+  };
+
+  const wrapStoreForAntiRecall = (store) => {
+    if (!store || typeof store.dispatch !== 'function' || store.dispatch.__olazAr) return store;
+    const origDispatch = store.dispatch.bind(store);
+    const wrappedDispatch = function (action) {
+      safe(() => scanStoreConversationsForAntiRecall(store.getState(), false), false);
+      const res = origDispatch.apply(this, arguments);
+      safe(() => scanStoreConversationsForAntiRecall(
+        store.getState(),
+        Boolean(window.__olazPrivacy && window.__olazPrivacy.antiRecall),
+      ), false);
+      return res;
+    };
+    wrappedDispatch.__olazAr = true;
+    try { store.dispatch = wrappedDispatch; } catch {}
+    safe(() => scanStoreConversationsForAntiRecall(
+      store.getState(),
+      Boolean(window.__olazPrivacy && window.__olazPrivacy.antiRecall),
+    ), false);
+    return store;
+  };
+
+  window.__olazPatchAntiRecallTarget = patchAntiRecallTarget;
+  window.__olazWrapStoreForAntiRecall = wrapStoreForAntiRecall;
+  window.__olazRefreshAntiRecallDom = applyAntiRecallBadgesNow;
+
   window.__olazSetPrivacy = (cfg) => {
     if (cfg && typeof cfg === 'object') {
       Object.assign(window.__olazPrivacy, cfg);
+      normalizePrivacyState(window.__olazPrivacy, cfg);
     }
+    broadcastPrivacyToWorkers();
+    syncOpenBubbleMenuAntiRecallState();
+    startAntiRecallDomObserver();
+    applyAntiRecallBadgesNow();
     return Object.assign({}, window.__olazPrivacy);
   };
   const shouldBlockPrivacyReceipt = (rawUrl) => {
@@ -2726,6 +4133,55 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
       }
     } catch {}
 
+    // Wrap webpack exports & DI prototypes for Anti-Recall (`convertToRecalled`, `mergeUndo`, `mergeUndoMulti`, `deleteMessageResourceIfExists`)
+    const patchAntiRecallModules = () => {
+      let count = 0;
+      eachExport(req, (ex) => {
+        if (!ex || (typeof ex !== 'object' && typeof ex !== 'function') || ex === window.$capp) return;
+        try {
+          if (patchAntiRecallTarget(ex)) count += 1;
+          if (ex.default && patchAntiRecallTarget(ex.default)) count += 1;
+        } catch {}
+      });
+      for (const reg of diRegistrations(req)) {
+        for (const c of [reg.instance, reg.provider && reg.provider.useClass, reg.provider]) {
+          if (!c) continue;
+          try {
+            if (typeof c === 'object' && patchAntiRecallTarget(c)) count += 1;
+            const proto = typeof c === 'function' ? c.prototype : (c && typeof c === 'object' ? Object.getPrototypeOf(c) : null);
+            if (proto && patchAntiRecallTarget(proto)) count += 1;
+          } catch {}
+        }
+      }
+      return count > 0;
+    };
+    patchAntiRecallModules();
+    {
+      const arTimer = setInterval(() => { patchAntiRecallModules(); }, 1500);
+      if (arTimer && typeof arTimer.unref === 'function') arTimer.unref();
+      const arStop = setTimeout(() => clearInterval(arTimer), 60000);
+      if (arStop && typeof arStop.unref === 'function') arStop.unref();
+    }
+
+    if (typeof document !== 'undefined' && document) {
+      const bootDomTools = () => {
+        syncSidebarAccountTools();
+        injectBubbleMenuAntiRecall();
+        syncCallSettingsRecordingSection();
+        startAntiRecallDomObserver();
+        scheduleAntiRecallDomPass();
+      };
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', bootDomTools, { once: true });
+      } else {
+        bootDomTools();
+      }
+      const tbTimer = setInterval(() => { if (syncSidebarAccountTools()) clearInterval(tbTimer); }, 600);
+      if (tbTimer && typeof tbTimer.unref === 'function') tbTimer.unref();
+      const tbStop = setTimeout(() => clearInterval(tbTimer), 30000);
+      if (tbStop && typeof tbStop.unref === 'function') tbStop.unref();
+    }
+
     // Attach Redux store + event-driven control-plane bridge (`window.__olazControl`, zero polling timers)
     const attachStore = () => {
       let store = null;
@@ -2739,6 +4195,8 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
       });
       if (!store) return false;
       window.__zaloStore = store;
+      wrapStoreForAntiRecall(store);
+      patchAntiRecallModules();
 
       const ctl = { chat: null, opener: null, io: null, friends: null, groups: null, convs: null, unread: null, preview: null, loader: null, boxReg: null, callHelper: null, loading: false };
       const resolveCtl = () => {
@@ -2796,6 +4254,10 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
       const flushStoreSync = () => {
         syncTimer = null;
         const st = store.getState() || {};
+        scanStoreConversationsForAntiRecall(
+          st,
+          Boolean(window.__olazPrivacy && window.__olazPrivacy.antiRecall),
+        );
         const u = st.user || {};
         const meUid = String(u.userId || '');
         const user = {
@@ -2866,7 +4328,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
             const isMine = fromUid === '0' || (meUid !== '' && fromUid === meUid);
             const text = msgTextOf(m.message) || msgTextOf(m.content) || '';
             const ts = Number(m.sendDttm || m.ts || 0);
-            const recalled = Number(m.msgType) === 20 || Number(m.status) === -27;
+            const recalled = Boolean(m.__olazRecalled) || Number(m.msgType) === 20 || Number(m.status) === -27;
             const sig = `${text}|${ts}|${recalled ? 1 : 0}`;
             if (convMap.get(id) === sig) continue;
             convMap.set(id, sig);

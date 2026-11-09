@@ -2550,6 +2550,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "olaz-web"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "cookie",
+ "cookie_store 0.21.1",
+ "dashmap",
+ "digest",
+ "futures-util",
+ "hex",
+ "hickory-resolver",
+ "hmac",
+ "md-5",
+ "mime_guess",
+ "olaz-core",
+ "olaz-net",
+ "once_cell",
+ "parking_lot",
+ "percent-encoding",
+ "rand 0.8.8",
+ "regex",
+ "reqwest",
+ "rustls 0.23.46",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -17,14 +17,29 @@ use std::ffi::{CStr, CString};
 use std::process::Command;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Native VoIP sample rate (`16,000 Hz`).
 pub const AUDIO_SAMPLE_RATE_HZ: u32 = 16_000;
 /// Samples per 20ms VoIP frame (`320`).
 pub const AUDIO_FRAME_SAMPLES: usize = OPUS_VOIP_FRAME_SAMPLES;
+
+/// Audio stream direction for wait-free VoIP call recording taps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TapSource {
+    TxMic,
+    RxRemote,
+}
+
+/// Fixed-size 20ms (`320` samples @ `16,000 Hz` mono `S16LE`) wait-free audio tap packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioTapPacket {
+    pub source: TapSource,
+    pub samples: [i16; AUDIO_FRAME_SAMPLES],
+}
 /// Bytes per 20ms `S16LE` mono frame (`640` bytes).
 pub const PULSE_RECORD_FRAGSIZE_BYTES: u32 = 640;
 /// Playback target buffer (`1,920` bytes = `60ms` @ `16,000 Hz` mono `S16LE`).
@@ -297,19 +312,57 @@ pub fn resample_mono_i16(input: &[i16], src_rate: u32, dst_rate: u32) -> Vec<i16
 
 /// Downmixes interleaved multi-channel PCM into mono `i16`.
 pub fn downmix_to_mono_i16(interleaved: &[i16], channels: usize) -> Vec<i16> {
+    let mut mono = Vec::with_capacity(interleaved.len() / channels.max(1));
+    downmix_to_mono_i16_into(interleaved, channels, &mut mono);
+    mono
+}
+
+fn downmix_to_mono_i16_into(interleaved: &[i16], channels: usize, out: &mut Vec<i16>) {
+    out.clear();
     if channels <= 1 {
-        return interleaved.to_vec();
+        out.extend_from_slice(interleaved);
+        return;
     }
     let frames = interleaved.len() / channels;
-    let mut mono = Vec::with_capacity(frames);
+    if out.capacity() < frames {
+        out.reserve(frames - out.capacity());
+    }
     for f in 0..frames {
         let mut acc: i32 = 0;
         for c in 0..channels {
             acc += interleaved[f * channels + c] as i32;
         }
-        mono.push((acc / (channels as i32)) as i16);
+        out.push((acc / (channels as i32)) as i16);
     }
-    mono
+}
+
+fn resample_mono_i16_into_deque(
+    input: &[i16],
+    src_rate: u32,
+    dst_rate: u32,
+    out: &mut VecDeque<i16>,
+) {
+    if input.is_empty() || src_rate == 0 || dst_rate == 0 {
+        return;
+    }
+    if src_rate == dst_rate {
+        out.extend(input.iter().copied());
+        return;
+    }
+    let out_len = (((input.len() as u64) * (dst_rate as u64)) / (src_rate as u64)).max(1) as usize;
+    let ratio = (src_rate as f64) / (dst_rate as f64);
+    for i in 0..out_len {
+        let src_pos = (i as f64) * ratio;
+        let idx0 = (src_pos.floor() as usize).min(input.len() - 1);
+        let idx1 = (idx0 + 1).min(input.len() - 1);
+        let frac = src_pos - (idx0 as f64);
+        let s0 = input[idx0] as f64;
+        let s1 = input[idx1] as f64;
+        let interp = (s0 + (s1 - s0) * frac)
+            .round()
+            .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+        out.push_back(interp);
+    }
 }
 
 /// Bounded speaker playback jitter buffer enforcing the `400ms` (`6,400` samples @ 16 kHz) overrun cap.
@@ -511,9 +564,39 @@ struct SharedAudioControl {
     selected_out: AtomicI32,
     in_epoch: AtomicU64,
     out_epoch: AtomicU64,
+    recording_active: AtomicBool,
+    dropped_tap_frames: AtomicU64,
+    tap_tx: Mutex<Option<SyncSender<AudioTapPacket>>>,
     devices: Mutex<AudioDeviceList>,
     jitter: Mutex<PlaybackJitterBuffer>,
     decoder: Mutex<Option<OpusVoipDecoder>>,
+}
+
+impl SharedAudioControl {
+    /// Wait-free audio tap fast path: checks `recording_active` without locking, and uses
+    /// `try_send` so real-time capture/playback threads never block on disk I/O.
+    #[inline]
+    fn emit_tap(&self, source: TapSource, samples: &[i16; AUDIO_FRAME_SAMPLES]) {
+        if !self.recording_active.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut guard = self.tap_tx.lock();
+        if let Some(ref tx) = *guard {
+            match tx.try_send(AudioTapPacket {
+                source,
+                samples: *samples,
+            }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    self.dropped_tap_frames.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    *guard = None;
+                    self.recording_active.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+    }
 }
 
 /// Full-duplex VoIP audio engine managing Opus encoding/decoding, PulseAudio (`pa_simple`) streams,
@@ -546,6 +629,9 @@ impl AudioIoSession {
                 selected_out: AtomicI32::new(-1),
                 in_epoch: AtomicU64::new(0),
                 out_epoch: AtomicU64::new(0),
+                recording_active: AtomicBool::new(false),
+                dropped_tap_frames: AtomicU64::new(0),
+                tap_tx: Mutex::new(None),
                 devices: Mutex::new(devices),
                 jitter: Mutex::new(PlaybackJitterBuffer::new(MAX_PLAYBACK_JITTER_SAMPLES)),
                 decoder: Mutex::new(decoder),
@@ -553,6 +639,27 @@ impl AudioIoSession {
             cap_thread: Mutex::new(None),
             play_thread: Mutex::new(None),
         }
+    }
+
+    /// Attaches or detaches a bounded wait-free `SyncSender<AudioTapPacket>` for call recording.
+    pub fn set_audio_tap(&self, tap: Option<SyncSender<AudioTapPacket>>) {
+        let mut guard = self.ctrl.tap_tx.lock();
+        let active = tap.is_some();
+        *guard = tap;
+        if active {
+            self.ctrl.dropped_tap_frames.store(0, Ordering::Relaxed);
+        }
+        self.ctrl.recording_active.store(active, Ordering::SeqCst);
+    }
+
+    /// Number of 20ms tap packets dropped due to recorder channel backpressure.
+    pub fn dropped_tap_frames(&self) -> u64 {
+        self.ctrl.dropped_tap_frames.load(Ordering::Relaxed)
+    }
+
+    /// Emits a 20ms PCM frame directly through the wait-free audio tap (if active).
+    pub fn emit_tap_frame(&self, source: TapSource, samples: &[i16; AUDIO_FRAME_SAMPLES]) {
+        self.ctrl.emit_tap(source, samples);
     }
 
     /// Enumerates current capture & playback devices (refreshing cached device IDs).
@@ -594,7 +701,7 @@ impl AudioIoSession {
     /// Mutes/unmutes speaker playback.
     pub fn set_speaker_muted(&self, muted: bool) {
         self.ctrl.speaker_muted.store(muted, Ordering::SeqCst);
-        if muted {
+        if muted && !self.ctrl.recording_active.load(Ordering::Relaxed) {
             self.ctrl.jitter.lock().clear();
         }
     }
@@ -620,9 +727,11 @@ impl AudioIoSession {
     }
 
     /// Decodes an inbound 20ms Opus packet and queues it into the `400ms`-capped playback buffer
-    /// (unless speaker output is muted).
+    /// (unless speaker output is muted AND call recording is inactive).
     pub fn push_inbound_opus(&self, opus_packet: &[u8]) {
-        if self.ctrl.speaker_muted.load(Ordering::Relaxed) {
+        if self.ctrl.speaker_muted.load(Ordering::Relaxed)
+            && !self.ctrl.recording_active.load(Ordering::Relaxed)
+        {
             return;
         }
         let mut dec_guard = self.ctrl.decoder.lock();
@@ -638,7 +747,9 @@ impl AudioIoSession {
 
     /// Pushes pre-decoded `16,000 Hz` mono PCM directly into the `400ms`-capped playback buffer.
     pub fn push_inbound_pcm(&self, pcm_16k: &[i16]) {
-        if self.ctrl.speaker_muted.load(Ordering::Relaxed) {
+        if self.ctrl.speaker_muted.load(Ordering::Relaxed)
+            && !self.ctrl.recording_active.load(Ordering::Relaxed)
+        {
             return;
         }
         self.ctrl.jitter.lock().push_pcm(pcm_16k);
@@ -678,6 +789,7 @@ impl AudioIoSession {
 
     /// Stops capture & playback threads cleanly.
     pub fn stop(&self) {
+        self.set_audio_tap(None);
         if !self.ctrl.running.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -725,13 +837,16 @@ fn process_captured_320(
     cb: &Arc<dyn Fn(Vec<u8>) + Send + Sync>,
 ) {
     if ctrl.mic_muted.load(Ordering::Relaxed) {
-        // Muted: drop mic PCM before encode (matches ZaloCall / zaudio.cpp).
+        // Muted: drop mic PCM before encode (matches ZaloCall / zaudio.cpp),
+        // while emitting 20ms silent TX tap frames to keep recording timeline sync.
         ctrl.mic_level_permille.store(0, Ordering::Relaxed);
+        ctrl.emit_tap(TapSource::TxMic, &[0i16; AUDIO_FRAME_SAMPLES]);
         return;
     }
     let gain = f32::from_bits(ctrl.mic_gain_bits.load(Ordering::Relaxed));
     let level = apply_mic_gain_and_level(frame_320, gain);
     ctrl.mic_level_permille.store(level, Ordering::Relaxed);
+    ctrl.emit_tap(TapSource::TxMic, frame_320);
     if let Ok(pkt) = enc.encode_20ms(frame_320) {
         cb(pkt);
     }
@@ -868,21 +983,21 @@ fn run_cpal_capture_once(
     let in_rate = cfg.sample_rate.0;
     let in_channels = (cfg.channels as usize).max(1);
 
-    let pcm_queue: Arc<Mutex<VecDeque<i16>>> = Arc::new(Mutex::new(VecDeque::with_capacity(3200)));
+    let pcm_queue: Arc<Mutex<VecDeque<i16>>> =
+        Arc::new(Mutex::new(VecDeque::with_capacity(MAX_PLAYBACK_JITTER_SAMPLES + 2048)));
     let q_cb = Arc::clone(&pcm_queue);
     let ctrl_muted = Arc::clone(ctrl);
 
-    let push_interleaved = move |mono_native: Vec<i16>| {
+    let push_mono = move |mono_native: &[i16]| {
         if ctrl_muted.mic_muted.load(Ordering::Relaxed) {
             q_cb.lock().clear();
             return;
         }
-        let resampled = resample_mono_i16(&mono_native, in_rate, AUDIO_SAMPLE_RATE_HZ);
         let mut g = q_cb.lock();
         if g.len() > MAX_PLAYBACK_JITTER_SAMPLES {
             g.clear();
         }
-        g.extend(resampled);
+        resample_mono_i16_into_deque(mono_native, in_rate, AUDIO_SAMPLE_RATE_HZ, &mut g);
     };
 
     let err_fn = |err| {
@@ -890,38 +1005,59 @@ fn run_cpal_capture_once(
     };
 
     let stream = match sample_format {
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &cfg,
-            move |data: &[i16], _| {
-                push_interleaved(downmix_to_mono_i16(data, in_channels));
-            },
-            err_fn,
-            None,
-        ),
-        cpal::SampleFormat::U16 => device.build_input_stream(
-            &cfg,
-            move |data: &[u16], _| {
-                let signed: Vec<i16> = data
-                    .iter()
-                    .map(|&u| (u as i32 - 32768).clamp(-32768, 32767) as i16)
-                    .collect();
-                push_interleaved(downmix_to_mono_i16(&signed, in_channels));
-            },
-            err_fn,
-            None,
-        ),
-        _ => device.build_input_stream(
-            &cfg,
-            move |data: &[f32], _| {
-                let signed: Vec<i16> = data
-                    .iter()
-                    .map(|&f| (f * 32767.0).round().clamp(-32768.0, 32767.0) as i16)
-                    .collect();
-                push_interleaved(downmix_to_mono_i16(&signed, in_channels));
-            },
-            err_fn,
-            None,
-        ),
+        cpal::SampleFormat::I16 => {
+            let mut mono_scratch: Vec<i16> = Vec::with_capacity(4096);
+            device.build_input_stream(
+                &cfg,
+                move |data: &[i16], _| {
+                    downmix_to_mono_i16_into(data, in_channels, &mut mono_scratch);
+                    push_mono(&mono_scratch);
+                },
+                err_fn,
+                None,
+            )
+        }
+        cpal::SampleFormat::U16 => {
+            let mut signed_scratch: Vec<i16> = Vec::with_capacity(8192);
+            let mut mono_scratch: Vec<i16> = Vec::with_capacity(4096);
+            device.build_input_stream(
+                &cfg,
+                move |data: &[u16], _| {
+                    signed_scratch.clear();
+                    if signed_scratch.capacity() < data.len() {
+                        signed_scratch.reserve(data.len() - signed_scratch.capacity());
+                    }
+                    for &u in data {
+                        signed_scratch.push((u as i32 - 32768).clamp(-32768, 32767) as i16);
+                    }
+                    downmix_to_mono_i16_into(&signed_scratch, in_channels, &mut mono_scratch);
+                    push_mono(&mono_scratch);
+                },
+                err_fn,
+                None,
+            )
+        }
+        _ => {
+            let mut signed_scratch: Vec<i16> = Vec::with_capacity(8192);
+            let mut mono_scratch: Vec<i16> = Vec::with_capacity(4096);
+            device.build_input_stream(
+                &cfg,
+                move |data: &[f32], _| {
+                    signed_scratch.clear();
+                    if signed_scratch.capacity() < data.len() {
+                        signed_scratch.reserve(data.len() - signed_scratch.capacity());
+                    }
+                    for &f in data {
+                        signed_scratch
+                            .push((f * 32767.0).round().clamp(-32768.0, 32767.0) as i16);
+                    }
+                    downmix_to_mono_i16_into(&signed_scratch, in_channels, &mut mono_scratch);
+                    push_mono(&mono_scratch);
+                },
+                err_fn,
+                None,
+            )
+        }
     };
 
     let Ok(stream) = stream else {
@@ -929,7 +1065,7 @@ fn run_cpal_capture_once(
     };
     if stream.play().is_err() {
         return;
-    }
+    };
 
     voip_log(
         "audio",
@@ -937,13 +1073,25 @@ fn run_cpal_capture_once(
     );
 
     let mut frame = [0i16; AUDIO_FRAME_SAMPLES];
+    let mut next_muted_tick: Option<Instant> = None;
     while ctrl.running.load(Ordering::Relaxed) && ctrl.in_epoch.load(Ordering::SeqCst) == epoch {
         if ctrl.mic_muted.load(Ordering::Relaxed) {
             pcm_queue.lock().clear();
             ctrl.mic_level_permille.store(0, Ordering::Relaxed);
-            thread::sleep(Duration::from_millis(20));
+            ctrl.emit_tap(TapSource::TxMic, &[0i16; AUDIO_FRAME_SAMPLES]);
+            let target = next_muted_tick
+                .map(|t| t + Duration::from_millis(20))
+                .unwrap_or_else(|| Instant::now() + Duration::from_millis(20));
+            let now = Instant::now();
+            if target > now {
+                thread::sleep(target - now);
+                next_muted_tick = Some(target);
+            } else {
+                next_muted_tick = Some(now);
+            }
             continue;
         }
+        next_muted_tick = None;
         let has_frame = {
             let mut q = pcm_queue.lock();
             if q.len() >= AUDIO_FRAME_SAMPLES {
@@ -1037,10 +1185,11 @@ fn run_pulse_playback_once(
 
     let mut pcm_buf = [0i16; AUDIO_FRAME_SAMPLES];
     while ctrl.running.load(Ordering::Relaxed) && ctrl.out_epoch.load(Ordering::SeqCst) == epoch {
+        ctrl.jitter.lock().pop_into(&mut pcm_buf);
+        // Tap RX audio BEFORE speaker mute zeroes local playback so muting speakers never mutes remote in recording.
+        ctrl.emit_tap(TapSource::RxRemote, &pcm_buf);
         if ctrl.speaker_muted.load(Ordering::Relaxed) {
             pcm_buf.fill(0);
-        } else {
-            ctrl.jitter.lock().pop_into(&mut pcm_buf);
         }
         let mut werr: c_int = 0;
         let rc = unsafe {
@@ -1085,30 +1234,38 @@ fn run_cpal_playback_once(ctrl: &Arc<SharedAudioControl>, dev_id: Option<&str>, 
     let out_channels = (cfg.channels as usize).max(1);
 
     let resampled_out: Arc<Mutex<VecDeque<i16>>> =
-        Arc::new(Mutex::new(VecDeque::with_capacity(4096)));
+        Arc::new(Mutex::new(VecDeque::with_capacity(8192)));
     let q_out = Arc::clone(&resampled_out);
     let ctrl_cb = Arc::clone(ctrl);
 
-    let pull_mono = move |frames: usize| -> Vec<i16> {
-        if ctrl_cb.speaker_muted.load(Ordering::Relaxed) {
+    let fill_mono = move |frames: usize, write_sample: &mut dyn FnMut(usize, i16)| {
+        let spk_muted = ctrl_cb.speaker_muted.load(Ordering::Relaxed);
+        let rec_active = ctrl_cb.recording_active.load(Ordering::Relaxed);
+        if spk_muted && !rec_active {
             q_out.lock().clear();
-            return vec![0i16; frames];
+            for f in 0..frames {
+                write_sample(f, 0);
+            }
+            return;
         }
         let mut q = q_out.lock();
         while q.len() < frames {
             let mut src_chunk = [0i16; AUDIO_FRAME_SAMPLES];
             ctrl_cb.jitter.lock().pop_into(&mut src_chunk);
-            let up = resample_mono_i16(&src_chunk, AUDIO_SAMPLE_RATE_HZ, out_rate);
-            if up.is_empty() {
+            ctrl_cb.emit_tap(TapSource::RxRemote, &src_chunk);
+            if spk_muted {
+                src_chunk.fill(0);
+            }
+            let prev_len = q.len();
+            resample_mono_i16_into_deque(&src_chunk, AUDIO_SAMPLE_RATE_HZ, out_rate, &mut q);
+            if q.len() == prev_len {
                 break;
             }
-            q.extend(up);
         }
-        let mut out = Vec::with_capacity(frames);
-        for _ in 0..frames {
-            out.push(q.pop_front().unwrap_or(0));
+        for f in 0..frames {
+            let s = q.pop_front().unwrap_or(0);
+            write_sample(f, if spk_muted { 0 } else { s });
         }
-        out
     };
 
     let err_fn = |err| {
@@ -1120,12 +1277,11 @@ fn run_cpal_playback_once(ctrl: &Arc<SharedAudioControl>, dev_id: Option<&str>, 
             &cfg,
             move |out: &mut [i16], _| {
                 let frames = out.len() / out_channels;
-                let mono = pull_mono(frames);
-                for (f, &s) in mono.iter().enumerate() {
+                fill_mono(frames, &mut |f, s| {
                     for c in 0..out_channels {
                         out[f * out_channels + c] = s;
                     }
-                }
+                });
             },
             err_fn,
             None,
@@ -1134,13 +1290,12 @@ fn run_cpal_playback_once(ctrl: &Arc<SharedAudioControl>, dev_id: Option<&str>, 
             &cfg,
             move |out: &mut [u16], _| {
                 let frames = out.len() / out_channels;
-                let mono = pull_mono(frames);
-                for (f, &s) in mono.iter().enumerate() {
+                fill_mono(frames, &mut |f, s| {
                     let u = (s as i32 + 32768).clamp(0, 65535) as u16;
                     for c in 0..out_channels {
                         out[f * out_channels + c] = u;
                     }
-                }
+                });
             },
             err_fn,
             None,
@@ -1149,13 +1304,12 @@ fn run_cpal_playback_once(ctrl: &Arc<SharedAudioControl>, dev_id: Option<&str>, 
             &cfg,
             move |out: &mut [f32], _| {
                 let frames = out.len() / out_channels;
-                let mono = pull_mono(frames);
-                for (f, &s) in mono.iter().enumerate() {
+                fill_mono(frames, &mut |f, s| {
                     let v = (s as f32) / 32768.0;
                     for c in 0..out_channels {
                         out[f * out_channels + c] = v;
                     }
-                }
+                });
             },
             err_fn,
             None,

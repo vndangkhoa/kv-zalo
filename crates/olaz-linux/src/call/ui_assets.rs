@@ -17,8 +17,8 @@ pub const CALL_UI_DEVICES_URL: &str = "zcall-ui://app/devices.html";
 /// Preload bridge script injected at `UserScriptInjectionTime::Start` into every Call UI WebView.
 pub const PRELOAD_BRIDGE_JS: &str = r#"(function () {
   if (window.zcallUI) return;
-  var listeners = { partner: [], state: [], devices: [], micLevel: [], videoFrame: [] };
-  var latest = { partner: null, state: null, devices: null, micLevel: 0 };
+  var listeners = { partner: [], state: [], devices: [], micLevel: [], videoFrame: [], recording: [] };
+  var latest = { partner: null, state: null, devices: null, micLevel: 0, recording: null };
 
   function postToRust(action, value) {
     try {
@@ -30,6 +30,7 @@ pub const PRELOAD_BRIDGE_JS: &str = r#"(function () {
       }
     } catch (_e) {}
   }
+  var post = postToRust;
 
   window.zcallUI = {
     onPartner: function (cb) {
@@ -51,6 +52,12 @@ pub const PRELOAD_BRIDGE_JS: &str = r#"(function () {
     onVideoFrame: function (cb) {
       listeners.videoFrame.push(cb);
     },
+    onRecording: function (cb) {
+      listeners.recording.push(cb);
+      if (latest.recording) { try { cb(latest.recording); } catch (_e) {} }
+    },
+    toggleRecord: (opts) => post("toggleRecord", opts),
+    openRecordingFolder: (path) => post("openRecordingFolder", path),
     action: function (action, value) {
       postToRust(action, value);
     },
@@ -67,7 +74,7 @@ pub const PRELOAD_BRIDGE_JS: &str = r#"(function () {
     if (ev.button !== 0) return;
     var t = ev.target;
     if (!t || !t.closest) return;
-    if (t.closest('button, select, input, option, .no-drag, .wc, .dock-btn, .rbtn, #actions, #dock')) return;
+    if (t.closest('button, select, input, option, .no-drag, .wc, .dock-btn, .rbtn, #actions, #dock, .controls-bar, #rec-toast')) return;
     if (t.closest('#titlebar, .drag-region, #wrap')) {
       postToRust('windowDrag', {
         button: 1,
@@ -124,6 +131,15 @@ pub const ICONS_CSS: &str = r#"/* Clean inline SVG icons — zero binary PNG/TTF
 }
 .nic-accept {
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z'/></svg>");
+}
+.nic-record {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none'><circle cx='12' cy='12' r='9' stroke='%23ffffff' stroke-width='2'/><circle cx='12' cy='12' r='4.5' fill='%23ef4444'/></svg>");
+}
+.nic-record-stop {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none'><circle cx='12' cy='12' r='9' stroke='%23fca5a5' stroke-width='2'/><rect x='8.5' y='8.5' width='7' height='7' rx='1.4' fill='%23ffffff'/></svg>");
+}
+.nic-folder {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2334d399' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z'/></svg>");
 }
 "#;
 
@@ -265,22 +281,29 @@ pub const CALL_HTML: &str = r#"<!doctype html>
     <canvas id="remote-video" width="320" height="240"></canvas>
     <canvas id="local-video" width="240" height="180"></canvas>
 
-    <div id="center">
+    <div id="center" class="header-info">
       <div class="avatar-ring">
         <div class="avatar" id="avatar"><span id="avatar-initial">Z</span></div>
       </div>
       <div class="partner-name" id="partner-name">—</div>
       <div class="call-status" id="status">Đang kết nối...</div>
+      <div class="rec-indicator" id="rec-indicator" hidden><span class="rec-dot">●</span> <span id="rec-time">REC 00:00</span></div>
       <div class="mic-bar-wrap" title="Mức thu micro">
         <div class="mic-bar-fill" id="mic-level-fill"></div>
       </div>
     </div>
 
-    <div id="dock" class="no-drag">
+    <div id="rec-toast" class="rec-toast no-drag" hidden title="Nhấn để mở thư mục chứa bản ghi">
+      <span class="nic nic-folder"></span>
+      <span id="rec-toast-text"></span>
+    </div>
+
+    <div id="dock" class="controls-bar no-drag">
       <button class="dock-btn" id="btn-spk" title="Loa"><span class="nic nic-speaker" id="ic-spk"></span></button>
       <button class="dock-btn" id="btn-mic" title="Micro"><span class="nic nic-mic" id="ic-mic"></span></button>
       <button class="dock-btn" id="btn-cam" title="Camera"><span class="nic nic-cam-off" id="ic-cam"></span></button>
       <button class="dock-btn" id="btn-screen" title="Chia sẻ màn hình"><span class="nic nic-screen" id="ic-screen"></span></button>
+      <button class="dock-btn" id="btn-record" title="Ghi âm cuộc gọi (Chuột phải đổi WAV/Opus)"><span class="nic nic-record" id="ic-record"></span></button>
       <button class="dock-btn" id="btn-more" title="Thiết bị âm thanh"><span class="nic nic-more"></span></button>
       <button class="dock-btn dock-end" id="btn-end" title="Kết thúc"><span class="nic nic-endcall"></span></button>
     </div>
@@ -338,23 +361,44 @@ body.video-active.remote-has-frames .avatar-ring { display: none; }
 }
 .partner-name { font-size: 21px; font-weight: 600; color: #f9fafb; text-align: center; }
 .call-status { font-size: 14px; color: #cbd5e1; min-height: 20px; }
+[hidden] { display: none !important; }
+.rec-indicator {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 11px; border-radius: 999px;
+  font-size: 12px; font-weight: 700; letter-spacing: 0.4px; color: #fecaca;
+  background: rgba(220, 38, 38, 0.24); border: 1px solid rgba(248, 113, 113, 0.55);
+}
+@keyframes recPulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.3; transform: scale(0.85); } }
+.rec-dot { color: #ef4444; font-size: 12px; line-height: 1; animation: recPulse 1.1s ease-in-out infinite; }
 .mic-bar-wrap { width: 120px; height: 5px; border-radius: 3px; background: rgba(255,255,255,0.14); overflow: hidden; margin-top: 4px; }
 .mic-bar-fill { width: 0%; height: 100%; background: #34d399; transition: width 75ms linear; }
 
+.rec-toast {
+  position: absolute; bottom: 98px; left: 50%; transform: translateX(-50%); z-index: 6;
+  max-width: calc(100% - 32px); display: inline-flex; align-items: center; gap: 8px;
+  padding: 8px 14px; border-radius: 10px; background: rgba(17, 24, 39, 0.94);
+  border: 1px solid rgba(52, 211, 153, 0.45); color: #ecfdf5; font-size: 12.5px; cursor: pointer;
+  box-shadow: 0 8px 20px rgba(0,0,0,0.45); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.rec-toast:hover { background: rgba(31, 41, 55, 0.98); border-color: rgba(52, 211, 153, 0.75); }
+.rec-toast.rec-toast-error { border-color: rgba(248, 113, 113, 0.6); color: #fecaca; cursor: default; }
+.rec-toast .nic-folder { width: 18px; height: 18px; flex: 0 0 auto; }
+#rec-toast-text { overflow: hidden; text-overflow: ellipsis; }
+
 #dock {
-  z-index: 5; display: flex; align-items: center; gap: 14px;
-  background: rgba(24, 28, 34, 0.86); padding: 12px 18px; border-radius: 40px;
+  z-index: 5; display: flex; align-items: center; gap: 9px;
+  background: rgba(24, 28, 34, 0.86); padding: 10px 14px; border-radius: 40px;
   border: 1px solid rgba(255,255,255,0.09); backdrop-filter: blur(8px);
 }
 .dock-btn {
-  width: 48px; height: 48px; border-radius: 50%; border: none; cursor: pointer;
+  width: 43px; height: 43px; border-radius: 50%; border: none; cursor: pointer;
   background: rgba(255,255,255,0.12); display: inline-flex; align-items: center; justify-content: center;
-  transition: background 120ms ease, transform 90ms ease;
+  transition: background 120ms ease, transform 90ms ease, box-shadow 120ms ease;
 }
 .dock-btn:hover { background: rgba(255,255,255,0.2); }
 .dock-btn:active { transform: scale(0.95); }
 .dock-btn.active-accent { background: #2563eb; }
 .dock-btn.muted { background: rgba(239, 68, 68, 0.22); }
+.dock-btn.recording { background: rgba(239, 68, 68, 0.34); box-shadow: 0 0 0 2px rgba(248, 113, 113, 0.65); }
 .dock-end { background: #ef4444; }
 .dock-end:hover { background: #dc2626; }
 "#;
@@ -367,6 +411,53 @@ pub const CALL_JS: &str = r#"(function () {
 
   var state = 'calling', connectedAt = null, muted = false, spkOff = false;
   var camEnabled = false, screenSharing = false, tickIv = null;
+  var recActive = false, recStartedAt = null, recTickIv = null, recToastTm = null;
+  var recFormat = 'wav', lastSavedPath = null;
+
+  function renderRecTimer() {
+    var sec = (recActive && recStartedAt) ? (Date.now() - recStartedAt) / 1000 : 0;
+    $('rec-time').textContent = 'REC ' + fmt.formatDuration(sec);
+  }
+
+  function showRecToast(text, savedPath, isError) {
+    lastSavedPath = savedPath || null;
+    var toast = $('rec-toast');
+    $('rec-toast-text').textContent = text || '';
+    toast.classList.toggle('rec-toast-error', !!isError);
+    toast.hidden = false;
+    if (recToastTm) clearTimeout(recToastTm);
+    recToastTm = setTimeout(function () { toast.hidden = true; }, 8000);
+  }
+
+  function applyRecording(r) {
+    if (!r) return;
+    recActive = !!r.active;
+    if (r.format === 'wav' || r.format === 'opus') recFormat = r.format;
+    if (recTickIv) { clearInterval(recTickIv); recTickIv = null; }
+    if (recActive) {
+      $('rec-indicator').hidden = false;
+      $('rec-toast').hidden = true;
+      if (r.startedAtMs) {
+        recStartedAt = r.startedAtMs;
+        renderRecTimer();
+        recTickIv = setInterval(renderRecTimer, 500);
+      } else {
+        recStartedAt = null;
+        $('rec-time').textContent = 'REC CHỜ KẾT NỐI';
+      }
+    } else {
+      recStartedAt = null;
+      $('rec-indicator').hidden = true;
+      if (r.error) {
+        showRecToast('Lỗi ghi âm: ' + r.error, null, true);
+      } else if (r.path) {
+        var fname = String(r.path).split(/[\\/]/).pop() || String(r.path);
+        showRecToast('Đã lưu: ' + fname + ' (mở thư mục)', r.path, false);
+      }
+    }
+    $('btn-record').classList.toggle('recording', recActive);
+    $('ic-record').className = 'nic ' + (recActive ? 'nic-record-stop' : 'nic-record');
+  }
 
   function renderStatus() {
     var sec = (state === 'connected' && connectedAt) ? (Date.now() - connectedAt) / 1000 : 0;
@@ -437,6 +528,7 @@ pub const CALL_JS: &str = r#"(function () {
     $('mic-level-fill').style.width = (muted ? 0 : pct) + '%';
   });
   api.onVideoFrame(drawRgbaFrame);
+  api.onRecording(applyRecording);
 
   $('btn-end').addEventListener('click', function () { sounds.stopAll(); api.action('end'); });
   $('btn-mic').addEventListener('click', function () {
@@ -463,6 +555,21 @@ pub const CALL_JS: &str = r#"(function () {
     if (screenSharing) document.body.classList.add('video-active');
     syncMediaButtons();
     api.action('toggleScreenShare', screenSharing);
+  });
+  $('btn-record').addEventListener('click', function () {
+    api.toggleRecord({ format: recFormat, layout: 'stereo' });
+  });
+  $('btn-record').addEventListener('contextmenu', function (ev) {
+    ev.preventDefault();
+    if (!recActive) {
+      recFormat = (recFormat === 'wav') ? 'opus' : 'wav';
+      showRecToast('Định dạng ghi âm: ' + recFormat.toUpperCase(), null, false);
+    }
+  });
+  $('rec-toast').addEventListener('click', function () {
+    if (lastSavedPath) {
+      api.openRecordingFolder(lastSavedPath);
+    }
   });
   $('btn-more').addEventListener('click', function () { api.action('openDevices'); });
   $('wc-min').addEventListener('click', function () { api.action('win', 'minimize'); });

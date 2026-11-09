@@ -120,7 +120,7 @@ fn privacy_config_atomic_persistence_and_js_init_script() {
     let tmp = TempDir::new().unwrap();
     let cfg_dir = tmp.path().join("config/profiles/work");
 
-    // Missing file defaults to all false
+    // Missing file defaults to anti_recall=true and outbound blockers=false
     let mut cfg = PrivacyConfig::load_from(&cfg_dir);
     assert_eq!(
         cfg,
@@ -128,12 +128,14 @@ fn privacy_config_atomic_persistence_and_js_init_script() {
             block_typing: false,
             block_seen: false,
             block_delivered: false,
+            anti_recall: true,
         }
     );
 
     cfg.apply_patch(&json!({
         "blockTyping": true,
         "block_seen": true,
+        "anti_recall": true,
     }));
     cfg.save_to(&cfg_dir).unwrap();
 
@@ -148,12 +150,55 @@ fn privacy_config_atomic_persistence_and_js_init_script() {
     assert!(reloaded.block_typing);
     assert!(reloaded.block_seen);
     assert!(!reloaded.block_delivered);
+    assert!(reloaded.anti_recall);
 
     let js = reloaded.to_js_init_script();
     assert!(js.contains("window.__olazSetPrivacy && window.__olazSetPrivacy("));
     assert!(js.contains("\"block_typing\":true"));
     assert!(js.contains("\"blockSeen\":true"));
     assert!(js.contains("\"block_delivered\":false"));
+    assert!(js.contains("\"anti_recall\":true"));
+    assert!(js.contains("\"antiRecall\":true"));
+
+    // Verify camelCase `antiRecall` patch alias and Tray privacy anti-recall toggle
+    let mut patched_alias = reloaded;
+    patched_alias.apply_patch(&json!({ "antiRecall": false }));
+    assert!(!patched_alias.anti_recall);
+
+    assert_eq!(
+        olaz_linux::tray::LABEL_ANTI_RECALL,
+        "Giữ tin nhắn thu hồi (Xem tin thu hồi)"
+    );
+    let mut tray_priv = olaz_linux::tray::TrayPrivacyState::default();
+    assert!(tray_priv.get(olaz_linux::tray::PrivacyField::AntiRecall));
+    tray_priv.set(olaz_linux::tray::PrivacyField::AntiRecall, false);
+    assert!(!tray_priv.get(olaz_linux::tray::PrivacyField::AntiRecall));
+    tray_priv.set(olaz_linux::tray::PrivacyField::AntiRecall, true);
+    assert!(tray_priv.get(olaz_linux::tray::PrivacyField::AntiRecall));
+    assert!(tray_priv.anti_recall);
+
+    // Verify CallRecordingSettings atomic persistence & JS init payload
+    let default_rec = tmp.path().join("share/olaz/recordings");
+    let rec_initial = olaz_linux::CallRecordingSettings::load_from(&cfg_dir);
+    assert_eq!(rec_initial.recordings_dir, None);
+    assert_eq!(rec_initial.resolved_dir(&default_rec), default_rec);
+
+    let custom_rec = tmp.path().join("CustomCallRecords");
+    let rec_saved = olaz_linux::CallRecordingSettings {
+        recordings_dir: Some(custom_rec.clone()),
+    };
+    rec_saved.save_to(&cfg_dir).unwrap();
+    let rec_file = olaz_linux::CallRecordingSettings::file_path(&cfg_dir);
+    assert_eq!(
+        std::fs::metadata(&rec_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let rec_reloaded = olaz_linux::CallRecordingSettings::load_from(&cfg_dir);
+    assert_eq!(rec_reloaded.resolved_dir(&default_rec), custom_rec);
+    let rec_js =
+        olaz_linux::CallRecordingSettings::to_js_init_script(&custom_rec, &default_rec);
+    assert!(rec_js.contains("window.__olazSetCallRecording && window.__olazSetCallRecording("));
+    assert!(rec_js.contains("\"isCustom\":true"));
 }
 
 // ============================================================================
@@ -831,11 +876,11 @@ async fn rest_api_endpoints_bearer_auth_mcp_stdio_and_socket_rpc_bridge() {
         json!({
             "jsonrpc": "2.0",
             "id": 13,
-            "method": "tools/call",
             "params": {
                 "name": "zalo_set_privacy",
-                "arguments": { "block_seen": true }
-            }
+                "arguments": { "block_seen": true, "anti_recall": true }
+            },
+            "method": "tools/call"
         })
         .to_string(),
     ]
@@ -867,6 +912,7 @@ async fn rest_api_endpoints_bearer_auth_mcp_stdio_and_socket_rpc_bridge() {
         .collect();
     for expected_tool in [
         "zalo_status",
+        "zalo_list_profiles",
         "zalo_list_threads",
         "zalo_get_messages",
         "zalo_send_message",
@@ -886,7 +932,9 @@ async fn rest_api_endpoints_bearer_auth_mcp_stdio_and_socket_rpc_bridge() {
     assert_eq!(out_lines[3]["result"]["isError"], false);
 
     assert_eq!(sent_log.lock().len(), 2);
-    assert!(PrivacyConfig::load_from(&config_dir).block_seen);
+    let saved_priv = PrivacyConfig::load_from(&config_dir);
+    assert!(saved_priv.block_seen);
+    assert!(saved_priv.anti_recall);
 
     drop(primary_guard);
 }
@@ -1084,4 +1132,215 @@ async fn updater_github_to_forgejo_fallback_sha256sums_and_transactional_install
     )
     .unwrap();
     assert_eq!(std::fs::read(&target_bin).unwrap(), verified_bytes);
+}
+
+// ============================================================================
+// 7. Profile-Scoped Autostart (`AutostartManager::for_profile`)
+// ============================================================================
+
+#[test]
+fn autostart_manager_for_profile_isolates_desktop_entries_and_preserves_default() {
+    let tmp = TempDir::new().unwrap();
+    let autostart_dir = tmp.path().join("autostart");
+    let cfg_default = tmp.path().join("config/olaz");
+    let cfg_acc2 = tmp.path().join("config/olaz/profiles/account-2");
+    let fake_exe = tmp.path().join("bin/olaz");
+
+    let mgr_default = olaz_linux::AutostartManager::for_profile(
+        &autostart_dir,
+        &cfg_default,
+        "default",
+    )
+    .with_notify_systemd(false)
+    .with_exe_path(&fake_exe);
+
+    let mgr_acc2 = olaz_linux::AutostartManager::for_profile(
+        &autostart_dir,
+        &cfg_acc2,
+        "account-2",
+    )
+    .with_notify_systemd(false)
+    .with_exe_path(&fake_exe);
+
+    assert_eq!(
+        mgr_default.desktop_file_path(),
+        autostart_dir.join("olaz.desktop")
+    );
+    assert_eq!(
+        mgr_acc2.desktop_file_path(),
+        autostart_dir.join("olaz-account-2.desktop")
+    );
+
+    // Enable autostart on default profile -> writes `olaz.desktop` without `--profile`
+    mgr_default.set_open_at_login(true).unwrap();
+    assert!(mgr_default.desktop_file_path().is_file());
+    let default_desktop = std::fs::read_to_string(mgr_default.desktop_file_path()).unwrap();
+    assert!(!default_desktop.contains("--profile"));
+    assert!(default_desktop.contains("--minimized"));
+
+    // Booting/reconciling or toggling secondary profile NEVER clobbers or deletes `olaz.desktop`!
+    mgr_acc2.reconcile(Some(false)).unwrap();
+    assert!(
+        mgr_default.desktop_file_path().is_file(),
+        "secondary profile startup reconcile must not delete default olaz.desktop"
+    );
+
+    mgr_acc2.set_open_at_login(true).unwrap();
+    assert!(mgr_acc2.desktop_file_path().is_file());
+    let acc2_desktop = std::fs::read_to_string(mgr_acc2.desktop_file_path()).unwrap();
+    assert!(acc2_desktop.contains("--profile account-2 --minimized"));
+    assert!(acc2_desktop.contains("Name=Olaz (account-2)"));
+
+    // Disabling secondary profile removes ONLY `olaz-account-2.desktop`
+    mgr_acc2.set_open_at_login(false).unwrap();
+    assert!(!mgr_acc2.desktop_file_path().exists());
+    assert!(mgr_default.desktop_file_path().is_file());
+}
+
+// ============================================================================
+// 8. Multi-Account Control Backend (`MultiAccountControlBackend`, `/api/v1/profiles`, `zalo_list_profiles`)
+// ============================================================================
+
+#[tokio::test]
+async fn multi_account_control_backend_rest_and_mcp_profile_routing() {
+    let tmp = TempDir::new().unwrap();
+    let cfg_default = tmp.path().join("cfg-default");
+    let cfg_acc2 = tmp.path().join("cfg-acc2");
+
+    let state1 = sample_engine_state();
+    {
+        let mut s = state1.write();
+        s.user = Some(UserProfile {
+            user_id: "uid_111".into(),
+            display_name: "Khoa Chính".into(),
+            zalo_name: Some("Khoa".into()),
+            avatar: None,
+            phone: None,
+            raw: json!({}),
+        });
+    }
+    let state2 = sample_engine_state();
+    {
+        let mut s = state2.write();
+        s.user = Some(UserProfile {
+            user_id: "uid_222".into(),
+            display_name: "Khoa Công Việc".into(),
+            zalo_name: Some("Khoa Work".into()),
+            avatar: None,
+            phone: None,
+            raw: json!({}),
+        });
+    }
+
+    let b1: Arc<dyn OlazControlBackend> = Arc::new(
+        EngineControlBackend::new(
+            Arc::clone(&state1),
+            Arc::new(SchedulerEngine::load_from(&cfg_default)),
+            Arc::new(AutoReplyEngine::load_from(&cfg_default)),
+            &cfg_default,
+        )
+        .with_profile_slug("default"),
+    );
+    let b2: Arc<dyn OlazControlBackend> = Arc::new(
+        EngineControlBackend::new(
+            Arc::clone(&state2),
+            Arc::new(SchedulerEngine::load_from(&cfg_acc2)),
+            Arc::new(AutoReplyEngine::load_from(&cfg_acc2)),
+            &cfg_acc2,
+        )
+        .with_profile_slug("account-2"),
+    );
+
+    let multi = Arc::new(olaz_linux::api_mcp::MultiAccountControlBackend::new(
+        "default",
+    ));
+    multi.register_account("default", Some("Cá nhân".into()), Arc::clone(&b1));
+    multi.register_account("account-2", Some("Công việc".into()), Arc::clone(&b2));
+    let multi_dyn: Arc<dyn OlazControlBackend> = multi.clone();
+
+    let server = spawn_local_api_server_with_token(
+        Arc::clone(&multi_dyn),
+        0,
+        Some("multi-token".into()),
+    )
+    .await
+    .unwrap();
+    let base_url = format!("http://{}", server.local_addr());
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    // 1. GET /api/v1/profiles returns all registered accounts + active marker
+    let profiles_resp: Value = http
+        .get(format!("{base_url}/api/v1/profiles"))
+        .bearer_auth("multi-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(profiles_resp["ok"], true);
+    assert_eq!(profiles_resp["active_profile"], "default");
+    let prof_arr = profiles_resp["profiles"].as_array().unwrap();
+    assert_eq!(prof_arr.len(), 2);
+    assert_eq!(prof_arr[0]["slug"], "default");
+    assert_eq!(prof_arr[0]["label"], "Cá nhân");
+    assert_eq!(prof_arr[0]["is_active"], true);
+    assert_eq!(prof_arr[0]["user_id"], "uid_111");
+    assert_eq!(prof_arr[1]["slug"], "account-2");
+    assert_eq!(prof_arr[1]["label"], "Công việc");
+    assert_eq!(prof_arr[1]["is_active"], false);
+    assert_eq!(prof_arr[1]["user_id"], "uid_222");
+
+    // 2. Profile-scoped query `GET /api/v1/status?profile=account-2` & `POST /api/v1/privacy`
+    let st_acc2: Value = http
+        .get(format!("{base_url}/api/v1/status?profile=account-2"))
+        .bearer_auth("multi-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st_acc2["profile"], "account-2");
+    assert_eq!(st_acc2["display_name"], "Khoa Công Việc");
+
+    let priv_acc2: Value = http
+        .post(format!("{base_url}/api/v1/privacy"))
+        .bearer_auth("multi-token")
+        .json(&json!({ "profile": "account-2", "anti_recall": false, "block_seen": true }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(priv_acc2["ok"], true);
+    assert_eq!(priv_acc2["privacy"]["anti_recall"], false);
+    assert_eq!(priv_acc2["privacy"]["block_seen"], true);
+    assert!(!PrivacyConfig::load_from(&cfg_acc2).anti_recall);
+    assert!(PrivacyConfig::load_from(&cfg_acc2).block_seen);
+    assert!(PrivacyConfig::load_from(&cfg_default).anti_recall);
+    assert!(!PrivacyConfig::load_from(&cfg_default).block_seen);
+
+    // 3. MCP `zalo_list_profiles` tool call
+    let mcp_resp = handle_mcp_jsonrpc(
+        &multi_dyn,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/call",
+            "params": {
+                "name": "zalo_list_profiles",
+                "arguments": {}
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mcp_resp["result"]["isError"], false);
+    let text = mcp_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["profiles"].as_array().unwrap().len(), 2);
+
+    server.stop();
 }

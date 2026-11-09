@@ -45,18 +45,46 @@ impl Default for AutostartState {
     }
 }
 
-/// Manages `<base_dir>/olaz-autostart.json` and `<autostart_dir>/olaz.desktop`.
+/// Manages `<config_dir>/olaz-autostart.json` and `<autostart_dir>/olaz[-<slug>].desktop`.
 #[derive(Debug)]
 pub struct AutostartManager {
     state_file: PathBuf,
     autostart_dir: PathBuf,
     exe_path: PathBuf,
+    profile_slug: String,
     notify_systemd: bool,
     lock: Mutex<()>,
 }
 
+fn normalize_autostart_profile_slug(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+        return "default".to_string();
+    }
+    let clean: String = trimmed
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if clean.is_empty() || clean.eq_ignore_ascii_case("default") {
+        "default".to_string()
+    } else {
+        clean
+    }
+}
+
+/// Returns the `.desktop` filename for `profile_slug`:
+/// `"olaz.desktop"` for `"default"` and `"olaz-<slug>.desktop"` for secondary profiles.
+pub fn autostart_desktop_filename_for_profile(profile_slug: &str) -> String {
+    let clean = normalize_autostart_profile_slug(profile_slug);
+    if clean == "default" {
+        AUTOSTART_DESKTOP_FILENAME.to_string()
+    } else {
+        format!("olaz-{clean}.desktop")
+    }
+}
+
 impl AutostartManager {
-    /// Creates an [`AutostartManager`] using the host's current `olaz` executable path.
+    /// Creates an [`AutostartManager`] using the host's current `olaz` executable path (`"default"` profile).
     pub fn new(base_dir: &Path, autostart_dir: &Path, notify_systemd: bool) -> Self {
         Self::with_paths(
             base_dir.join(AUTOSTART_STATE_FILENAME),
@@ -64,6 +92,26 @@ impl AutostartManager {
             resolve_olaz_executable_path(),
             notify_systemd,
         )
+    }
+
+    /// Creates a profile-scoped [`AutostartManager`] writing `olaz.desktop` for `"default"` and
+    /// `olaz-<slug>.desktop` (with `--profile <slug>` in `Exec=`) for secondary profiles.
+    pub fn for_profile(
+        autostart_dir: impl Into<PathBuf>,
+        config_dir: impl Into<PathBuf>,
+        profile_slug: &str,
+    ) -> Self {
+        let autostart_dir = autostart_dir.into();
+        let config_dir = config_dir.into();
+        let clean = normalize_autostart_profile_slug(profile_slug);
+        Self {
+            state_file: config_dir.join(AUTOSTART_STATE_FILENAME),
+            autostart_dir,
+            exe_path: resolve_olaz_executable_path(),
+            profile_slug: clean,
+            notify_systemd: true,
+            lock: Mutex::new(()),
+        }
     }
 
     /// Creates an [`AutostartManager`] with explicit paths (used directly by isolated unit tests).
@@ -77,14 +125,33 @@ impl AutostartManager {
             state_file: state_file.into(),
             autostart_dir: autostart_dir.into(),
             exe_path: exe_path.into(),
+            profile_slug: "default".to_string(),
             notify_systemd,
             lock: Mutex::new(()),
         }
     }
 
-    /// Full path to `<autostart_dir>/olaz.desktop`.
+    /// Configures whether systemd user daemon reloads are triggered when `.desktop` files change.
+    pub fn with_notify_systemd(mut self, notify_systemd: bool) -> Self {
+        self.notify_systemd = notify_systemd;
+        self
+    }
+
+    /// Overrides the executable path written into `Exec=` (useful in deterministic unit tests).
+    pub fn with_exe_path(mut self, exe_path: impl Into<PathBuf>) -> Self {
+        self.exe_path = exe_path.into();
+        self
+    }
+
+    /// Profile slug owned by this manager (`"default"` or secondary slug).
+    pub fn profile_slug(&self) -> &str {
+        &self.profile_slug
+    }
+
+    /// Full path to `<autostart_dir>/olaz.desktop` (or `olaz-<slug>.desktop`).
     pub fn desktop_file_path(&self) -> PathBuf {
-        self.autostart_dir.join(AUTOSTART_DESKTOP_FILENAME)
+        self.autostart_dir
+            .join(autostart_desktop_filename_for_profile(&self.profile_slug))
     }
 
     /// Full path to `<base_dir>/olaz-autostart.json`.
@@ -215,7 +282,11 @@ impl AutostartManager {
     }
 
     fn write_desktop_file_if_changed_unlocked(&self, start_in_tray: bool) -> Result<bool> {
-        let content = format_autostart_desktop_entry(&self.exe_path, start_in_tray);
+        let content = format_autostart_desktop_entry_for_profile(
+            &self.exe_path,
+            &self.profile_slug,
+            start_in_tray,
+        );
         let desktop_path = self.desktop_file_path();
         if let Ok(existing) = std::fs::read_to_string(&desktop_path) {
             if existing == content {
@@ -302,18 +373,37 @@ pub fn format_desktop_exec_arg(exe_path: &Path) -> String {
     out
 }
 
-/// Builds the exact contents of `$XDG_CONFIG_HOME/autostart/olaz.desktop`.
+/// Builds the exact contents of `$XDG_CONFIG_HOME/autostart/olaz.desktop` (`"default"` profile).
 pub fn format_autostart_desktop_entry(exe_path: &Path, start_in_tray: bool) -> String {
+    format_autostart_desktop_entry_for_profile(exe_path, "default", start_in_tray)
+}
+
+/// Builds the exact contents of `$XDG_CONFIG_HOME/autostart/olaz[-<slug>].desktop`.
+pub fn format_autostart_desktop_entry_for_profile(
+    exe_path: &Path,
+    profile_slug: &str,
+    start_in_tray: bool,
+) -> String {
+    let clean = normalize_autostart_profile_slug(profile_slug);
     let exec_bin = format_desktop_exec_arg(exe_path);
-    let exec_line = if start_in_tray {
-        format!("{exec_bin} --minimized")
+    let mut exec_parts = vec![exec_bin];
+    if clean != "default" {
+        exec_parts.push("--profile".to_string());
+        exec_parts.push(clean.clone());
+    }
+    if start_in_tray {
+        exec_parts.push("--minimized".to_string());
+    }
+    let exec_line = exec_parts.join(" ");
+    let name_line = if clean == "default" {
+        "Olaz".to_string()
     } else {
-        exec_bin
+        format!("Olaz ({clean})")
     };
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
-         Name=Olaz\n\
+         Name={name_line}\n\
          Comment=Zalo Desktop Client for Linux\n\
          Exec={exec_line}\n\
          Icon=olaz\n\

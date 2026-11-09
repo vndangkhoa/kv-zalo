@@ -56,7 +56,9 @@ pub use instance::{
     AcquireInstanceOutcome, AcquireProfileInstanceOutcome, InstanceEvent, InstanceRpcHandle,
     ProfileInstanceEvent, RpcHandler, SingleInstanceGuard,
 };
-pub use privacy::{PrivacyConfig, PRIVACY_CONFIG_FILENAME};
+pub use privacy::{
+    CallRecordingSettings, PrivacyConfig, CALL_RECORDING_CONFIG_FILENAME, PRIVACY_CONFIG_FILENAME,
+};
 pub use updater::{
     check_for_updates, check_for_updates_from_urls, compute_sha256_hex,
     download_and_verify_artifact, download_release, install_release, is_newer_semver,

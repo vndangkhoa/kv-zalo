@@ -14,10 +14,17 @@ use serde_json::{json, Value};
 /// Filename of the persisted privacy settings inside `<config_dir>`.
 pub const PRIVACY_CONFIG_FILENAME: &str = "privacy.json";
 
+/// Filename of the persisted call recording directory settings inside `<config_dir>`.
+pub const CALL_RECORDING_CONFIG_FILENAME: &str = "call_recording.json";
+
 static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
 
-/// User-configurable outbound receipt & typing indicator suppression flags.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+const fn default_anti_recall_true() -> bool {
+    true
+}
+
+/// User-configurable outbound receipt, typing indicator, and anti-recall flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivacyConfig {
     #[serde(default, alias = "blockTyping")]
     pub block_typing: bool,
@@ -25,6 +32,19 @@ pub struct PrivacyConfig {
     pub block_seen: bool,
     #[serde(default, alias = "blockDelivered")]
     pub block_delivered: bool,
+    #[serde(default = "default_anti_recall_true", alias = "antiRecall")]
+    pub anti_recall: bool,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            block_typing: false,
+            block_seen: false,
+            block_delivered: false,
+            anti_recall: true,
+        }
+    }
 }
 
 impl PrivacyConfig {
@@ -34,7 +54,7 @@ impl PrivacyConfig {
     }
 
     /// Loads [`PrivacyConfig`] from `<config_dir>/privacy.json`, falling back to [`Self::default`]
-    /// (all `false`) when the file does not exist or cannot be parsed.
+    /// (`anti_recall: true`, outbound blockers `false`) when the file does not exist or cannot be parsed.
     pub fn load_from(config_dir: &Path) -> Self {
         let path = Self::file_path(config_dir);
         fs::read(&path)
@@ -78,6 +98,13 @@ impl PrivacyConfig {
         {
             self.block_delivered = v;
         }
+        if let Some(v) = obj
+            .get("anti_recall")
+            .or_else(|| obj.get("antiRecall"))
+            .and_then(Value::as_bool)
+        {
+            self.anti_recall = v;
+        }
     }
 
     /// Generates the JavaScript init/update snippet invoking `window.__olazSetPrivacy({...})`
@@ -87,9 +114,11 @@ impl PrivacyConfig {
             "block_typing": self.block_typing,
             "block_seen": self.block_seen,
             "block_delivered": self.block_delivered,
+            "anti_recall": self.anti_recall,
             "blockTyping": self.block_typing,
             "blockSeen": self.block_seen,
             "blockDelivered": self.block_delivered,
+            "antiRecall": self.anti_recall,
         });
         format!(
             "window.__olazPrivacy = {payload}; window.__olazSetPrivacy && window.__olazSetPrivacy({payload});"
@@ -142,4 +171,59 @@ fn create_unique_tmp(parent: &Path) -> std::io::Result<(PathBuf, File)> {
         std::io::ErrorKind::AlreadyExists,
         "exhausted temporary file name attempts",
     ))
+}
+
+/// Persisted call recording directory configuration stored at `<config_dir>/call_recording.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallRecordingSettings {
+    #[serde(default, alias = "recordingsDir")]
+    pub recordings_dir: Option<PathBuf>,
+}
+
+impl CallRecordingSettings {
+    /// Returns `<config_dir>/call_recording.json`.
+    pub fn file_path(config_dir: &Path) -> PathBuf {
+        config_dir.join(CALL_RECORDING_CONFIG_FILENAME)
+    }
+
+    /// Loads [`CallRecordingSettings`] from `<config_dir>/call_recording.json`, falling back to
+    /// [`Self::default`] (`recordings_dir: None`) when the file is absent or malformed.
+    pub fn load_from(config_dir: &Path) -> Self {
+        let path = Self::file_path(config_dir);
+        fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Atomically persists this [`CallRecordingSettings`] to `<config_dir>/call_recording.json` (`0o600`).
+    pub fn save_to(&self, config_dir: &Path) -> Result<()> {
+        let path = Self::file_path(config_dir);
+        let mut bytes = serde_json::to_vec_pretty(self)
+            .context("failed to serialize CallRecordingSettings")?;
+        bytes.push(b'\n');
+        write_atomic_private(&path, &bytes)
+    }
+
+    /// Resolves the effective call recordings directory, falling back to `default_dir` when no
+    /// custom path has been configured.
+    pub fn resolved_dir(&self, default_dir: &Path) -> PathBuf {
+        self.recordings_dir
+            .as_ref()
+            .filter(|p| !p.as_os_str().is_empty())
+            .cloned()
+            .unwrap_or_else(|| default_dir.to_path_buf())
+    }
+
+    /// Generates the JavaScript init/update snippet invoking `window.__olazSetCallRecording({...})`.
+    pub fn to_js_init_script(active_dir: &Path, default_dir: &Path) -> String {
+        let payload = json!({
+            "dir": active_dir.to_string_lossy(),
+            "defaultDir": default_dir.to_string_lossy(),
+            "isCustom": active_dir != default_dir,
+        });
+        format!(
+            "window.__olazCallRecording = {payload}; window.__olazSetCallRecording && window.__olazSetCallRecording({payload});"
+        )
+    }
 }

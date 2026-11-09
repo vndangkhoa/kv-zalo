@@ -20,25 +20,44 @@ pub const LABEL_PRIVACY_MENU: &str = "Quyền riêng tư";
 pub const LABEL_BLOCK_TYPING: &str = "Chặn trạng thái đang soạn (Block Typing)";
 pub const LABEL_BLOCK_SEEN: &str = "Chặn đã xem (Block Seen)";
 pub const LABEL_BLOCK_DELIVERED: &str = "Chặn đã nhận (Block Delivered)";
+pub const LABEL_ANTI_RECALL: &str = "Giữ tin nhắn thu hồi (Xem tin thu hồi)";
 pub const LABEL_SCREENSHOT: &str = "Chụp màn hình / Screenshot";
 pub const LABEL_NEW_PROFILE: &str = "Mở tài khoản khác (New Profile)";
 pub const LABEL_QUIT: &str = "Thoát / Quit";
 
-/// Individual receipt-blocking flag controlled from the Privacy tray submenu.
+/// Individual receipt-blocking / anti-recall flag controlled from the Privacy tray submenu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PrivacyField {
     BlockTyping,
     BlockSeen,
     BlockDelivered,
+    AntiRecall,
 }
 
-/// Live receipt-blocking configuration synced between the tray menu and `window.__olazPrivacy`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+const fn default_anti_recall_true() -> bool {
+    true
+}
+
+/// Live privacy configuration synced between the tray menu and `window.__olazPrivacy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct TrayPrivacyState {
     pub block_typing: bool,
     pub block_seen: bool,
     pub block_delivered: bool,
+    #[serde(default = "default_anti_recall_true")]
+    pub anti_recall: bool,
+}
+
+impl Default for TrayPrivacyState {
+    fn default() -> Self {
+        Self {
+            block_typing: false,
+            block_seen: false,
+            block_delivered: false,
+            anti_recall: true,
+        }
+    }
 }
 
 impl TrayPrivacyState {
@@ -47,6 +66,7 @@ impl TrayPrivacyState {
             PrivacyField::BlockTyping => self.block_typing,
             PrivacyField::BlockSeen => self.block_seen,
             PrivacyField::BlockDelivered => self.block_delivered,
+            PrivacyField::AntiRecall => self.anti_recall,
         }
     }
 
@@ -55,6 +75,7 @@ impl TrayPrivacyState {
             PrivacyField::BlockTyping => self.block_typing = enabled,
             PrivacyField::BlockSeen => self.block_seen = enabled,
             PrivacyField::BlockDelivered => self.block_delivered = enabled,
+            PrivacyField::AntiRecall => self.anti_recall = enabled,
         }
     }
 }
@@ -389,6 +410,20 @@ impl Tray for OlazTray {
                             tray.privacy_state.block_delivered = next;
                             tray.emit(OlazTrayEvent::TogglePrivacy {
                                 field: PrivacyField::BlockDelivered,
+                                enabled: next,
+                            });
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                    CheckmarkItem {
+                        label: LABEL_ANTI_RECALL.to_string(),
+                        checked: self.privacy_state.anti_recall,
+                        activate: Box::new(|tray: &mut Self| {
+                            let next = !tray.privacy_state.anti_recall;
+                            tray.privacy_state.anti_recall = next;
+                            tray.emit(OlazTrayEvent::TogglePrivacy {
+                                field: PrivacyField::AntiRecall,
                                 enabled: next,
                             });
                         }),

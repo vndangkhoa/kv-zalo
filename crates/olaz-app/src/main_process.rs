@@ -22,9 +22,9 @@ use olaz_linux::call::{
     enumerate_audio_devices, init_global_voip_log, CallEngineConfig, OlazCallEngine,
 };
 use olaz_linux::{
-    pick_open_dialog, pick_save_file_with_dir, AutostartManager, FileCard, IncomingVoipCall,
-    LinuxCallCoordinator, LinuxNotifier, NotificationEvent, NotificationIcon, NotificationPolicy,
-    NotificationRequest, DEFAULT_KICKOUT_NOTICE,
+    pick_open_dialog, pick_save_file_with_dir, AutostartManager, CallRecordingSettings, FileCard,
+    IncomingVoipCall, LinuxCallCoordinator, LinuxNotifier, NotificationEvent, NotificationIcon,
+    NotificationPolicy, NotificationRequest, DEFAULT_KICKOUT_NOTICE,
 };
 use olaz_net::{
     is_observed_zalo_endpoint, DownloadManager, MediaLoader, NetworkProxy, ZaloCookieJar,
@@ -523,6 +523,7 @@ pub struct NotificationContext {
     pub sound_enabled: bool,
     pub hidden_known: bool,
     pub locked_ids: HashSet<String>,
+    pub account_title_prefix: Option<String>,
 }
 
 impl Default for NotificationContext {
@@ -538,6 +539,7 @@ impl Default for NotificationContext {
             // Fail-closed until `convActions.hidden_known` arrives from the renderer!
             hidden_known: false,
             locked_ids: HashSet::new(),
+            account_title_prefix: None,
         }
     }
 }
@@ -701,13 +703,29 @@ impl ZaloMainProcess {
         let crypto = Arc::new(CryptoBridge::new());
         let fs_bridge = FsBridge::new(Arc::clone(&platform));
         let safe_storage = SafeStorage::new();
-        let keychain = Arc::new(KeychainCipher::for_platform(&platform));
-        let notifier = LinuxNotifier::new();
-        let autostart = Arc::new(AutostartManager::new(
-            platform.base_dir(),
-            platform.autostart_dir(),
-            !platform.is_isolated_root(),
+        let keychain = Arc::new(KeychainCipher::with_profile(
+            platform.base_dir().join("keys"),
+            platform.profile_slug(),
         ));
+        let notifier = LinuxNotifier::new();
+        if platform.profile_slug() == "default" {
+            let legacy_state = platform.base_dir().join(olaz_linux::AUTOSTART_STATE_FILENAME);
+            let config_state = platform
+                .config_dir()
+                .join(olaz_linux::AUTOSTART_STATE_FILENAME);
+            if legacy_state.is_file() && !config_state.exists() {
+                let _ = std::fs::create_dir_all(platform.config_dir());
+                let _ = std::fs::copy(&legacy_state, &config_state);
+            }
+        }
+        let autostart = Arc::new(
+            AutostartManager::for_profile(
+                platform.autostart_dir(),
+                platform.config_dir(),
+                platform.profile_slug(),
+            )
+            .with_notify_systemd(!platform.is_isolated_root()),
+        );
         let call_coordinator = Rc::new(RefCell::new(LinuxCallCoordinator::new()));
         init_global_voip_log(&platform.user_data().join("logs").join("voip"));
         let (call_ui, call_ui_sink) = CallUiController::create_with_event_sink(None);
@@ -726,6 +744,11 @@ impl ZaloMainProcess {
                 (call_ui_sink)(ev);
             },
         ));
+        let default_rec_dir = platform.base_dir().join("recordings");
+        let initial_rec_dir = CallRecordingSettings::load_from(platform.config_dir())
+            .resolved_dir(&default_rec_dir);
+        platform.grant_readable_path(&initial_rec_dir);
+        call_engine.set_recordings_dir(initial_rec_dir);
         call_ui.bind_engine(Arc::clone(&call_engine));
         let shared_worker = SharedWorkerRouter::new();
         let last_kickout_notice = Arc::new(Mutex::new(None));
@@ -897,6 +920,14 @@ impl ZaloMainProcess {
 
     pub fn runtime(&self) -> &ZaloWebRuntime {
         &self.runtime
+    }
+
+    pub fn cookie_jar(&self) -> &ZaloCookieJar {
+        &self.cookie_jar
+    }
+
+    pub fn network(&self) -> &NetworkProxy {
+        &self.network
     }
 
     pub fn media_loader(&self) -> &MediaLoader {
@@ -1631,11 +1662,18 @@ impl ZaloMainProcess {
                 async move {
                     let count = args.first().and_then(Value::as_i64).unwrap_or(0).max(0);
                     let ucount = count as u64;
-                    rt_handle.spawn(async move {
-                        let _ = notifier.emit_unity_badge(ucount).await;
-                    });
                     if let Some(mp) = mp_weak.upgrade() {
-                        mp.emit_event(MainProcessEvent::Badge(count));
+                        if mp.on_event.borrow().is_some() {
+                            mp.emit_event(MainProcessEvent::Badge(count));
+                        } else {
+                            rt_handle.spawn(async move {
+                                let _ = notifier.emit_unity_badge(ucount).await;
+                            });
+                        }
+                    } else {
+                        rt_handle.spawn(async move {
+                            let _ = notifier.emit_unity_badge(ucount).await;
+                        });
                     }
                     Ok(wire::undefined())
                 }
@@ -1664,6 +1702,15 @@ impl ZaloMainProcess {
                     };
                     if !ctx.sound_enabled {
                         req.silent = true;
+                    }
+                    if let Some(ref prefix) = ctx.account_title_prefix {
+                        let clean = prefix.trim();
+                        if !clean.is_empty() {
+                            let tag_prefix = format!("[{clean}]");
+                            if !req.title.starts_with(&tag_prefix) {
+                                req.title = format!("{tag_prefix} {}", req.title);
+                            }
+                        }
                     }
 
                     let avatar_path = mp.resolve_notification_avatar(&req.icon).await;
