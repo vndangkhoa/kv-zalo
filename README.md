@@ -59,9 +59,35 @@ open build/Olaz.app            # real QR login — scan with Zalo on your phone
 A new PC session has no message history except My Cloud, because Zalo keeps history on the phone. Use
 **Đồng bộ tin nhắn từ điện thoại** (confirm on the phone) to import it.
 
-## Build & install (Linux — Rust: Omarchy & Ubuntu)
+## Install & build (Linux — Rust: Omarchy & Ubuntu)
 
-### Omarchy / Arch Linux
+### 1-Click Install (Prebuilt Releases — Omarchy & Ubuntu)
+
+- **1-Line Terminal Installer** (auto-detects **Omarchy / Arch Linux** `pacman` or **Ubuntu / Debian** `apt`, verifies `SHA256SUMS.txt`, and installs desktop launcher + icons):
+  ```bash
+  # GitHub:
+  curl -fsSL https://raw.githubusercontent.com/vndangkhoa/zalo-swift-re/main/packaging/install.sh | bash
+
+  # Forgejo mirror:
+  curl -fsSL https://git.khoavo.myds.me/vndangkhoa/zalo-swift-re/raw/branch/main/packaging/install.sh | bash
+  ```
+  *(Pass `... | bash -s -- --user` to install into `~/.local` without `sudo`, or `--launch` to start Olaz right away.)*
+
+- **1-Click Setup Files** ([GitHub Releases](https://github.com/vndangkhoa/zalo-swift-re/releases) · [Forgejo Releases](https://git.khoavo.myds.me/vndangkhoa/zalo-swift-re/releases) · [GitLab Releases](https://gitlab.khoavo.myds.me/vndangkhoa/zalo-swift-re/-/releases)):
+  - **Universal 1-Click Offline Setup (Omarchy + Ubuntu)**: `olaz-setup-linux-x86_64.run`
+    ```bash
+    chmod +x olaz-setup-linux-x86_64.run && ./olaz-setup-linux-x86_64.run
+    ```
+  - **Ubuntu 22.04 LTS / 24.04 LTS+ / Debian / Linux Mint / Pop!\_OS**: double-click `olaz_0.1.0_amd64.deb` in Software Install, or run:
+    ```bash
+    sudo apt install ./olaz_0.1.0_amd64.deb
+    ```
+  - **Omarchy / Arch Linux / CachyOS / EndeavourOS**:
+    ```bash
+    sudo pacman -U ./olaz-0.1.0-1-x86_64.pkg.tar.zst
+    ```
+
+### Build from source — Omarchy / Arch Linux
 
 1. **Install build & runtime packages** (already present on most Omarchy setups; `libgstolazauto.so` also embeds
    fallback audio/video sinks and FFmpeg MP4/AAC/MP3/H.264 demuxing when `gst-plugins-good` / `gst-libav` are absent):
@@ -96,11 +122,10 @@ A new PC session has no message history except My Cloud, because Zalo keeps hist
    ~/.local/bin/olaz
    ```
 
-3. **Option B — Build & install a native `.deb` package**:
+3. **Option B — Build & install native Linux release packages (`.deb`, `.pkg.tar.zst`, `.run`, `.tar.gz`)**:
    ```bash
-   cargo install cargo-deb
-   cargo deb -p olaz-app
-   sudo apt install ./target/debian/olaz_*.deb
+   ./packaging/build-linux-release.sh
+   sudo apt install ./dist/v0.1.0/olaz_0.1.0_amd64.deb
    ```
 
 ### Linux tests & developer harness

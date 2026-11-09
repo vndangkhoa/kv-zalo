@@ -1,0 +1,98 @@
+name: Linux Release (Omarchy & Ubuntu)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v0.1.0)'
+        required: false
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  release-linux:
+    name: Build & Publish Omarchy + Ubuntu 1-Click Setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Ubuntu build & packaging dependencies
+        run: |
+          ./packaging/ubuntu-deps.sh
+          sudo apt-get install -y librsvg2-bin libarchive-tools zstd dpkg-dev
+
+      - name: Ensure stable Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          rustc --version
+          cargo --version
+
+      - name: Determine release version & tag
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            VER="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+            TAG="v${VER}"
+          fi
+          VER="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Build all 1-click setup packages (Omarchy & Ubuntu)
+        run: |
+          ./packaging/build-linux-release.sh --version "${{ steps.meta.outputs.version }}"
+          ./dist/${{ steps.meta.outputs.tag }}/olaz-setup-linux-x86_64.run --check
+          dpkg-deb -I ./dist/${{ steps.meta.outputs.tag }}/olaz_${{ steps.meta.outputs.version }}_amd64.deb
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          VER="${{ steps.meta.outputs.version }}"
+          NOTES_FILE="$(mktemp)"
+          cat > "$NOTES_FILE" <<EOF
+          ## Olaz ${TAG} — 1-Click Setup for Omarchy (Arch Linux) & Ubuntu
+
+          Native Rust + GTK3 + WebKit2GTK 4.1 desktop client for Zalo on Linux, featuring inline GStreamer media/video playback, full MediaViewer (\`popup-viewer.html\`) photo & JXL preview, Stickers, E2EE, phone sync, system tray, XDG Desktop Portals, and login autostart (with default start-in-tray toggle).
+
+          ### 🚀 1-Command Terminal Install (Omarchy & Ubuntu)
+          \`\`\`bash
+          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/install.sh | bash
+          \`\`\`
+
+          ### 📦 1-Click Offline / Graphical Setup Packages
+          - **Universal 1-Click Installer (Omarchy + Ubuntu)**: \`olaz-setup-linux-x86_64.run\`
+            \`\`\`bash
+            chmod +x olaz-setup-linux-x86_64.run && ./olaz-setup-linux-x86_64.run
+            \`\`\`
+          - **Ubuntu 22.04 LTS / 24.04 LTS+ / Debian / Linux Mint / Pop!_OS**: \`olaz_${VER}_amd64.deb\`
+            - Double-click in Software Install, or run: \`sudo apt install ./olaz_${VER}_amd64.deb\`
+          - **Omarchy / Arch Linux / CachyOS / EndeavourOS**: \`olaz-${VER}-1-x86_64.pkg.tar.zst\`
+            - Run: \`sudo pacman -U ./olaz-${VER}-1-x86_64.pkg.tar.zst\`
+          - **Portable Rootless Tarball (\`~/.local\`)**: \`olaz-${VER}-linux-x86_64.tar.gz\`
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "Olaz ${TAG} — 1-Click Setup for Omarchy & Ubuntu" \
+              --notes-file "$NOTES_FILE"
+            gh release upload "$TAG" dist/"$TAG"/* --clobber
+          else
+            gh release create "$TAG" dist/"$TAG"/* \
+              --title "Olaz ${TAG} — 1-Click Setup for Omarchy & Ubuntu" \
+              --notes-file "$NOTES_FILE"
+          fi

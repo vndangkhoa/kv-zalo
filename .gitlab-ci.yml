@@ -1,0 +1,44 @@
+stages:
+  - build
+  - release
+
+variables:
+  CARGO_TERM_COLOR: always
+
+build-linux-packages:
+  stage: build
+  image: ubuntu:24.04
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+  before_script:
+    - apt-get update
+    - DEBIAN_FRONTEND=noninteractive ./packaging/ubuntu-deps.sh
+    - DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates git librsvg2-bin libarchive-tools zstd dpkg-dev
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    - export PATH="$HOME/.cargo/bin:$PATH"
+  script:
+    - export PATH="$HOME/.cargo/bin:$PATH"
+    - VER="${CI_COMMIT_TAG#v}"
+    - ./packaging/build-linux-release.sh --version "$VER"
+    - ./dist/${CI_COMMIT_TAG}/olaz-setup-linux-x86_64.run --check
+  artifacts:
+    paths:
+      - dist/${CI_COMMIT_TAG}/*
+    expire_in: 30 days
+
+publish-gitlab-release:
+  stage: release
+  image: curlimages/curl:latest
+  needs:
+    - job: build-linux-packages
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+  script:
+    - VER="${CI_COMMIT_TAG#v}"
+    - PKG_BASE="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/olaz/${VER}"
+    - |
+      for f in dist/${CI_COMMIT_TAG}/*; do
+        name="$(basename "$f")"
+        curl --fail --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$f" "${PKG_BASE}/${name}"
+      done

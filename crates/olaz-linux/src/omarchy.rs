@@ -677,6 +677,10 @@ pub fn system_has_nvidia_driver() -> bool {
 const EMBEDDED_GST_OLAZAUTO_SO: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/libgstolazauto.so"));
 
+#[cfg(has_embedded_gst_ffmpeg_helper)]
+const EMBEDDED_GST_OLAZAV_HELPER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/olazav.gsthelper"));
+
 /// Returns the user-writable GStreamer plugin staging directory (`<XDG_CACHE_HOME>/olaz/gst-plugins`).
 pub fn olaz_gst_plugin_dir() -> PathBuf {
     if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
@@ -697,17 +701,25 @@ pub fn ensure_olaz_gst_plugin_staged() -> Option<PathBuf> {
             tracing::warn!("failed to create GStreamer plugin cache dir {}: {err}", dir.display());
             return so_path.is_file().then_some(dir);
         }
-        let up_to_date = fs::read(&so_path)
-            .map(|existing| existing == EMBEDDED_GST_OLAZAUTO_SO)
-            .unwrap_or(false);
-        if !up_to_date {
-            let tmp_path = dir.join(format!(".libgstolazauto.so.tmp.{}", std::process::id()));
-            if let Err(err) = fs::write(&tmp_path, EMBEDDED_GST_OLAZAUTO_SO)
-                .and_then(|()| fs::rename(&tmp_path, &so_path))
-            {
-                let _ = fs::remove_file(&tmp_path);
-                tracing::warn!("failed to stage {}: {err}", so_path.display());
+        let stage_blob = |target: &Path, bytes: &[u8], tag: &str| {
+            let up_to_date = fs::read(target)
+                .map(|existing| existing == bytes)
+                .unwrap_or(false);
+            if !up_to_date {
+                let tmp_path = dir.join(format!(".{tag}.tmp.{}", std::process::id()));
+                if let Err(err) = fs::write(&tmp_path, bytes)
+                    .and_then(|()| fs::rename(&tmp_path, target))
+                {
+                    let _ = fs::remove_file(&tmp_path);
+                    tracing::warn!("failed to stage {}: {err}", target.display());
+                }
             }
+        };
+        stage_blob(&so_path, EMBEDDED_GST_OLAZAUTO_SO, "libgstolazauto.so");
+        #[cfg(has_embedded_gst_ffmpeg_helper)]
+        {
+            let helper_path = dir.join("olazav.gsthelper");
+            stage_blob(&helper_path, EMBEDDED_GST_OLAZAV_HELPER, "olazav.gsthelper");
         }
     }
 

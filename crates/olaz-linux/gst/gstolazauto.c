@@ -43,11 +43,13 @@
 #endif
 #include <string.h>
 
-static void olaz_ensure_dynamic_webkit_media_src (void);
-
 #ifndef PACKAGE
 #define PACKAGE "olaz"
 #endif
+
+#ifndef OLAZ_FFMPEG_HELPER
+
+static void olaz_ensure_dynamic_webkit_media_src (void);
 
 /* ============================================================================
  * Helper: Detect whether system `libgstautodetect.so` (`gst-plugins-good`) exists
@@ -1426,6 +1428,8 @@ olaz_register_webkit_media_src_idle_cb (gpointer user_data)
   return G_SOURCE_REMOVE;
 }
 
+#endif /* !OLAZ_FFMPEG_HELPER */
+
 /* ============================================================================
  * 5. `OlazAvDemux` (`olazavdemux` — FFmpeg libavformat + libavcodec fallback)
  *
@@ -2489,7 +2493,25 @@ static void olaz_av_audio_caps_class_init (OlazAvAudioCapsClass *klass) {
   gst_element_class_add_static_pad_template (ec, &olaz_av_acaps_src);
 }
 
+#ifdef OLAZ_FFMPEG_HELPER
+GST_PLUGIN_EXPORT gboolean
+olazav_register_elements (GstPlugin *plugin)
+{
+  if (!olaz_system_has_full_mp4_decoders () || g_getenv ("OLAZ_GST_FORCE_AVDEMUX") != NULL) {
+    if (!gst_element_register (plugin, "olazavdemux", GST_RANK_PRIMARY + 10, OLAZ_TYPE_AV_DEMUX))
+      return FALSE;
+    if (!gst_element_register (plugin, "olazavvideocaps", GST_RANK_MARGINAL, olaz_av_video_caps_get_type ()))
+      return FALSE;
+    if (!gst_element_register (plugin, "olazavaudiocaps", GST_RANK_MARGINAL, olaz_av_audio_caps_get_type ()))
+      return FALSE;
+  }
+  return TRUE;
+}
+#endif
+
 #endif /* OLAZ_HAVE_FFMPEG */
+
+#ifndef OLAZ_FFMPEG_HELPER
 
 /* ============================================================================
  * 6. `OlazScaletempo` (`scaletempo`) & `playsink` video filter fallbacks
@@ -2863,6 +2885,32 @@ olazauto_plugin_init (GstPlugin *plugin)
     if (!gst_element_register (plugin, "olazavaudiocaps", GST_RANK_MARGINAL, olaz_av_audio_caps_get_type ()))
       return FALSE;
   }
+#else
+  {
+    Dl_info dl_info;
+    const gchar *plugin_file = gst_plugin_get_filename (plugin);
+    if (plugin_file == NULL && dladdr ((const void *) olazauto_plugin_init, &dl_info) != 0)
+      plugin_file = dl_info.dli_fname;
+    if (plugin_file != NULL) {
+      gchar *dir = g_path_get_dirname (plugin_file);
+      gchar *helper_path = g_build_filename (dir, "olazav.gsthelper", NULL);
+      if (g_file_test (helper_path, G_FILE_TEST_IS_REGULAR)) {
+        void *h = dlopen (helper_path, RTLD_NOW | RTLD_LOCAL);
+        if (h != NULL) {
+          typedef gboolean (*OlazAvRegFn) (GstPlugin *);
+          OlazAvRegFn reg_fn = NULL;
+          *(void **) (&reg_fn) = dlsym (h, "olazav_register_elements");
+          if (reg_fn != NULL && !reg_fn (plugin)) {
+            g_free (helper_path);
+            g_free (dir);
+            return FALSE;
+          }
+        }
+      }
+      g_free (helper_path);
+      g_free (dir);
+    }
+  }
 #endif
 
   if (gst_element_factory_find ("webkitwebsrc") != NULL) {
@@ -2899,3 +2947,5 @@ GST_PLUGIN_DEFINE (
     "Olaz",
     "https://github.com/qnguyen3/zalo-swift-re"
 )
+
+#endif /* !OLAZ_FFMPEG_HELPER */
