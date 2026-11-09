@@ -1,16 +1,19 @@
 # Maintainer: Olaz Contributors <noreply@olaz.app>
 pkgname=olaz
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Native Zalo desktop client for Linux (Omarchy & Ubuntu) built in Rust on WebKit2GTK'
 arch=('x86_64' 'aarch64')
-url='https://github.com/qnguyen3/zalo-swift-re'
+url='https://github.com/vndangkhoa/zalo-swift-re'
 license=('GPL-3.0-only')
 depends=(
   'webkit2gtk-4.1'
   'gtk3'
   'gst-plugins-base'
   'gst-plugins-good'
+  'opus'
+  'libpulse'
+  'ffmpeg'
   'xdg-desktop-portal'
   '7zip'
   'hicolor-icon-theme'

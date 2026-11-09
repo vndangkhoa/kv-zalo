@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to publish (e.g. v0.1.0)'
+        description: 'Release tag to publish (e.g. v0.2.0)'
         required: false
-        default: 'v0.1.0'
+        default: 'v0.2.0'
 
 permissions:
   contents: write
@@ -67,9 +67,13 @@ jobs:
           VER="${{ steps.meta.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<EOF
-          ## Olaz ${TAG} — 1-Click Setup for Omarchy (Arch Linux) & Ubuntu
+          ## Olaz ${TAG} — Pure-Rust VoIP Calls, Native Parity & Power Features for Omarchy & Ubuntu
 
-          Native Rust + GTK3 + WebKit2GTK 4.1 desktop client for Zalo on Linux, featuring inline GStreamer media/video playback, full MediaViewer (\`popup-viewer.html\`) photo & JXL preview, Stickers, E2EE, phone sync, system tray, XDG Desktop Portals, and login autostart (with default start-in-tray toggle).
+          100% pure-Rust + GTK3 + WebKit2GTK 4.1 desktop client for Zalo on Linux:
+          - **Pure-Rust 1:1 & Group VoIP Calls**: Opus 16 kHz audio, H.264 camera & screen sharing, Zavi/SRTP encryption, and native incoming/in-call/device windows.
+          - **Native Storage & Addon Parity**: \`ZDB4.0\` (\`db-cross-v4\`), \`zwalker\`, \`file-utilities\`, \`zfile\`, and file-manager \`Ctrl+C\` image clipboard paste.
+          - **Power Features**: Multi-account \`--profile\`, SOCKS5/HTTP \`--proxy\`, \`zalo://\` deep links, privacy receipt blocker, scheduler & auto-reply, local HTTP REST API (\`--api\`), stdio \`--mcp\` server, and \`--check-update\` / \`--update\`.
+          - **Media & Desktop UX**: Inline GStreamer HTTP 206 video playback, \`MediaViewer\` photo & JXL preview, Stickers, E2EE, system tray, and autostart with start-in-tray.
 
           ### 🚀 1-Command Terminal Install (Omarchy & Ubuntu)
           \`\`\`bash

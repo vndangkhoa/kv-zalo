@@ -897,7 +897,8 @@ async fn rest_api_endpoints_bearer_auth_mcp_stdio_and_socket_rpc_bridge() {
 
 #[tokio::test]
 async fn updater_github_to_forgejo_fallback_sha256sums_and_transactional_install() {
-    assert!(is_newer_semver("v0.2.0", CURRENT_OLAZ_VERSION));
+    assert!(is_newer_semver("v99.0.0", CURRENT_OLAZ_VERSION));
+    assert!(is_newer_semver("v0.2.0", "0.1.0"));
     assert!(!is_newer_semver(CURRENT_OLAZ_VERSION, CURRENT_OLAZ_VERSION));
     assert!(is_newer_semver("0.2.0", "0.2.0-rc.1"));
 

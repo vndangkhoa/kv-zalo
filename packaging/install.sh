@@ -11,7 +11,7 @@
 #   --launch            Launch Olaz immediately after installation
 set -euo pipefail
 
-DEFAULT_TAG="v0.1.0"
+DEFAULT_TAG="v0.2.0"
 RELEASE_TAG="${OLAZ_RELEASE_TAG:-}"
 USER_MODE=0
 LAUNCH_AFTER=0
@@ -238,7 +238,7 @@ elif [ "$DISTRO_FAMILY" = "arch" ] && command -v pacman >/dev/null 2>&1; then
     verify_checksum_if_available "$PKG_PATH"
     echo "==> Installing native Omarchy / Arch package (${PKG_NAME}) via pacman..."
     run_privileged pacman -Sy --needed --noconfirm \
-      webkit2gtk-4.1 gtk3 gst-plugins-base gst-plugins-good xdg-desktop-portal 7zip hicolor-icon-theme
+      webkit2gtk-4.1 gtk3 gst-plugins-base gst-plugins-good opus libpulse ffmpeg xdg-desktop-portal 7zip hicolor-icon-theme
     run_privileged pacman -U --noconfirm "$PKG_PATH"
   else
     echo "==> Prebuilt ${PKG_NAME} not found for ${ARCH_UNAME}; falling back to portable install..."

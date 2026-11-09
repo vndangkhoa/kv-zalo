@@ -68,9 +68,15 @@ fi
 NOTES_FILE="$(mktemp)"
 trap 'rm -f "$NOTES_FILE"' EXIT
 cat > "$NOTES_FILE" <<EOF
-## Olaz ${TAG} — 1-Click Setup for Omarchy (Arch Linux) & Ubuntu
+## Olaz ${TAG} — Pure-Rust VoIP Calls, Native Parity & Power Features for Omarchy & Ubuntu
 
-Native Rust + GTK3 + WebKit2GTK 4.1 desktop client for Zalo on Linux, featuring inline GStreamer media/video playback, full \`MediaViewer\` (\`popup-viewer.html\`) photo & JXL preview, Stickers, E2EE, phone sync, system tray, XDG Desktop Portals, and login autostart (with default start-in-tray toggle).
+100% pure-Rust + GTK3 + WebKit2GTK 4.1 desktop client for Zalo on Linux, integrating full parity across \`zalo-linux\` and \`ctdozlite\`:
+
+- **📞 Pure-Rust 1:1 & Group VoIP Calls (\`zcall\` + \`zrtc\`)**: Full-duplex Opus 16 kHz audio (PulseAudio/PipeWire + \`cpal\`), H.264 \`PT 98\`/\`97\` V4L2 camera & X11 screen sharing, \`ZaviNullAuthNoSeq\` & \`SRTP_AES128_CM_HMAC_SHA1_80\` media encryption, \`InitZRTP\` \`0x0b\`/\`0x0c\` framing, and native GTK3/WebKit2GTK incoming/in-call/device-picker windows.
+- **🗄️ Native Modules & Storage Parity**: Pure-Rust \`db-cross-v4\` (\`ZDB4.0\` 64 KiB \`AES-256-CBC\` + XZ + \`parseBinNet\` TLV), \`zwalker\` (all 5 async channels + cancellation), \`file-utilities\` (all 11 sync/async ops), \`zfile\` (\`/proc/mounts\` + drive migration filter), and file-manager \`Ctrl+C\` image clipboard paste.
+- **🛡️ Privacy, Multi-Account & Proxy (\`ctdozlite\` parity)**: Multi-account \`--profile <slug>\` & \`--data-dir <path>\`, \`zalo://\` deep-link Unix-socket IPC, SOCKS5/HTTP \`--proxy <url>\` (with DoH & WebKit2GTK routing), and tray + API toggles blocking typing/seen/delivered receipts.
+- **🤖 Automation, Local REST API, MCP & Self-Updater**: Persistent message scheduler & keyword/regex auto-reply engine, loopback HTTP REST API (\`--api\` / \`--api-port\`), stdio Model Context Protocol server (\`--mcp\`), and SHA-256 verified release updater (\`--check-update\` / \`--update\`).
+- **🎬 Media, Stickers & Desktop UX**: Inline GStreamer HTTP 206 video playback, \`MediaViewer\` (\`popup-viewer.html\`) photo & JXL preview, Stickers, E2EE, login autostart + start-in-tray, unthrottled background message delivery, and persistent window geometry.
 
 ### 🚀 1-Command Terminal Setup (Auto-detects Omarchy & Ubuntu)
 

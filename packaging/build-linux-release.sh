@@ -120,12 +120,13 @@ Architecture: ${DEB_ARCH}
 Installed-Size: ${INSTALLED_KB}
 Maintainer: Olaz Contributors <noreply@olaz.app>
 Homepage: https://github.com/vndangkhoa/zalo-swift-re
-Depends: libc6 (>= 2.35), libwebkit2gtk-4.1-0, libjavascriptcoregtk-4.1-0, libgtk-3-0t64 | libgtk-3-0, libsoup-3.0-0, libasound2t64 | libasound2, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-pipewire | gstreamer1.0-pulseaudio | gstreamer1.0-alsa, xdg-desktop-portal, 7zip | p7zip-full
+Depends: libc6 (>= 2.35), libwebkit2gtk-4.1-0, libjavascriptcoregtk-4.1-0, libgtk-3-0t64 | libgtk-3-0, libsoup-3.0-0, libasound2t64 | libasound2, libopus0, libpulse0, ffmpeg, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-pipewire | gstreamer1.0-pulseaudio | gstreamer1.0-alsa, xdg-desktop-portal, 7zip | p7zip-full
 Description: Native Linux desktop client for Zalo (Omarchy & Ubuntu)
  Olaz is a native Linux desktop client for Zalo built in Rust on WebKit2GTK 4.1.
  It mounts the official Zalo PC interface with frameless desktop integration,
- inline GStreamer media playback, E2EE, phone sync, system tray, autostart,
- and XDG Desktop Portal support.
+ pure-Rust 1:1 & group audio/video/screen-share VoIP calls, inline GStreamer media
+ playback, ZDB4.0 storage, E2EE, multi-account profiles, SOCKS5/HTTP proxy,
+ local REST/MCP automation, system tray, autostart, and XDG Desktop Portals.
 EOF
 
   cat > "$DEB_STAGE/DEBIAN/postinst" <<'EOF'
@@ -188,6 +189,9 @@ depends=(
   'gtk3'
   'gst-plugins-base'
   'gst-plugins-good'
+  'opus'
+  'libpulse'
+  'ffmpeg'
   'xdg-desktop-portal'
   '7zip'
   'hicolor-icon-theme'
@@ -243,6 +247,9 @@ depend = webkit2gtk-4.1
 depend = gtk3
 depend = gst-plugins-base
 depend = gst-plugins-good
+depend = opus
+depend = libpulse
+depend = ffmpeg
 depend = xdg-desktop-portal
 depend = 7zip
 depend = hicolor-icon-theme
@@ -443,7 +450,7 @@ if [ "\$USER_MODE" -eq 1 ]; then
   PREFIX="\$PREFIX_DIR" "\$TMP_EXTRACT/portable/install-user.sh"
 elif [ "\$DISTRO_FAMILY" = "arch" ] && command -v pacman >/dev/null 2>&1; then
   echo "==> Installing Olaz \${OLAZ_VER} on Omarchy / Arch Linux via pacman..."
-  run_root sh -c "pacman -Sy --needed --noconfirm webkit2gtk-4.1 gtk3 gst-plugins-base gst-plugins-good xdg-desktop-portal 7zip hicolor-icon-theme && pacman -U --noconfirm '\$TMP_EXTRACT/\$ARCH_FILE'"
+  run_root sh -c "pacman -Sy --needed --noconfirm webkit2gtk-4.1 gtk3 gst-plugins-base gst-plugins-good opus libpulse ffmpeg xdg-desktop-portal 7zip hicolor-icon-theme && pacman -U --noconfirm '\$TMP_EXTRACT/\$ARCH_FILE'"
 elif [ "\$DISTRO_FAMILY" = "debian" ] && command -v apt-get >/dev/null 2>&1; then
   echo "==> Installing Olaz \${OLAZ_VER} on Ubuntu / Debian via apt..."
   run_root env DEBIAN_FRONTEND=noninteractive sh -c "apt-get update && apt-get install -y '\$TMP_EXTRACT/\$DEB_FILE'"

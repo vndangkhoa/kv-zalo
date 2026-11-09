@@ -3,7 +3,7 @@
 //! Omarchy live theme watcher, `StatusNotifierItem` tray integration, and `ZaloEngineState` -> UI store serializer.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -19,13 +19,17 @@ use javascriptcore::ValueExt as JscValueExt;
 use olaz_core::{InstallProgress, ZaloPlatform, ZaloRuntimeManager};
 use olaz_linux::{
     capture_interactive_screenshot, has_gstreamer_audio_sink, instance_socket_path,
-    load_omarchy_theme, pick_open_files, resolve_olaz_executable_path, spawn_omarchy_watcher,
-    spawn_tray, stage_screenshot_file, ComposerDraft, Conversation, DesktopTheme, EnginePhase,
-    FileCard, IncomingVoipCall, InstanceEvent, Mention, NotificationPolicy, OlazTrayEvent,
-    OlazTrayHandle, OmarchyWatcherHandle, TrayPrivacyState, WaitingConfirm, ZaloEngineState,
-    SCREENSHOT_STAGING_DIR,
+    load_omarchy_theme, pick_open_files, resolve_olaz_executable_path, spawn_automation_loop,
+    spawn_local_api_server, spawn_omarchy_watcher, spawn_tray, stage_screenshot_file, unix_now_ms,
+    AutoReplyEngine, AutomationLoopHandle, ComposerDraft, Conversation, DesktopTheme,
+    EngineControlBackend, EnginePhase, FileCard, IncomingVoipCall, InstanceEvent,
+    LocalApiServerHandle, Mention, NotificationPolicy, OlazControlBackend, OlazTrayEvent,
+    OlazTrayHandle, OmarchyWatcherHandle, PrivacyConfig, ProfileInstanceEvent, SchedulerEngine,
+    StartCallCallback, TrayPrivacyState, WaitingConfirm, ZaloEngineState, DEFAULT_AUTOMATION_TICK,
+    PRIVACY_CONFIG_FILENAME, SCREENSHOT_STAGING_DIR,
 };
 use olaz_net::{serve_local_media_range, MediaLoader, MediaRangeResponse};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use soup::{MessageHeaders, MessageHeadersType};
@@ -33,11 +37,11 @@ use tokio::sync::oneshot;
 use url::Url;
 use webkit2gtk::{
     HardwareAccelerationPolicy, LoadEvent, NavigationPolicyDecision, NavigationPolicyDecisionExt,
-    PolicyDecisionExt, PolicyDecisionType, SecurityManagerExt, Settings as WebKitSettings,
-    SettingsExt, URIRequestExt, URISchemeRequest, URISchemeRequestExt, URISchemeResponse,
-    URISchemeResponseExt, UserContentInjectedFrames, UserContentManager, UserContentManagerExt,
-    UserScript, UserScriptInjectionTime, WebContext, WebContextExt, WebView, WebViewExt,
-    WebsiteDataManager,
+    NetworkProxyMode, NetworkProxySettings, PolicyDecisionExt, PolicyDecisionType,
+    SecurityManagerExt, Settings as WebKitSettings, SettingsExt, URIRequestExt, URISchemeRequest,
+    URISchemeRequestExt, URISchemeResponse, URISchemeResponseExt, UserContentInjectedFrames,
+    UserContentManager, UserContentManagerExt, UserScript, UserScriptInjectionTime, WebContext,
+    WebContextExt, WebView, WebViewExt, WebsiteDataManager, WebsiteDataManagerExt,
 };
 
 use crate::client_host::{HostPage, OfficialClientHost, PageEvent};
@@ -314,6 +318,34 @@ fn save_privacy_state(state: &TrayPrivacyState, path: &Path) {
     }
 }
 
+fn tray_privacy_from_config(cfg: PrivacyConfig) -> TrayPrivacyState {
+    TrayPrivacyState {
+        block_typing: cfg.block_typing,
+        block_seen: cfg.block_seen,
+        block_delivered: cfg.block_delivered,
+    }
+}
+
+fn privacy_config_from_tray(state: TrayPrivacyState) -> PrivacyConfig {
+    PrivacyConfig {
+        block_typing: state.block_typing,
+        block_seen: state.block_seen,
+        block_delivered: state.block_delivered,
+    }
+}
+
+struct OutboundSendRequest {
+    conv_id: String,
+    text: String,
+    reply_tx: Option<oneshot::Sender<anyhow::Result<()>>>,
+}
+
+struct OutboundCallRequest {
+    target_id: String,
+    video: bool,
+    reply_tx: oneshot::Sender<anyhow::Result<Value>>,
+}
+
 /// Primary GTK3 application window hosting Zalo's official renderer directly (in normal GUI mode,
 /// matching `vndangkhoa/zalo-linux` pixel-for-pixel) and falling back to the `olaz-ui://` setup
 /// view during first-run DMG installation or `--demo`.
@@ -330,6 +362,7 @@ pub struct OlazAppWindow {
     demo_mode: bool,
 
     engine_state: RefCell<ZaloEngineState>,
+    engine_state_mirror: Arc<RwLock<ZaloEngineState>>,
     runtime_progress: RefCell<Option<UiRuntimeProgress>>,
     signing_in: Cell<bool>,
     qr_seq: Cell<u64>,
@@ -352,6 +385,14 @@ pub struct OlazAppWindow {
     suppress_renderer_auto_show: Cell<bool>,
     quitting: Cell<bool>,
 
+    boot_time_ms: i64,
+    autoreply: Arc<AutoReplyEngine>,
+    autoreply_seen_ids: RefCell<HashSet<(String, String)>>,
+    outbound_send_tx: tokio::sync::mpsc::UnboundedSender<OutboundSendRequest>,
+    control_backend: Arc<dyn OlazControlBackend>,
+    _automation_loop: Option<AutomationLoopHandle>,
+    _api_server: RefCell<Option<LocalApiServerHandle>>,
+
     tray_handle: RefCell<Option<OlazTrayHandle>>,
     _omarchy_watcher: OmarchyWatcherHandle,
 }
@@ -360,6 +401,11 @@ impl OlazAppWindow {
     const UI_CRASH_WINDOW: Duration = Duration::from_secs(15);
     const MAX_UI_CRASH_RELOADS: usize = 3;
     const QR_EXPIRY_SECS: u32 = 100;
+
+    /// Returns the shared control-plane backend (`EngineControlBackend`) for local REST, MCP, and Unix-socket RPC.
+    pub fn control_backend(&self) -> Arc<dyn OlazControlBackend> {
+        Arc::clone(&self.control_backend)
+    }
 
     /// Constructs and presents the native Olaz GTK3 window, starts the Omarchy watcher and tray,
     /// and boots (or installs) the official Zalo runtime (unless `demo_mode` is `true`).
@@ -372,7 +418,7 @@ impl OlazAppWindow {
         tokio_handle: tokio::runtime::Handle,
         demo_mode: bool,
     ) -> Rc<Self> {
-        Self::launch_with_options(
+        Self::launch_with_profile_options(
             platform,
             runtime_mgr,
             host,
@@ -381,12 +427,13 @@ impl OlazAppWindow {
             demo_mode,
             false,
             None,
+            None,
         )
     }
 
     /// Constructs the native Olaz GTK3 window with optional `--minimized` start-in-tray lifecycle
     /// and single-instance re-activation channel.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn launch_with_options(
         platform: Arc<ZaloPlatform>,
         runtime_mgr: ZaloRuntimeManager,
@@ -396,6 +443,48 @@ impl OlazAppWindow {
         demo_mode: bool,
         start_minimized: bool,
         instance_rx: Option<tokio::sync::mpsc::UnboundedReceiver<InstanceEvent>>,
+    ) -> Rc<Self> {
+        let mapped_rx = instance_rx.map(|mut rx| {
+            let (tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio_handle.spawn(async move {
+                while let Some(ev) = rx.recv().await {
+                    let mapped = match ev {
+                        InstanceEvent::PresentWindow => ProfileInstanceEvent::PresentWindow,
+                        InstanceEvent::BackgroundPing => ProfileInstanceEvent::BackgroundPing,
+                    };
+                    if tx.send(mapped).is_err() {
+                        break;
+                    }
+                }
+            });
+            out_rx
+        });
+        Self::launch_with_profile_options(
+            platform,
+            runtime_mgr,
+            host,
+            main_process,
+            tokio_handle,
+            demo_mode,
+            start_minimized,
+            mapped_rx,
+            None,
+        )
+    }
+
+    /// Constructs the native Olaz GTK3 window with profile-aware activation/deep-link events
+    /// and optional loopback HTTP REST/MCP server (`--api-port`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_with_profile_options(
+        platform: Arc<ZaloPlatform>,
+        runtime_mgr: ZaloRuntimeManager,
+        host: Rc<OfficialClientHost>,
+        main_process: Rc<ZaloMainProcess>,
+        tokio_handle: tokio::runtime::Handle,
+        demo_mode: bool,
+        start_minimized: bool,
+        instance_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ProfileInstanceEvent>>,
+        api_port: Option<u16>,
     ) -> Rc<Self> {
         gtk::Window::set_default_icon_name("olaz");
 
@@ -411,7 +500,98 @@ impl OlazAppWindow {
         let win_state_path = platform.user_data().join("olaz-window-state.json");
         let saved_win_state = SavedWindowState::load(&win_state_path);
         let privacy_path = platform.user_data().join("olaz-privacy.json");
-        let initial_privacy = load_privacy_state(&privacy_path);
+        let config_privacy_file = platform.config_dir().join(PRIVACY_CONFIG_FILENAME);
+        let initial_privacy = if config_privacy_file.exists() {
+            let cfg = PrivacyConfig::load_from(platform.config_dir());
+            let st = tray_privacy_from_config(cfg);
+            save_privacy_state(&st, &privacy_path);
+            st
+        } else {
+            let st = load_privacy_state(&privacy_path);
+            let _ = privacy_config_from_tray(st).save_to(platform.config_dir());
+            st
+        };
+
+        let engine_state_mirror = Arc::new(RwLock::new(ZaloEngineState::new()));
+        let scheduler = Arc::new(SchedulerEngine::load_from(platform.config_dir()));
+        let autoreply = Arc::new(AutoReplyEngine::load_from(platform.config_dir()));
+        let (outbound_send_tx, mut outbound_send_rx) =
+            tokio::sync::mpsc::unbounded_channel::<OutboundSendRequest>();
+        let (outbound_call_tx, mut outbound_call_rx) =
+            tokio::sync::mpsc::unbounded_channel::<OutboundCallRequest>();
+        let (privacy_obs_tx, mut privacy_obs_rx) =
+            tokio::sync::mpsc::unbounded_channel::<PrivacyConfig>();
+
+        let send_tx_for_backend = outbound_send_tx.clone();
+        let send_tx_for_scheduler = outbound_send_tx.clone();
+        let call_cb: StartCallCallback = Arc::new(move |target_id: String, video: bool| {
+            let tx = outbound_call_tx.clone();
+            Box::pin(async move {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                tx.send(OutboundCallRequest {
+                    target_id,
+                    video,
+                    reply_tx,
+                })
+                .map_err(|_| anyhow::anyhow!("Olaz UI call channel closed"))?;
+                reply_rx
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Olaz UI call handler dropped"))?
+            })
+        });
+
+        let control_backend_concrete = EngineControlBackend::new(
+            Arc::clone(&engine_state_mirror),
+            Arc::clone(&scheduler),
+            Arc::clone(&autoreply),
+            platform.config_dir(),
+        )
+        .with_profile_slug(platform.profile_slug())
+        .with_send_callback(move |conv_id: String, text: String| {
+            let tx = send_tx_for_backend.clone();
+            async move {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                tx.send(OutboundSendRequest {
+                    conv_id,
+                    text,
+                    reply_tx: Some(reply_tx),
+                })
+                .map_err(|_| anyhow::anyhow!("Olaz UI send channel closed"))?;
+                reply_rx
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Olaz UI send handler dropped"))?
+            }
+        })
+        .with_call_callback(call_cb)
+        .with_privacy_observer(move |cfg| {
+            let _ = privacy_obs_tx.send(cfg);
+        });
+        let control_backend: Arc<dyn OlazControlBackend> = Arc::new(control_backend_concrete);
+
+        let automation_loop = if demo_mode {
+            None
+        } else {
+            let _enter = tokio_handle.enter();
+            Some(spawn_automation_loop(
+                Arc::clone(&scheduler),
+                DEFAULT_AUTOMATION_TICK,
+                move |conv_id: String, text: String| {
+                    let tx = send_tx_for_scheduler.clone();
+                    async move {
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        tx.send(OutboundSendRequest {
+                            conv_id,
+                            text,
+                            reply_tx: Some(reply_tx),
+                        })
+                        .map_err(|_| anyhow::anyhow!("Olaz UI send channel closed"))?;
+                        reply_rx
+                            .await
+                            .map_err(|_| anyhow::anyhow!("Olaz UI send handler dropped"))?
+                    }
+                },
+            ))
+        };
 
         let ui_context = build_ui_web_context(
             &platform,
@@ -467,7 +647,11 @@ impl OlazAppWindow {
             window.set_default_size(1180, 760);
             window.set_size_request(960, 620);
         } else {
-            window.set_title("Zalo");
+            if platform.profile_slug() == "default" {
+                window.set_title("Zalo");
+            } else {
+                window.set_title(&format!("Zalo ({})", platform.profile_slug()));
+            }
             // Frameless window so Zalo's patched Windows-style `#titleBar` and login bar are the sole chrome!
             window.set_decorated(false);
             window.set_default_size(saved_win_state.width, saved_win_state.height);
@@ -493,6 +677,7 @@ impl OlazAppWindow {
             tokio_handle: tokio_handle.clone(),
             demo_mode,
             engine_state: RefCell::new(ZaloEngineState::new()),
+            engine_state_mirror,
             runtime_progress: RefCell::new(None),
             signing_in: Cell::new(false),
             qr_seq: Cell::new(0),
@@ -514,6 +699,13 @@ impl OlazAppWindow {
             ui_crash_timestamps: RefCell::new(Vec::new()),
             suppress_renderer_auto_show: Cell::new(hide_on_startup),
             quitting: Cell::new(false),
+            boot_time_ms: unix_now_ms(),
+            autoreply,
+            autoreply_seen_ids: RefCell::new(HashSet::new()),
+            outbound_send_tx,
+            control_backend: Arc::clone(&control_backend),
+            _automation_loop: automation_loop,
+            _api_server: RefCell::new(None),
             tray_handle: RefCell::new(None),
             _omarchy_watcher: omarchy_watcher,
         });
@@ -525,6 +717,99 @@ impl OlazAppWindow {
             app.install_host_and_main_process_hooks();
             app.install_auto_relock_timer();
         }
+
+        // Handle outbound message sends from Scheduler, Auto-Reply, REST `/api/v1/send`, and MCP `zalo_send_message`.
+        {
+            let app_weak = Rc::downgrade(&app);
+            glib::MainContext::default().spawn_local(async move {
+                while let Some(req) = outbound_send_rx.recv().await {
+                    let Some(app) = app_weak.upgrade() else {
+                        if let Some(tx) = req.reply_tx {
+                            let _ = tx.send(Err(anyhow::anyhow!("Olaz window closed")));
+                        }
+                        break;
+                    };
+                    let res = app.execute_control_send(&req.conv_id, &req.text).await;
+                    if let Some(tx) = req.reply_tx {
+                        let _ = tx.send(res);
+                    }
+                }
+            });
+        }
+
+        // Handle outbound call requests from REST `/api/v1/call` and MCP `zalo_start_call`.
+        {
+            let app_weak = Rc::downgrade(&app);
+            glib::MainContext::default().spawn_local(async move {
+                while let Some(req) = outbound_call_rx.recv().await {
+                    let Some(app) = app_weak.upgrade() else {
+                        let _ = req.reply_tx.send(Err(anyhow::anyhow!("Olaz window closed")));
+                        break;
+                    };
+                    let res = app.execute_control_call(&req.target_id, req.video).await;
+                    let _ = req.reply_tx.send(res);
+                }
+            });
+        }
+
+        // Synchronize privacy updates originating from REST `/api/v1/privacy` or MCP `zalo_set_privacy`
+        // onto the system tray checkboxes, `olaz-privacy.json`, and active WebView.
+        {
+            let app_weak = Rc::downgrade(&app);
+            glib::MainContext::default().spawn_local(async move {
+                while let Some(cfg) = privacy_obs_rx.recv().await {
+                    let Some(app) = app_weak.upgrade() else {
+                        break;
+                    };
+                    let next_state = tray_privacy_from_config(cfg);
+                    let changed = {
+                        let mut cur = app.privacy_state.borrow_mut();
+                        if *cur == next_state {
+                            false
+                        } else {
+                            *cur = next_state;
+                            true
+                        }
+                    };
+                    if changed {
+                        save_privacy_state(&next_state, &app.privacy_path);
+                        app.sync_privacy_to_webview();
+                        if let Some(tray) = app.tray_handle.borrow().clone() {
+                            app.tokio_handle.spawn(async move {
+                                tray.set_privacy_state(next_state).await;
+                            });
+                        }
+                    }
+                }
+            });
+        }
+
+        if let Some(port) = api_port.filter(|_| !demo_mode) {
+            let app_weak = Rc::downgrade(&app);
+            let backend_for_srv = Arc::clone(&control_backend);
+            let (srv_tx, srv_rx) = oneshot::channel();
+            tokio_handle.spawn(async move {
+                let _ = srv_tx.send(spawn_local_api_server(backend_for_srv, port).await);
+            });
+            glib::MainContext::default().spawn_local(async move {
+                match srv_rx.await {
+                    Ok(Ok(handle)) => {
+                        tracing::info!(
+                            addr = %handle.local_addr(),
+                            "Olaz local REST & HTTP-MCP server listening"
+                        );
+                        if let Some(app) = app_weak.upgrade() {
+                            *app._api_server.borrow_mut() = Some(handle);
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        tracing::error!(port, %err, "failed to bind Olaz local REST API server");
+                    }
+                    Err(_) => {}
+                }
+            });
+        }
+
         if let Some(mut rx) = instance_rx {
             let app_weak = Rc::downgrade(&app);
             glib::MainContext::default().spawn_local(async move {
@@ -533,17 +818,23 @@ impl OlazAppWindow {
                         break;
                     };
                     match ev {
-                        InstanceEvent::PresentWindow => {
+                        ProfileInstanceEvent::PresentWindow => {
                             tracing::info!(
                                 "presenting primary window for secondary olaz invocation"
                             );
                             app.present_window();
                             app.host.bridge().send("show-from-tray", vec![]);
                         }
-                        InstanceEvent::BackgroundPing => {
+                        ProfileInstanceEvent::BackgroundPing => {
                             tracing::debug!(
                                 "ignoring duplicate --minimized background invocation"
                             );
+                        }
+                        ProfileInstanceEvent::OpenDeepLink(url) => {
+                            tracing::info!(%url, "forwarding zalo:// deep link to primary window");
+                            app.present_window();
+                            app.host.bridge().send("show-from-tray", vec![]);
+                            app.handle_deep_link(&url);
                         }
                     }
                 }
@@ -978,6 +1269,7 @@ impl OlazAppWindow {
                             if needs_ready {
                                 app.signing_in.set(false);
                                 app.engine_state.borrow_mut().phase = EnginePhase::Ready;
+                                app.sync_engine_state_mirror();
                                 let snap = app.full_ui_snapshot();
                                 app.push_ui_state(&snap);
                             }
@@ -1080,6 +1372,7 @@ impl OlazAppWindow {
                         *app.last_qr.borrow_mut() = None;
                         app.qr_seq.set(app.qr_seq.get().wrapping_add(1));
                         app.engine_state.borrow_mut().phase = EnginePhase::Booting;
+                        app.sync_engine_state_mirror();
                         let snap = app.full_ui_snapshot();
                         app.push_ui_state(&snap);
                     }
@@ -1087,10 +1380,12 @@ impl OlazAppWindow {
                         app.signing_in.set(false);
                         *app.last_qr.borrow_mut() = None;
                         app.qr_seq.set(app.qr_seq.get().wrapping_add(1));
+                        app.autoreply_seen_ids.borrow_mut().clear();
                         {
                             let mut state = app.engine_state.borrow_mut();
                             state.reset_account_state(kickout_notice.clone());
                         }
+                        app.sync_engine_state_mirror();
                         app.refresh_unread_indicators(0);
                         let mut snap = app.full_ui_snapshot();
                         if let (Some(notice), Some(obj)) = (kickout_notice, snap.as_object_mut()) {
@@ -1287,6 +1582,15 @@ impl OlazAppWindow {
                                 tray.set_privacy_state(next_state).await;
                             });
                         }
+                        let backend = Arc::clone(&app.control_backend);
+                        let req = json!({
+                            "blockTyping": next_state.block_typing,
+                            "blockSeen": next_state.block_seen,
+                            "blockDelivered": next_state.block_delivered,
+                        });
+                        app.tokio_handle.spawn(async move {
+                            let _ = backend.set_privacy(&req).await;
+                        });
                     }
                     OlazTrayEvent::LaunchSecondaryProfile => {
                         app.launch_secondary_profile();
@@ -1715,6 +2019,12 @@ impl OlazAppWindow {
             return;
         }
 
+        self.sync_engine_state_mirror();
+
+        if changed.iter().any(|s| s == "messages") {
+            self.evaluate_autoreply_for_new_messages();
+        }
+
         let unread = self.engine_state.borrow().total_unread();
         if changed.iter().any(|s| s == "conversations" || s == "conv_actions") {
             self.refresh_unread_indicators(unread);
@@ -1916,8 +2226,176 @@ impl OlazAppWindow {
         }
     }
 
+    fn sync_engine_state_mirror(&self) {
+        let snap = self.engine_state.borrow().clone();
+        *self.engine_state_mirror.write() = snap;
+    }
+
+    fn evaluate_autoreply_for_new_messages(&self) {
+        if self.demo_mode {
+            return;
+        }
+        let now_ms = unix_now_ms();
+        let mut pending_replies: Vec<(String, String)> = Vec::new();
+        {
+            let state = self.engine_state.borrow();
+            let self_uid = state.user.as_ref().map(|u| u.user_id.clone());
+            let group_map: HashMap<&str, bool> = state
+                .conversations
+                .iter()
+                .map(|c| (c.id.as_str(), c.is_group))
+                .collect();
+            let mut seen = self.autoreply_seen_ids.borrow_mut();
+
+            for (conv_id, list) in &state.messages {
+                let is_group = group_map
+                    .get(conv_id.as_str())
+                    .copied()
+                    .unwrap_or_else(|| conv_id.starts_with('g'));
+                for msg in list {
+                    let key = (conv_id.clone(), msg.id.clone());
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    let msg_ts_ms = if msg.timestamp > 0 && msg.timestamp < 1_000_000_000_000 {
+                        msg.timestamp.saturating_mul(1000)
+                    } else {
+                        msg.timestamp
+                    };
+                    if msg.is_mine || msg.recalled || msg_ts_ms < self.boot_time_ms {
+                        continue;
+                    }
+                    if let Some(rule) = self.autoreply.evaluate_chat_message(
+                        msg,
+                        is_group,
+                        self_uid.as_deref(),
+                        now_ms,
+                    ) {
+                        pending_replies.push((conv_id.clone(), rule.reply_text));
+                    }
+                }
+            }
+        }
+
+        for (conv_id, reply_text) in pending_replies {
+            let _ = self.outbound_send_tx.send(OutboundSendRequest {
+                conv_id,
+                text: reply_text,
+                reply_tx: None,
+            });
+        }
+    }
+
+    async fn execute_control_send(&self, conv_id: &str, text: &str) -> anyhow::Result<()> {
+        let cid = conv_id.trim();
+        let body = text.trim();
+        if cid.is_empty() || body.is_empty() {
+            anyhow::bail!("conv_id and text must not be empty");
+        }
+        let cid_json = serde_json::to_string(cid)?;
+        let txt_json = serde_json::to_string(body)?;
+        let js = format!(
+            "const cid = {cid_json};\n\
+             const txt = {txt_json};\n\
+             if (window.__zaloChat && typeof window.__zaloChat.sendText === 'function') {{\n\
+               return await window.__zaloChat.sendText(cid, txt, null, []);\n\
+             }}\n\
+             if (window.__olazControl && typeof window.__olazControl.sendText === 'function') {{\n\
+               return await window.__olazControl.sendText(cid, txt);\n\
+             }}\n\
+             return 'not-ready';"
+        );
+        let out = self
+            .eval_host_js(&js)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        if out.as_str() == Some("sent") || out.as_bool() == Some(true) {
+            Ok(())
+        } else {
+            anyhow::bail!("Zalo renderer returned `{out}` when sending message to `{cid}`")
+        }
+    }
+
+    async fn execute_control_call(&self, target_id: &str, video: bool) -> anyhow::Result<Value> {
+        let tid = target_id.trim();
+        if tid.is_empty() {
+            anyhow::bail!("target_id must not be empty");
+        }
+        let tid_json = serde_json::to_string(tid)?;
+        let js = format!(
+            "const tid = {tid_json};\n\
+             const video = {video};\n\
+             if (window.__zaloCall && typeof window.__zaloCall.start === 'function') {{\n\
+               return await window.__zaloCall.start(tid, video);\n\
+             }}\n\
+             if (window.__olazControl && typeof window.__olazControl.startCall === 'function') {{\n\
+               return await window.__olazControl.startCall(tid, video);\n\
+             }}\n\
+             return 'fallback-native';"
+        );
+        if let Ok(out) = self.eval_host_js(&js).await {
+            let s = out.as_str().unwrap_or("");
+            if out.as_bool() == Some(true) || s == "started" || s == "sent" {
+                return Ok(json!({
+                    "ok": true,
+                    "target_id": tid,
+                    "video": video,
+                    "via": "renderer",
+                }));
+            }
+        }
+
+        // Fallback directly to the pure-Rust VoIP engine (`makeCall`).
+        let payload = json!({
+            "type": "request",
+            "command": "makeCall",
+            "data": {
+                "calleeId": tid,
+                "partner": [{ "id": tid, "name": tid }],
+                "callType": if video { 2 } else { 1 },
+            }
+        });
+        self.main_process
+            .call_engine()
+            .handle_send_to_native(payload);
+        Ok(json!({
+            "ok": true,
+            "target_id": tid,
+            "video": video,
+            "via": "call_engine",
+        }))
+    }
+
+    pub fn handle_deep_link(&self, url: &str) {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.host
+            .bridge()
+            .send("open-deep-link", vec![json!(trimmed)]);
+        if let Ok(url_json) = serde_json::to_string(trimmed) {
+            let js = format!(
+                "if (window.__olazControl && typeof window.__olazControl.openDeepLink === 'function') {{ window.__olazControl.openDeepLink({url_json}); }}"
+            );
+            self.host.webview().evaluate_javascript(
+                &js,
+                None,
+                None,
+                gio::Cancellable::NONE,
+                |_| {},
+            );
+        }
+    }
+
     fn shutdown_and_quit(&self) {
         self.persist_window_geometry();
+        if let Some(ref loop_h) = self._automation_loop {
+            loop_h.stop();
+        }
+        if let Some(srv) = self._api_server.borrow_mut().take() {
+            srv.stop();
+        }
         let tray_opt = self.tray_handle.borrow_mut().take();
         if let Some(tray) = tray_opt {
             self.tokio_handle.spawn(async move {
@@ -3112,6 +3590,12 @@ fn build_ui_web_context(
         .base_data_directory(ui_data.to_string_lossy().as_ref())
         .base_cache_directory(ui_cache.to_string_lossy().as_ref())
         .build();
+    if let Some(proxy_url) = platform.proxy_url() {
+        let mut proxy_settings =
+            NetworkProxySettings::new(Some(proxy_url), &["localhost", "127.0.0.1", "::1"]);
+        data_manager
+            .set_network_proxy_settings(NetworkProxyMode::Custom, Some(&mut proxy_settings));
+    }
 
     let context = WebContext::with_website_data_manager(&data_manager);
     if let Some(sec) = context.security_manager() {

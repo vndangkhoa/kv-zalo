@@ -30,13 +30,13 @@ use url::Url;
 use webkit2gtk::{
     AutoplayPolicy, DeviceInfoPermissionRequest, DownloadExt, FileChooserRequest,
     FileChooserRequestExt, HardwareAccelerationPolicy, LoadEvent, NavigationAction,
-    NavigationPolicyDecision, NavigationPolicyDecisionExt, PermissionRequestExt,
-    PolicyDecisionExt, PolicyDecisionType, ResponsePolicyDecision, ResponsePolicyDecisionExt,
-    SecurityManagerExt, Settings, SettingsExt, URIRequestExt, URISchemeRequest,
-    URISchemeRequestExt, URISchemeResponse, URISchemeResponseExt, UserContentInjectedFrames,
-    UserContentManager, UserContentManagerExt, UserMediaPermissionRequest, UserScript,
-    UserScriptInjectionTime, WebContext, WebContextExt, WebView, WebViewExt, WebsiteDataManager,
-    WebsitePolicies,
+    NavigationPolicyDecision, NavigationPolicyDecisionExt, NetworkProxyMode, NetworkProxySettings,
+    PermissionRequestExt, PolicyDecisionExt, PolicyDecisionType, ResponsePolicyDecision,
+    ResponsePolicyDecisionExt, SecurityManagerExt, Settings, SettingsExt, URIRequestExt,
+    URISchemeRequest, URISchemeRequestExt, URISchemeResponse, URISchemeResponseExt,
+    UserContentInjectedFrames, UserContentManager, UserContentManagerExt,
+    UserMediaPermissionRequest, UserScript, UserScriptInjectionTime, WebContext, WebContextExt,
+    WebView, WebViewExt, WebsiteDataManager, WebsiteDataManagerExt, WebsitePolicies,
 };
 
 /// Custom URI scheme serving `pc-dist/` from `app.asar` and `/__olaz/bridge-sync`.
@@ -736,6 +736,12 @@ impl ZaloWebRuntime {
             .base_data_directory(data_dir.to_string_lossy().as_ref())
             .base_cache_directory(cache_dir.to_string_lossy().as_ref())
             .build();
+        if let Some(proxy_url) = platform.proxy_url() {
+            let mut proxy_settings =
+                NetworkProxySettings::new(Some(proxy_url), &["localhost", "127.0.0.1", "::1"]);
+            data_manager
+                .set_network_proxy_settings(NetworkProxyMode::Custom, Some(&mut proxy_settings));
+        }
 
         let context = WebContext::with_website_data_manager(&data_manager);
 

@@ -12,8 +12,8 @@ pub use cookies::{
     is_zalo_cookie_domain, CookieEntry, ZaloCookieJar, AUTH_DOMAIN, SESSION_COOKIE_DOMAINS,
 };
 pub use doh::{
-    is_zalo_cdn, DnsBackend, DnsResolveError, ZaloDnsResolver, DEAD_HOST_TTL, DOH_INITIAL_TTL,
-    DOH_STICKY_TTL, SYSTEM_DNS_TIMEOUT, SYSTEM_OK_TTL, ZALO_CDN_SUFFIXES,
+    is_zalo_cdn, parse_upstream_proxy, DnsBackend, DnsResolveError, ZaloDnsResolver, DEAD_HOST_TTL,
+    DOH_INITIAL_TTL, DOH_STICKY_TTL, SYSTEM_DNS_TIMEOUT, SYSTEM_OK_TTL, ZALO_CDN_SUFFIXES,
 };
 pub use media_loader::{
     fnv1a_64_hex, open_local_media_range, sanitize_headers, serve_local_media_range,

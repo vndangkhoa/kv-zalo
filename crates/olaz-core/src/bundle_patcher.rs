@@ -2726,7 +2726,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
       }
     } catch {}
 
-    // Attach Redux store once for user identity & window transition notification (event-driven, no polling)
+    // Attach Redux store + event-driven control-plane bridge (`window.__olazControl`, zero polling timers)
     const attachStore = () => {
       let store = null;
       eachExport(req, (ex) => {
@@ -2739,24 +2739,242 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
       });
       if (!store) return false;
       window.__zaloStore = store;
-      let lastKey = '';
-      const publishUser = () => {
-        const u = (store.getState() || {}).user || {};
+
+      const ctl = { chat: null, opener: null, io: null, friends: null, groups: null, convs: null, unread: null, preview: null, loader: null, boxReg: null, callHelper: null, loading: false };
+      const resolveCtl = () => {
+        for (const reg of diRegistrations(req)) {
+          const i = reg.instance;
+          if (!i || typeof i !== 'object') continue;
+          try {
+            if (!ctl.chat && typeof i.broadCastMessage === 'function' && i.chatboxController) ctl.chat = i;
+            if (!ctl.opener && typeof i.openConversation === 'function' && typeof i.conversationWillOpen === 'function') ctl.opener = i;
+            if (!ctl.io && typeof i.getFriendManagerModule === 'function') ctl.io = i;
+            if (!ctl.convs && typeof i.getConvByIdSync === 'function' && typeof i.addOrUpdateConv === 'function') ctl.convs = i;
+            if (!ctl.unread && typeof i.getUnreadByConvIdSync === 'function') ctl.unread = i;
+            if (!ctl.preview && typeof i.convertDBMessageToPreviewItem === 'function') ctl.preview = i;
+          } catch {}
+        }
+        eachExport(req, (ex) => {
+          if (!ex || typeof ex !== 'object' || ex === window.$capp) return;
+          try {
+            if (!ctl.loader && ex.cacheMessageLoader instanceof Map && typeof ex.getLastMessagesForConversation === 'function') ctl.loader = ex;
+            if (!ctl.callHelper && typeof ex.canUseIpcCall === 'function' && typeof ex.makeCall === 'function') ctl.callHelper = ex;
+            for (const cand of [ex, ex.default]) {
+              if (!ctl.boxReg && cand && typeof cand === 'object' && cand !== window.$capp && cand.popupChatBoxMapping && cand.wins && typeof cand.getChatBoxControllerByConvId === 'function') {
+                ctl.boxReg = cand;
+              }
+            }
+          } catch {}
+        });
+        if (ctl.io && !ctl.friends && !ctl.loading) {
+          ctl.loading = true;
+          Promise.all([ctl.io.getFriendManagerModule(), ctl.io.getGroupManagerModule()])
+            .then(([f, g]) => { ctl.friends = (f && f.default) || f; ctl.groups = (g && g.default) || g; scheduleSync(); })
+            .catch(() => { ctl.loading = false; });
+        }
+        return ctl;
+      };
+
+      const msgTextOf = (c) => {
+        if (typeof c === 'string') return c;
+        if (Array.isArray(c)) {
+          for (const x of c) {
+            const t = x && (x.title || x.description || x.text);
+            if (typeof t === 'string' && t) return t;
+          }
+          return '';
+        }
+        const v = c && (c.title || c.description || c.text || c.msg || c.message);
+        return typeof v === 'string' ? v : '';
+      };
+
+      let lastUserKey = '';
+      let lastConvsKey = '';
+      const seenMsgSigs = new Map();
+      let syncTimer = null;
+
+      const flushStoreSync = () => {
+        syncTimer = null;
+        const st = store.getState() || {};
+        const u = st.user || {};
+        const meUid = String(u.userId || '');
         const user = {
-          userId: u.userId || '',
+          userId: meUid,
           displayName: u.displayName || '',
           zaloName: u.zaloName || '',
           avatar: u.avatar || '',
           phoneNumber: u.phoneNumber || '',
         };
-        const key = JSON.stringify(user);
-        if (key !== lastKey) {
-          lastKey = key;
+        const uKey = JSON.stringify(user);
+        if (uKey !== lastUserKey) {
+          lastUserKey = uKey;
           postState({ page: 'main', user });
         }
+
+        resolveCtl();
+        if (ctl.convs && ctl.convs.data instanceof Map) {
+          const rows = [];
+          for (const [rawId, c] of ctl.convs.data) {
+            const id = String(rawId);
+            const isGroup = !!c.isGroup || id.startsWith('g');
+            const name = safe(() => (isGroup ? (ctl.groups && ctl.groups.getDName(id)) : (ctl.friends && ctl.friends.getDName(id))), '') || '';
+            const avatar = safe(() => (isGroup ? (ctl.groups && ctl.groups.getAvatarGroup(id)) : (ctl.friends && ctl.friends.getAvatar(id))), '') || '';
+            const ur = safe(() => ctl.unread && ctl.unread.getUnreadByConvIdSync(id), null);
+            const pv = safe(() => ctl.preview && ctl.preview.data && ctl.preview.data.get(id), null);
+            const preview = pv ? {
+              text: String(msgTextOf(pv.computedMessage) || msgTextOf(pv.message) || msgTextOf(pv.content) || '').slice(0, 200),
+              ts: Number(pv.messageTime || pv.sendDttm || pv.ts || 0),
+              fromMe: !!pv.isMe || String(pv.fromUid) === '0' || (meUid && String(pv.fromUid) === meUid),
+              type: pv.messageType || pv.msgType || '',
+            } : null;
+            rows.push({
+              id,
+              isGroup,
+              name,
+              avatar,
+              pinned: !!c.pinned,
+              members: isGroup ? (safe(() => ctl.groups && ctl.groups.getTotalMember(id), 0) || 0) : 0,
+              unread: (ur && (ur.smsUnreadCount || 0)) || 0,
+              preview,
+            });
+          }
+          const cKey = JSON.stringify(rows);
+          if (cKey !== lastConvsKey) {
+            lastConvsKey = cKey;
+            postState({ page: 'main', conversations: rows });
+          }
+        }
+
+        const alls = (st.conversations && st.conversations.alls) || {};
+        for (const cid of Object.keys(alls)) {
+          const convObj = alls[cid];
+          const rawMsgs = (convObj && Array.isArray(convObj.messages)) ? convObj.messages : [];
+          if (!rawMsgs.length) continue;
+          let convMap = seenMsgSigs.get(cid);
+          const isInitial = !convMap;
+          if (!convMap) {
+            convMap = new Map();
+            seenMsgSigs.set(cid, convMap);
+          }
+          const changedMsgs = [];
+          const tail = rawMsgs.slice(-60);
+          for (const m of tail) {
+            if (!m) continue;
+            const id = String(m.msgId || m.cliMsgId || '');
+            if (!id || id === '0') continue;
+            const fromUid = String(m.fromUid || '');
+            const isMine = fromUid === '0' || (meUid !== '' && fromUid === meUid);
+            const text = msgTextOf(m.message) || msgTextOf(m.content) || '';
+            const ts = Number(m.sendDttm || m.ts || 0);
+            const recalled = Number(m.msgType) === 20 || Number(m.status) === -27;
+            const sig = `${text}|${ts}|${recalled ? 1 : 0}`;
+            if (convMap.get(id) === sig) continue;
+            convMap.set(id, sig);
+            const senderName = isMine
+              ? (u.displayName || 'Bạn')
+              : (safe(() => ctl.friends && ctl.friends.getDName(fromUid), '') || String(m.dName || ''));
+            changedMsgs.push({
+              id,
+              conversationId: String(cid),
+              senderId: isMine ? meUid : fromUid,
+              senderName,
+              senderAvatar: '',
+              isMine,
+              text,
+              date: ts,
+              status: isMine ? 'sent' : 'delivered',
+              kind: recalled ? { type: 'recalled' } : { type: 'text' },
+              recalled,
+            });
+          }
+          if (changedMsgs.length) {
+            postState({
+              page: 'main',
+              chat: {
+                convId: String(cid),
+                messages: changedMsgs,
+                removed: [],
+                hasMore: false,
+                reset: isInitial,
+              },
+            });
+          }
+        }
       };
-      store.subscribe(publishUser);
-      publishUser();
+
+      const scheduleSync = () => {
+        if (syncTimer === null) {
+          syncTimer = setTimeout(flushStoreSync, 250);
+        }
+      };
+
+      let sendQueue = Promise.resolve();
+      window.__olazControl = {
+        sendText(convId, text) {
+          const cid = String(convId || '').trim();
+          const body = String(text || '').trim();
+          if (!cid || !body) return Promise.resolve('empty');
+          const task = sendQueue.then(async () => {
+            resolveCtl();
+            const alls = () => ((store.getState() || {}).conversations || {}).alls || {};
+            if (!alls()[cid] && ctl.opener) {
+              try { await ctl.opener.openConversation(cid); } catch {}
+              if (ctl.loader) {
+                try { await ctl.loader.getLastMessagesForConversation(cid, {}); } catch {}
+              }
+            }
+            let cc = (ctl.chat && ctl.chat.chatboxController) || null;
+            if (!cc && ctl.boxReg) {
+              cc = safe(() => ctl.boxReg.getChatBoxControllerByConvId(cid), null);
+            }
+            if (!cc) return 'not-ready';
+            const info = cc.convId === cid
+              ? safe(() => cc._getConversationInfo(), null)
+              : safe(() => cc._getConversationInfo(cid), null);
+            if (!info) return 'not-open';
+            await cc._processSendMessage(1, body, [], false, true, info, true, null, null);
+            return 'sent';
+          });
+          sendQueue = task.catch(() => {});
+          return task;
+        },
+        async startCall(targetId, video) {
+          const tid = String(targetId || '').trim();
+          if (!tid) return 'invalid';
+          resolveCtl();
+          const isGroup = tid.startsWith('g');
+          if (ctl.callHelper && !isGroup) {
+            try {
+              await ctl.callHelper.makeCall(tid, !!video, false);
+              return 'started';
+            } catch {}
+          }
+          if (ctl.opener) {
+            try { await ctl.opener.openConversation(tid); } catch {}
+          }
+          const cc = (ctl.chat && ctl.chat.chatboxController) || (ctl.boxReg && safe(() => ctl.boxReg.getChatBoxControllerByConvId(tid), null));
+          if (cc && typeof cc.makeCall === 'function') {
+            await cc.makeCall(!!video);
+            return 'started';
+          }
+          return 'unavailable';
+        },
+        openDeepLink(rawUrl) {
+          const u = String(rawUrl || '').trim();
+          if (!u) return false;
+          resolveCtl();
+          const m = /(?:uid|user|conv|group|id)=([A-Za-z0-9_-]+)/.exec(u)
+            || /^zalo:\/\/(?:conversation|chat|profile)\/([A-Za-z0-9_-]+)/i.exec(u);
+          if (m && m[1] && ctl.opener) {
+            Promise.resolve(ctl.opener.openConversation(m[1])).catch(() => {});
+            return true;
+          }
+          return false;
+        },
+      };
+
+      store.subscribe(scheduleSync);
+      flushStoreSync();
       return true;
     };
     if (!attachStore()) {

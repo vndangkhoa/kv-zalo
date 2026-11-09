@@ -9,11 +9,11 @@ members = [
 default-members = ["crates/olaz-app"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-only"
 authors = ["Olaz Contributors"]
-repository = "https://github.com/qnguyen3/zalo-swift-re"
+repository = "https://github.com/vndangkhoa/zalo-swift-re"
 
 [workspace.dependencies]
 # Internal crates

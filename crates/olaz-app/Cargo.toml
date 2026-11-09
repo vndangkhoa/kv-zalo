@@ -14,6 +14,7 @@ path = "src/main.rs"
 olaz-core.workspace = true
 olaz-net.workspace = true
 olaz-linux.workspace = true
+reqwest.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
 parking_lot.workspace = true
@@ -45,9 +46,10 @@ copyright = "2026, Quan Nguyen & Olaz Contributors"
 license-file = ["../../LICENSE", "0"]
 extended-description = """\
 Olaz is a native Linux desktop client for Zalo built in Rust on WebKit2GTK. \
-It mounts the official Zalo PC interface with Linux desktop integration, inline GStreamer media playback, \
-full E2EE, message sync, system tray, and XDG Desktop Portal support."""
-depends = "$auto, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-pipewire | gstreamer1.0-pulseaudio | gstreamer1.0-alsa, xdg-desktop-portal, 7zip | p7zip-full"
+It mounts the official Zalo PC interface with Linux desktop integration, pure-Rust 1:1 & group audio/video/screen-share VoIP calls, \
+inline GStreamer media playback, full E2EE, ZDB4.0 storage, multi-account profiles, SOCKS5/HTTP proxy, REST/MCP automation, \
+system tray, and XDG Desktop Portal support."""
+depends = "$auto, libopus0, libpulse0, ffmpeg, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-pipewire | gstreamer1.0-pulseaudio | gstreamer1.0-alsa, xdg-desktop-portal, 7zip | p7zip-full"
 section = "net"
 priority = "optional"
 assets = [

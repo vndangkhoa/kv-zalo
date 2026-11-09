@@ -9,7 +9,7 @@ mod client_host;
 mod main_process;
 mod ui_window;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,21 +20,38 @@ use client_host::{HostPage, OfficialClientHost, PageEvent, ZaloWebRuntime};
 use main_process::ZaloMainProcess;
 use olaz_core::{ZaloPlatform, ZaloRuntimeManager};
 use olaz_linux::{
-    acquire_or_notify_primary, configure_linux_webview_env, prune_old_screenshots,
-    AcquireInstanceOutcome, SCREENSHOT_RETENTION, SCREENSHOT_STAGING_DIR,
+    acquire_or_notify_in_dir, check_for_updates, configure_linux_webview_env,
+    download_and_verify_artifact, make_instance_rpc_handler, prune_old_screenshots, run_mcp_stdio,
+    AcquireProfileInstanceOutcome, DownloadLimits, OlazControlBackend, SocketRpcBackend,
+    DEFAULT_API_PORT, SCREENSHOT_RETENTION, SCREENSHOT_STAGING_DIR,
 };
-use olaz_net::{MediaLoader, NetworkProxy, ZaloCookieJar, ZaloDnsResolver};
+use olaz_net::{
+    parse_upstream_proxy, MediaLoader, NetworkProxy, ZaloCookieJar, ZaloDnsResolver,
+};
 use tracing_subscriber::EnvFilter;
 use ui_window::OlazAppWindow;
 
-///Parsed CLI invocation mode.
+/// Parsed CLI invocation mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliAction {
     Help,
     Version,
+    Mcp,
+    CheckUpdate { download: bool },
     Gui { start_minimized: bool },
     Demo,
     EngineProbe { page: ProbePage, seconds: u64 },
+}
+
+/// Complete parsed command-line configuration (mode + profile/proxy/API/deep-link options).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliConfig {
+    pub action: CliAction,
+    pub profile: Option<String>,
+    pub data_dir: Option<PathBuf>,
+    pub proxy_url: Option<String>,
+    pub api_port: Option<u16>,
+    pub deep_link: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,71 +70,192 @@ impl ProbePage {
 }
 
 impl CliAction {
-    /// Parses command-line arguments (excluding `argv[0]`).
+    /// Parses command-line arguments (excluding `argv[0]`) and returns the primary [`CliAction`].
+    pub fn parse<I, S>(args: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Ok(CliConfig::parse(args)?.action)
+    }
+}
+
+impl CliConfig {
+    /// Parses command-line arguments (excluding `argv[0]`) into a full [`CliConfig`].
     pub fn parse<I, S>(args: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
         let collected: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
+
         if collected
             .iter()
             .any(|a| matches!(a.as_str(), "-h" | "--help"))
         {
-            return Ok(Self::Help);
+            return Ok(Self {
+                action: CliAction::Help,
+                profile: None,
+                data_dir: None,
+                proxy_url: None,
+                api_port: None,
+                deep_link: None,
+            });
         }
         if collected
             .iter()
             .any(|a| matches!(a.as_str(), "-V" | "--version"))
         {
-            return Ok(Self::Version);
-        }
-        if collected.iter().any(|a| a == "--demo") {
-            return Ok(Self::Demo);
-        }
-
-        if let Some(pos) = collected.iter().position(|a| a == "--engine-probe") {
-            let mut page = ProbePage::Main;
-            let mut seconds = 20_u64;
-            let mut next_idx = pos + 1;
-
-            if let Some(arg1) = collected.get(next_idx) {
-                match arg1.as_str() {
-                    "login" => {
-                        page = ProbePage::Login;
-                        next_idx += 1;
-                    }
-                    "main" => {
-                        page = ProbePage::Main;
-                        next_idx += 1;
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(arg2) = collected.get(next_idx) {
-                if let Ok(parsed_secs) = arg2.parse::<u64>() {
-                    seconds = parsed_secs.max(1);
-                }
-            }
-            return Ok(Self::EngineProbe { page, seconds });
+            return Ok(Self {
+                action: CliAction::Version,
+                profile: None,
+                data_dir: None,
+                proxy_url: None,
+                api_port: None,
+                deep_link: None,
+            });
         }
 
+        let mut profile: Option<String> = None;
+        let mut data_dir: Option<PathBuf> = None;
+        let mut proxy_url: Option<String> = None;
+        let mut api_port: Option<u16> = None;
+        let mut deep_link: Option<String> = None;
         let mut start_minimized = false;
-        for arg in &collected {
+        let mut is_demo = false;
+        let mut is_mcp = false;
+        let mut check_update: Option<bool> = None;
+        let mut engine_probe: Option<(ProbePage, u64)> = None;
+
+        let mut idx = 0usize;
+        while idx < collected.len() {
+            let arg = &collected[idx];
             match arg.as_str() {
+                "--demo" => {
+                    is_demo = true;
+                }
+                "--mcp" => {
+                    is_mcp = true;
+                }
+                "--check-update" => {
+                    check_update = Some(check_update.unwrap_or(false));
+                }
+                "--update" => {
+                    check_update = Some(true);
+                }
                 "--minimized" | "--tray" | "--hidden" => {
                     start_minimized = true;
                 }
-                _ if arg.starts_with("--") && !arg.starts_with("--gapplication-") => {
+                "--profile" => {
+                    idx += 1;
+                    let val = collected
+                        .get(idx)
+                        .context("`--profile` requires a profile slug (e.g. `--profile work`)")?;
+                    profile = Some(val.clone());
+                }
+                _ if arg.starts_with("--profile=") => {
+                    profile = Some(arg["--profile=".len()..].to_string());
+                }
+                "--data-dir" => {
+                    idx += 1;
+                    let val = collected
+                        .get(idx)
+                        .context("`--data-dir` requires a directory path")?;
+                    data_dir = Some(PathBuf::from(val));
+                }
+                _ if arg.starts_with("--data-dir=") => {
+                    data_dir = Some(PathBuf::from(&arg["--data-dir=".len()..]));
+                }
+                "--proxy" => {
+                    idx += 1;
+                    let val = collected
+                        .get(idx)
+                        .context("`--proxy` requires a proxy URL (e.g. `socks5://127.0.0.1:1080`)")?;
+                    proxy_url = Some(val.clone());
+                }
+                _ if arg.starts_with("--proxy=") => {
+                    proxy_url = Some(arg["--proxy=".len()..].to_string());
+                }
+                "--api" => {
+                    api_port = Some(DEFAULT_API_PORT);
+                }
+                "--api-port" => {
+                    idx += 1;
+                    let val = collected
+                        .get(idx)
+                        .context("`--api-port` requires a TCP port number (e.g. `17890`)")?;
+                    let parsed: u16 = val
+                        .parse()
+                        .with_context(|| format!("invalid `--api-port` value `{val}`"))?;
+                    api_port = Some(parsed);
+                }
+                _ if arg.starts_with("--api-port=") => {
+                    let val = &arg["--api-port=".len()..];
+                    let parsed: u16 = val
+                        .parse()
+                        .with_context(|| format!("invalid `--api-port` value `{val}`"))?;
+                    api_port = Some(parsed);
+                }
+                "--engine-probe" => {
+                    let mut page = ProbePage::Main;
+                    let mut seconds = 20_u64;
+                    if let Some(arg1) = collected.get(idx + 1) {
+                        match arg1.as_str() {
+                            "login" => {
+                                page = ProbePage::Login;
+                                idx += 1;
+                            }
+                            "main" => {
+                                page = ProbePage::Main;
+                                idx += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(arg2) = collected.get(idx + 1) {
+                        if let Ok(parsed_secs) = arg2.parse::<u64>() {
+                            seconds = parsed_secs.max(1);
+                            idx += 1;
+                        }
+                    }
+                    engine_probe = Some((page, seconds));
+                }
+                _ if arg.starts_with("--gapplication-") => {}
+                _ if arg.starts_with("--") => {
                     bail!(
                         "Unknown option `{arg}`.\nRun `olaz --help` to see supported options."
                     );
                 }
-                _ => {}
+                _ => {
+                    let trimmed = arg.trim();
+                    if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("zalo://") {
+                        deep_link = Some(trimmed.to_string());
+                    }
+                }
             }
+            idx += 1;
         }
 
-        Ok(Self::Gui { start_minimized })
+        let action = if is_mcp {
+            CliAction::Mcp
+        } else if let Some(download) = check_update {
+            CliAction::CheckUpdate { download }
+        } else if is_demo {
+            CliAction::Demo
+        } else if let Some((page, seconds)) = engine_probe {
+            CliAction::EngineProbe { page, seconds }
+        } else {
+            CliAction::Gui { start_minimized }
+        };
+
+        Ok(Self {
+            action,
+            profile,
+            data_dir,
+            proxy_url,
+            api_port,
+            deep_link,
+        })
     }
 }
 
@@ -127,39 +265,156 @@ fn print_help() {
 Olaz {version} — Native Linux client for Zalo (Omarchy & Ubuntu)
 
 USAGE:
-    olaz [OPTIONS]
+    olaz [OPTIONS] [zalo://...]
 
 OPTIONS:
     -h, --help                         Print this help information and exit
     -V, --version                      Print version and exit
         --minimized, --tray, --hidden  Launch hidden in the system tray (used by XDG autostart)
+        --profile <SLUG>               Launch an isolated Zalo account profile (`[A-Za-z0-9_-]+`, default: `default`)
+        --data-dir <PATH>              Override Olaz root data directory (default: `~/.local/share/olaz`)
+        --proxy <URL>                  Route HTTP/WebSocket/DoH/WebView traffic via `socks5://`, `socks5h://`, `http://`, or `https://`
+        --api, --api-port <PORT>       Start local loopback HTTP REST & MCP server on `127.0.0.1:<PORT>` (default: `{default_api_port}`)
+        --mcp                          Run Model Context Protocol (MCP) JSON-RPC 2.0 server over `stdio`, bridging to the active GUI instance
+        --check-update                 Check GitHub / Forgejo Releases for a newer Olaz version and exit
+        --update                       Check for updates and download & SHA-256-verify the latest release package
         --demo                         Launch Olaz UI in offline mock/demo mode (`?demo=1`)
         --engine-probe [PAGE] [SECS]   Boot headless Zalo renderer + debug window (`login` or `main`, default: `main` 20s)
 
 ENVIRONMENT:
+    OLAZ_PROFILE                       Default profile slug when `--profile` is omitted
+    OLAZ_DATA_DIR                      Default root data directory when `--data-dir` is omitted
+    OLAZ_PROXY                         Upstream SOCKS5/HTTP(S) proxy URL when `--proxy` is omitted
+    OLAZ_API_PORT                      Loopback REST API port when `--api-port` is omitted
+    OLAZ_API_TOKEN                     Optional Bearer token required by the loopback REST API server
     RUST_LOG                           Tracing filter (e.g. `olaz=debug,olaz_app=debug,olaz_net=debug`)
     OLAZ_TRACE_WORKERS=1               Trace DedicatedWorker / SharedWorker IPC frames
     OLAZ_NO_SHARED_WORKER=1            Disable hidden `shared-worker.html` host
     OLAZ_ENABLE_WEBKIT_HWACCEL=1       Re-enable WebKit hardware acceleration on UI webview
     OLAZ_QR_OUT=/path/to/qr.png        Save login QR code PNG in `--engine-probe login` mode",
-        version = env!("CARGO_PKG_VERSION")
+        version = env!("CARGO_PKG_VERSION"),
+        default_api_port = DEFAULT_API_PORT,
     );
 }
 
-fn init_tracing() {
+fn init_tracing(stderr_writer: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("olaz=info,olaz_app=info,olaz_core=info,olaz_net=info,olaz_linux=info,warn")
     });
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .try_init();
+    if stderr_writer {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_target(true)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .try_init();
+    }
+}
+
+/// Computes the shared root directory holding `olaz-instance.sock` / `olaz-instance-<slug>.sock`
+/// and the primary `ZaloRuntime` across both `"default"` and named `--profile <slug>` accounts.
+fn resolve_instance_root_dir(platform: &ZaloPlatform) -> PathBuf {
+    if platform.profile_slug() == "default" {
+        platform.base_dir().to_path_buf()
+    } else {
+        platform
+            .base_dir()
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or_else(|| platform.base_dir())
+            .to_path_buf()
+    }
+}
+
+/// Shares an already-installed `ZaloRuntime/current` from `instance_root_dir` into a secondary
+/// profile's `runtime_root` via symlink so secondary `--profile` accounts boot instantaneously.
+fn link_shared_runtime_for_profile(platform: &ZaloPlatform, instance_root_dir: &Path) {
+    if platform.profile_slug() == "default" {
+        return;
+    }
+    let dst_current = platform.runtime_root().join("current");
+    if dst_current.exists() {
+        return;
+    }
+    let src_current = instance_root_dir.join("ZaloRuntime").join("current");
+    if ZaloRuntimeManager::is_complete(&src_current) {
+        if std::fs::create_dir_all(platform.runtime_root()).is_ok() {
+            let _ = std::os::unix::fs::symlink(&src_current, &dst_current);
+        }
+    }
+}
+
+async fn run_cli_update_check(platform: &ZaloPlatform, download: bool) -> Result<()> {
+    let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .timeout(Duration::from_secs(60));
+    if let Some(raw_proxy) = platform.proxy_url() {
+        if let Some((_, proxy)) = parse_upstream_proxy(raw_proxy)? {
+            builder = builder.proxy(proxy);
+        }
+    }
+    let client = builder.build().context("failed to build HTTP client")?;
+    let info = check_for_updates(&client).await?;
+
+    println!("Current version : v{}", info.current_version.trim_start_matches('v'));
+    println!("Latest version  : v{} ({:?})", info.latest_version.trim_start_matches('v'), info.source);
+    println!("Release URL     : {}", info.html_url);
+
+    if !info.has_update {
+        println!("Olaz is up to date.");
+        return Ok(());
+    }
+
+    println!("Update available: {}", info.release_title);
+    if let Some(ref asset) = info.asset_name {
+        println!("Recommended pkg : {asset} ({} bytes)", info.asset_size);
+    }
+
+    if download {
+        let dl_url = info
+            .download_url
+            .as_deref()
+            .context("release does not expose a compatible Linux package asset")?;
+        let asset_name = info
+            .asset_name
+            .as_deref()
+            .context("release asset name is missing")?;
+        let expected_sha = info
+            .expected_sha256
+            .as_deref()
+            .context("release does not provide a SHA-256 digest (`SHA256SUMS.txt`); refusing unverified download")?;
+
+        std::fs::create_dir_all(platform.downloads_dir())
+            .context("failed to create downloads directory")?;
+        let dest = platform.downloads_dir().join(asset_name);
+        println!("Downloading & verifying SHA-256 ({expected_sha})...");
+        let bytes = download_and_verify_artifact(
+            &client,
+            dl_url,
+            asset_name,
+            expected_sha,
+            DownloadLimits::default(),
+            Some(&dest),
+        )
+        .await?;
+        println!(
+            "Verified {} bytes -> {}",
+            bytes.len(),
+            dest.display()
+        );
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
     // Handle `--help` and `--version` BEFORE initializing GTK so headless CI / terminals succeed.
-    let action = CliAction::parse(std::env::args().skip(1))?;
-    match action {
+    let cli = CliConfig::parse(std::env::args().skip(1))?;
+    match cli.action {
         CliAction::Help => {
             print_help();
             return Ok(());
@@ -168,26 +423,95 @@ fn main() -> Result<()> {
             println!("olaz {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        CliAction::Gui { .. } | CliAction::Demo | CliAction::EngineProbe { .. } => {}
+        CliAction::Mcp
+        | CliAction::CheckUpdate { .. }
+        | CliAction::Gui { .. }
+        | CliAction::Demo
+        | CliAction::EngineProbe { .. } => {}
     }
 
-    init_tracing();
+    init_tracing(matches!(cli.action, CliAction::Mcp));
 
-    // Prepare platform directories and enforce single-instance re-activation BEFORE starting
-    // Tokio / GTK so a launcher click while hidden in tray immediately wakes the primary window.
-    let platform_raw = ZaloPlatform::new(env!("CARGO_PKG_VERSION"));
-    let mut _instance_guard = None;
+    let effective_profile = cli
+        .profile
+        .clone()
+        .or_else(|| std::env::var("OLAZ_PROFILE").ok().filter(|s| !s.trim().is_empty()));
+    let effective_data_dir = cli.data_dir.clone().or_else(|| {
+        std::env::var_os("OLAZ_DATA_DIR")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    });
+    let effective_proxy = cli
+        .proxy_url
+        .clone()
+        .or_else(|| std::env::var("OLAZ_PROXY").ok().filter(|s| !s.trim().is_empty()));
+    let effective_api_port = match cli.api_port {
+        Some(p) => Some(p),
+        None => match std::env::var("OLAZ_API_PORT") {
+            Ok(raw) if !raw.trim().is_empty() => Some(
+                raw.trim()
+                    .parse::<u16>()
+                    .with_context(|| format!("invalid OLAZ_API_PORT `{raw}`"))?,
+            ),
+            _ => None,
+        },
+    };
+
+    let platform_raw = ZaloPlatform::from_options(
+        effective_profile.as_deref(),
+        effective_data_dir,
+        effective_proxy,
+    )?;
+    platform_raw.set_app_version(env!("CARGO_PKG_VERSION"));
+    let instance_root_dir = resolve_instance_root_dir(&platform_raw);
+
+    // Headless `--mcp` and `--check-update` / `--update` modes run on Tokio BEFORE `gtk::init()`
+    // so they work cleanly in SSH sessions, AI agent hosts, and headless terminals.
+    if matches!(cli.action, CliAction::Mcp | CliAction::CheckUpdate { .. }) {
+        let headless_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("olaz-cli")
+            .build()
+            .context("failed to build Tokio runtime")?;
+        return match cli.action {
+            CliAction::Mcp => {
+                let backend: Arc<dyn OlazControlBackend> = Arc::new(
+                    SocketRpcBackend::for_profile_in_dir(
+                        &instance_root_dir,
+                        platform_raw.profile_slug(),
+                    ),
+                );
+                headless_rt.block_on(run_mcp_stdio(backend))
+            }
+            CliAction::CheckUpdate { download } => {
+                headless_rt.block_on(run_cli_update_check(&platform_raw, download))
+            }
+            _ => unreachable!(),
+        };
+    }
+
+    // Prepare platform directories and enforce profile-scoped single-instance re-activation BEFORE
+    // starting GTK so a launcher click or `zalo://` link wakes the running instance immediately.
+    link_shared_runtime_for_profile(&platform_raw, &instance_root_dir);
+    let mut instance_guard = None;
     let mut instance_rx = None;
-    if let CliAction::Gui { start_minimized } = action {
-        match acquire_or_notify_primary(platform_raw.base_dir(), !start_minimized) {
-            Ok(AcquireInstanceOutcome::Primary(guard, rx)) => {
-                _instance_guard = Some(guard);
+    if let CliAction::Gui { start_minimized } = cli.action {
+        match acquire_or_notify_in_dir(
+            &instance_root_dir,
+            platform_raw.profile_slug(),
+            start_minimized,
+            cli.deep_link.as_deref(),
+        ) {
+            Ok(AcquireProfileInstanceOutcome::Primary(guard, rx)) => {
+                instance_guard = Some(guard);
                 instance_rx = Some(rx);
             }
-            Ok(AcquireInstanceOutcome::ForwardedToPrimary) => {
+            Ok(AcquireProfileInstanceOutcome::ForwardedToPrimary) => {
                 tracing::info!(
+                    profile = %platform_raw.profile_slug(),
                     start_minimized,
-                    "olaz is already running; notified primary instance and exiting"
+                    deep_link = ?cli.deep_link,
+                    "olaz is already running for this profile; notified primary instance and exiting"
                 );
                 return Ok(());
             }
@@ -230,13 +554,19 @@ fn main() -> Result<()> {
 
     let cookie_jar = ZaloCookieJar::open(platform.user_data().join("cookies.json"))
         .context("failed to open Zalo cookie jar")?;
-    let dns_resolver = Arc::new(ZaloDnsResolver::new());
+    let dns_resolver = Arc::new(
+        ZaloDnsResolver::new()
+            .with_proxy_url(platform.proxy_url())
+            .context("failed to configure upstream proxy on ZaloDnsResolver")?,
+    );
     let network = NetworkProxy::with_config(
         cookie_jar.clone(),
         Arc::clone(&dns_resolver),
         platform.identity.user_agent(),
     )
-    .context("failed to initialize NetworkProxy")?;
+    .context("failed to initialize NetworkProxy")?
+    .with_proxy_url(platform.proxy_url())
+    .context("failed to configure upstream proxy on NetworkProxy")?;
     let media_loader =
         MediaLoader::new(platform.cache_dir(), dns_resolver).context("failed to init MediaLoader")?;
 
@@ -250,7 +580,7 @@ fn main() -> Result<()> {
         tokio_handle.clone(),
     );
 
-    let direct_ui = matches!(action, CliAction::Gui { .. });
+    let direct_ui = matches!(cli.action, CliAction::Gui { .. });
     let mp_for_bridge = Rc::clone(&main_process);
     let host = OfficialClientHost::new_with_mode(
         &platform,
@@ -265,18 +595,26 @@ fn main() -> Result<()> {
     );
     main_process.attach_host(&host);
 
-    match action {
+    match cli.action {
         CliAction::Gui { start_minimized } => {
-            let _window = OlazAppWindow::launch_with_options(
+            let window = OlazAppWindow::launch_with_profile_options(
                 platform,
                 runtime_mgr,
                 host,
                 main_process,
-                tokio_handle,
+                tokio_handle.clone(),
                 false,
                 start_minimized,
                 instance_rx,
+                effective_api_port,
             );
+            if let Some(ref guard) = instance_guard {
+                guard.set_tokio_handle(tokio_handle);
+                guard.set_rpc_handler(make_instance_rpc_handler(window.control_backend()));
+            }
+            if let Some(ref dl) = cli.deep_link {
+                window.handle_deep_link(dl);
+            }
             gtk::main();
         }
         CliAction::Demo => {
@@ -300,7 +638,10 @@ fn main() -> Result<()> {
                 seconds,
             )?;
         }
-        CliAction::Help | CliAction::Version => unreachable!(),
+        CliAction::Help
+        | CliAction::Version
+        | CliAction::Mcp
+        | CliAction::CheckUpdate { .. } => unreachable!(),
     }
 
     Ok(())
@@ -499,5 +840,60 @@ mod tests {
             }
         );
         assert!(CliAction::parse(["--nonexistent-flag"]).is_err());
+    }
+
+    #[test]
+    fn cli_config_parses_profile_proxy_api_mcp_updater_and_deep_link() {
+        let cfg = CliConfig::parse([
+            "--profile",
+            "work",
+            "--data-dir=/tmp/olaz-custom",
+            "--proxy",
+            "socks5h://127.0.0.1:1080",
+            "--api-port=18890",
+            "--minimized",
+            "zalo://conversation/123456",
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.action,
+            CliAction::Gui {
+                start_minimized: true
+            }
+        );
+        assert_eq!(cfg.profile.as_deref(), Some("work"));
+        assert_eq!(cfg.data_dir, Some(PathBuf::from("/tmp/olaz-custom")));
+        assert_eq!(cfg.proxy_url.as_deref(), Some("socks5h://127.0.0.1:1080"));
+        assert_eq!(cfg.api_port, Some(18890));
+        assert_eq!(cfg.deep_link.as_deref(), Some("zalo://conversation/123456"));
+
+        let api_default = CliConfig::parse(["--api", "--profile=personal"]).unwrap();
+        assert_eq!(api_default.api_port, Some(DEFAULT_API_PORT));
+        assert_eq!(api_default.profile.as_deref(), Some("personal"));
+
+        let mcp_cfg = CliConfig::parse(["--mcp", "--profile", "work"]).unwrap();
+        assert_eq!(mcp_cfg.action, CliAction::Mcp);
+        assert_eq!(mcp_cfg.profile.as_deref(), Some("work"));
+
+        assert_eq!(
+            CliAction::parse(["--check-update"]).unwrap(),
+            CliAction::CheckUpdate { download: false }
+        );
+        assert_eq!(
+            CliAction::parse(["--update"]).unwrap(),
+            CliAction::CheckUpdate { download: true }
+        );
+        assert!(CliConfig::parse(["--profile"]).is_err());
+        assert!(CliConfig::parse(["--api-port", "not-a-port"]).is_err());
+    }
+
+    #[test]
+    fn resolve_instance_root_dir_matches_across_default_and_named_profiles() {
+        let dir = std::env::temp_dir().join(format!("olaz-main-root-{}", uuid::Uuid::new_v4()));
+        let default_plat = ZaloPlatform::from_options(Some("default"), Some(dir.clone()), None).unwrap();
+        let work_plat = ZaloPlatform::from_options(Some("work"), Some(dir.clone()), None).unwrap();
+        assert_eq!(resolve_instance_root_dir(&default_plat), dir);
+        assert_eq!(resolve_instance_root_dir(&work_plat), dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

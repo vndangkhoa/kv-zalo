@@ -2391,7 +2391,7 @@ dependencies = [
 
 [[package]]
 name = "olaz-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2410,6 +2410,7 @@ dependencies = [
  "olaz-net",
  "parking_lot",
  "percent-encoding",
+ "reqwest",
  "serde",
  "serde_json",
  "soup3",
@@ -2423,7 +2424,7 @@ dependencies = [
 
 [[package]]
 name = "olaz-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2471,7 +2472,7 @@ dependencies = [
 
 [[package]]
 name = "olaz-linux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -2512,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "olaz-net"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "aes-gcm",

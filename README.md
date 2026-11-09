@@ -78,13 +78,13 @@ A new PC session has no message history except My Cloud, because Zalo keeps hist
     ```bash
     chmod +x olaz-setup-linux-x86_64.run && ./olaz-setup-linux-x86_64.run
     ```
-  - **Ubuntu 22.04 LTS / 24.04 LTS+ / Debian / Linux Mint / Pop!\_OS**: double-click `olaz_0.1.0_amd64.deb` in Software Install, or run:
+  - **Ubuntu 22.04 LTS / 24.04 LTS+ / Debian / Linux Mint / Pop!\_OS**: double-click `olaz_0.2.0_amd64.deb` in Software Install, or run:
     ```bash
-    sudo apt install ./olaz_0.1.0_amd64.deb
+    sudo apt install ./olaz_0.2.0_amd64.deb
     ```
   - **Omarchy / Arch Linux / CachyOS / EndeavourOS**:
     ```bash
-    sudo pacman -U ./olaz-0.1.0-1-x86_64.pkg.tar.zst
+    sudo pacman -U ./olaz-0.2.0-1-x86_64.pkg.tar.zst
     ```
 
 ### Build from source — Omarchy / Arch Linux
@@ -92,7 +92,7 @@ A new PC session has no message history except My Cloud, because Zalo keeps hist
 1. **Install build & runtime packages** (already present on most Omarchy setups; `libgstolazauto.so` also embeds
    fallback audio/video sinks and FFmpeg MP4/AAC/MP3/H.264 demuxing when `gst-plugins-good` / `gst-libav` are absent):
    ```bash
-   sudo pacman -S --needed rust pkgconf webkit2gtk-4.1 gtk3 gstreamer gst-plugins-base ffmpeg xdg-desktop-portal 7zip
+   sudo pacman -S --needed rust pkgconf webkit2gtk-4.1 gtk3 gstreamer gst-plugins-base opus libpulse ffmpeg xdg-desktop-portal 7zip
    ```
 
 2. **Option A — Build & install to `~/.local` (no `sudo` needed for install)**:
@@ -125,8 +125,18 @@ A new PC session has no message history except My Cloud, because Zalo keeps hist
 3. **Option B — Build & install native Linux release packages (`.deb`, `.pkg.tar.zst`, `.run`, `.tar.gz`)**:
    ```bash
    ./packaging/build-linux-release.sh
-   sudo apt install ./dist/v0.1.0/olaz_0.1.0_amd64.deb
+   sudo apt install ./dist/v0.2.0/olaz_0.2.0_amd64.deb
    ```
+
+### Linux CLI options (Multi-Account, Proxy, REST API, MCP, Updater)
+
+```bash
+olaz --profile work                        # launch isolated secondary Zalo account
+olaz --proxy socks5h://127.0.0.1:1080      # route traffic & DoH over SOCKS5 / HTTP proxy
+olaz --api                                 # enable local loopback REST API on 127.0.0.1:17890 (or --api-port <PORT>)
+olaz --mcp                                 # run JSON-RPC 2.0 MCP stdio server bridged to running instance
+olaz --check-update                        # check GitHub & Forgejo releases (use --update to verify SHA-256 & download)
+```
 
 ### Linux tests & developer harness
 
@@ -210,12 +220,13 @@ OlazAppWindow (GTK3 frameless + webkit2gtk-4.1)            crates/olaz-app/
   └─ ZaloMainProcess     ── Rust Electron main-process & IPC implementation (`$zwindow`, `$znode`, `$znoti`, …)
         │
   ├─ crates/olaz-core/   ── Zero-copy `mmap` AsarArchive, pinned DMG installer (`7zz`/`7z` + SHA-256),
-  │                         Node-parity `$znode.crypto`, `zsafe-storage`, `org.freedesktop.secrets` vault
-  ├─ crates/olaz-net/    ── `reqwest` + `tokio-tungstenite` proxy, `0600` cookie jar (`zpw_sek`),
+  │                         Node-parity `$znode.crypto`, `zsafe-storage`, `ZDB4.0` (`db-cross-v4`),
+  │                         `zwalker`, `file-utilities`, `org.freedesktop.secrets` vault
+  ├─ crates/olaz-net/    ── `reqwest` (SOCKS5/HTTP `--proxy`) + `tokio-tungstenite` proxy, `0600` cookie jar (`zpw_sek`),
   │                         DoH (`1.1.1.1` / `8.8.8.8`) for `*.zadn.vn`, streaming AES-GCM / AES-CTR media
-  └─ crates/olaz-linux/  ── Embedded `libgstolazauto.so` (PipeWire/Pulse/ALSA auto sinks + FFmpeg MP4/AAC/H.264
-                            demuxer + `olazmediasrc`), `ksni` tray, `xdg-desktop-portal` dialogs & screenshots,
-                            Omarchy theme watcher & GNOME `gsettings` fallback
+  └─ crates/olaz-linux/  ── Pure-Rust 1:1 & group SFU VoIP engine (`call/`: Opus 16 kHz, H.264 camera & screen share,
+                            Zavi/SRTP, `zcall-ui`), embedded `libgstolazauto.so`, `ksni` tray + privacy receipt blocker,
+                            scheduler & auto-reply, local REST/MCP server, `xdg-desktop-portal`, Omarchy theme watcher
 ```
 
 ## Status

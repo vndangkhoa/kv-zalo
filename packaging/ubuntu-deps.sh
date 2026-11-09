@@ -60,6 +60,11 @@ $SUDO apt-get install -y \
   libswresample-dev \
   libswscale-dev \
   libavutil-dev \
+  libopus-dev \
+  libopus0 \
+  libpulse-dev \
+  libpulse0 \
+  ffmpeg \
   gstreamer1.0-plugins-base \
   gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad \
