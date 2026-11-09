@@ -17,9 +17,9 @@ use olaz_core::{InstallProgress, ZaloPlatform, ZaloRuntimeManager};
 use olaz_linux::{
     capture_interactive_screenshot, has_gstreamer_audio_sink, load_omarchy_theme, pick_open_files,
     spawn_omarchy_watcher, spawn_tray, stage_screenshot_file, ComposerDraft, Conversation,
-    DesktopTheme, EnginePhase, FileCard, IncomingVoipCall, Mention, NotificationPolicy,
-    OlazTrayEvent, OlazTrayHandle, OmarchyWatcherHandle, WaitingConfirm, ZaloEngineState,
-    LINUX_CALL_UNSUPPORTED_MESSAGE, SCREENSHOT_STAGING_DIR,
+    DesktopTheme, EnginePhase, FileCard, IncomingVoipCall, InstanceEvent, Mention,
+    NotificationPolicy, OlazTrayEvent, OlazTrayHandle, OmarchyWatcherHandle, WaitingConfirm,
+    ZaloEngineState, LINUX_CALL_UNSUPPORTED_MESSAGE, SCREENSHOT_STAGING_DIR,
 };
 use olaz_net::{serve_local_media_range, MediaLoader, MediaRangeResponse};
 use serde::{Deserialize, Serialize};
@@ -319,6 +319,7 @@ pub struct OlazAppWindow {
     ui_loaded: Cell<bool>,
     ui_ready: Cell<bool>,
     ui_crash_timestamps: RefCell<Vec<Instant>>,
+    suppress_renderer_auto_show: Cell<bool>,
     quitting: Cell<bool>,
 
     tray_handle: RefCell<Option<OlazTrayHandle>>,
@@ -332,6 +333,7 @@ impl OlazAppWindow {
 
     /// Constructs and presents the native Olaz GTK3 window, starts the Omarchy watcher and tray,
     /// and boots (or installs) the official Zalo runtime (unless `demo_mode` is `true`).
+    #[allow(dead_code)]
     pub fn launch(
         platform: Arc<ZaloPlatform>,
         runtime_mgr: ZaloRuntimeManager,
@@ -340,7 +342,38 @@ impl OlazAppWindow {
         tokio_handle: tokio::runtime::Handle,
         demo_mode: bool,
     ) -> Rc<Self> {
+        Self::launch_with_options(
+            platform,
+            runtime_mgr,
+            host,
+            main_process,
+            tokio_handle,
+            demo_mode,
+            false,
+            None,
+        )
+    }
+
+    /// Constructs the native Olaz GTK3 window with optional `--minimized` start-in-tray lifecycle
+    /// and single-instance re-activation channel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_with_options(
+        platform: Arc<ZaloPlatform>,
+        runtime_mgr: ZaloRuntimeManager,
+        host: Rc<OfficialClientHost>,
+        main_process: Rc<ZaloMainProcess>,
+        tokio_handle: tokio::runtime::Handle,
+        demo_mode: bool,
+        start_minimized: bool,
+        instance_rx: Option<tokio::sync::mpsc::UnboundedReceiver<InstanceEvent>>,
+    ) -> Rc<Self> {
         gtk::Window::set_default_icon_name("olaz");
+
+        let hide_on_startup = start_minimized && !demo_mode;
+        main_process
+            .window_state()
+            .is_visible
+            .store(!hide_on_startup, Ordering::Relaxed);
 
         let initial_theme = load_omarchy_theme();
         let settings_path = platform.user_data().join("olaz-ui-settings.json");
@@ -443,6 +476,7 @@ impl OlazAppWindow {
             ui_loaded: Cell::new(false),
             ui_ready: Cell::new(false),
             ui_crash_timestamps: RefCell::new(Vec::new()),
+            suppress_renderer_auto_show: Cell::new(hide_on_startup),
             quitting: Cell::new(false),
             tray_handle: RefCell::new(None),
             _omarchy_watcher: omarchy_watcher,
@@ -455,6 +489,30 @@ impl OlazAppWindow {
             app.install_host_and_main_process_hooks();
             app.install_auto_relock_timer();
         }
+        if let Some(mut rx) = instance_rx {
+            let app_weak = Rc::downgrade(&app);
+            glib::MainContext::default().spawn_local(async move {
+                while let Some(ev) = rx.recv().await {
+                    let Some(app) = app_weak.upgrade() else {
+                        break;
+                    };
+                    match ev {
+                        InstanceEvent::PresentWindow => {
+                            tracing::info!(
+                                "presenting primary window for secondary olaz invocation"
+                            );
+                            app.present_window();
+                            app.host.bridge().send("show-from-tray", vec![]);
+                        }
+                        InstanceEvent::BackgroundPing => {
+                            tracing::debug!(
+                                "ignoring duplicate --minimized background invocation"
+                            );
+                        }
+                    }
+                }
+            });
+        }
         app.spawn_omarchy_listener(&mut theme_rx);
         app.spawn_status_tray();
 
@@ -464,8 +522,13 @@ impl OlazAppWindow {
             app.bootstrap_runtime();
         }
 
-        window.show_all();
-        window.present();
+        if app.suppress_renderer_auto_show.get() {
+            app.stack.show_all();
+            tracing::info!("started minimized to system tray (--minimized)");
+        } else {
+            window.show_all();
+            window.present();
+        }
 
         app
     }
@@ -499,7 +562,16 @@ impl OlazAppWindow {
                 .is_some_and(|h| !h.is_closed());
             if !app.quitting.get() && has_live_tray {
                 win.hide();
-                app.host.bridge().send("visibility-change", vec![json!("hide")]);
+                app.main_process
+                    .window_state()
+                    .is_visible
+                    .store(false, Ordering::Relaxed);
+                app.host
+                    .bridge()
+                    .send("visibility-change", vec![json!("hide")]);
+                app.host
+                    .bridge()
+                    .send("visibility-change", vec![json!("blur"), json!("1")]);
                 return glib::Propagation::Stop;
             }
             app.shutdown_and_quit();
@@ -694,9 +766,16 @@ impl OlazAppWindow {
                             .is_some_and(|h| !h.is_closed());
                         if !app.quitting.get() && has_live_tray {
                             app.window.hide();
+                            app.main_process
+                                .window_state()
+                                .is_visible
+                                .store(false, Ordering::Relaxed);
                             app.host
                                 .bridge()
                                 .send("visibility-change", vec![json!("hide")]);
+                            app.host
+                                .bridge()
+                                .send("visibility-change", vec![json!("blur"), json!("1")]);
                         } else {
                             app.quitting.set(true);
                             app.shutdown_and_quit();
@@ -711,14 +790,39 @@ impl OlazAppWindow {
                                 continue;
                             }
                         }
-                        app.window.show_all();
-                        app.window.deiconify();
-                        if focus {
-                            app.window.present();
+                        if app.suppress_renderer_auto_show.get() {
+                            tracing::debug!(
+                                "suppressing renderer-initiated main window show while started minimized in tray"
+                            );
+                            continue;
                         }
-                        app.host
-                            .bridge()
-                            .send("visibility-change", vec![json!("show")]);
+                        if focus {
+                            app.present_window();
+                        } else {
+                            if !app.window.is_visible()
+                                && !app.demo_mode
+                                && app.host.is_direct_ui()
+                                && !app.installing_runtime.get()
+                            {
+                                app.host.mount_into(&app.zalo_container);
+                                app.zalo_container.show_all();
+                                app.stack.set_visible_child_name("zalo");
+                                if app.in_login_mode.get() {
+                                    app.apply_login_window_size();
+                                } else {
+                                    app.apply_main_window_size();
+                                }
+                            }
+                            app.main_process
+                                .window_state()
+                                .is_visible
+                                .store(true, Ordering::Relaxed);
+                            app.window.show_all();
+                            app.window.deiconify();
+                            app.host
+                                .bridge()
+                                .send("visibility-change", vec![json!("show")]);
+                        }
                     }
                     WindowCommand::Focus { window_id } => {
                         if let Some(ref wid) = window_id {
@@ -727,6 +831,12 @@ impl OlazAppWindow {
                             {
                                 continue;
                             }
+                        }
+                        if app.suppress_renderer_auto_show.get() {
+                            tracing::debug!(
+                                "suppressing renderer-initiated main window focus while started minimized in tray"
+                            );
+                            continue;
                         }
                         app.present_window();
                     }
@@ -1074,7 +1184,15 @@ impl OlazAppWindow {
         let app_weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
             let Ok(Ok((handle, mut rx))) = ready_rx.await else {
-                tracing::debug!("StatusNotifierItem tray unavailable on current session bus");
+                tracing::warn!("StatusNotifierItem tray unavailable on current session bus");
+                if let Some(app) = app_weak.upgrade() {
+                    if app.suppress_renderer_auto_show.get() {
+                        tracing::warn!(
+                            "presenting main window because StatusNotifierItem tray failed during --minimized startup"
+                        );
+                        app.present_window();
+                    }
+                }
                 return;
             };
             if let Some(app) = app_weak.upgrade() {
@@ -1098,9 +1216,16 @@ impl OlazAppWindow {
                         if app.window.is_visible() && app.window.is_active() {
                             app.persist_window_geometry();
                             app.window.hide();
+                            app.main_process
+                                .window_state()
+                                .is_visible
+                                .store(false, Ordering::Relaxed);
                             app.host
                                 .bridge()
                                 .send("visibility-change", vec![json!("hide")]);
+                            app.host
+                                .bridge()
+                                .send("visibility-change", vec![json!("blur"), json!("1")]);
                         } else {
                             app.present_window();
                             app.host.bridge().send("show-from-tray", vec![]);
@@ -1210,6 +1335,11 @@ impl OlazAppWindow {
             return;
         }
         self.installing_runtime.set(true);
+        self.suppress_renderer_auto_show.set(false);
+        self.main_process
+            .window_state()
+            .is_visible
+            .store(true, Ordering::Relaxed);
         self.stack.set_visible_child_name("setup");
         self.ensure_setup_ui_loaded();
 
@@ -1328,13 +1458,19 @@ impl OlazAppWindow {
 
         if self.host.is_direct_ui() {
             if logged_in {
+                let st = self.saved_win_state.borrow().clone();
+                self.host
+                    .resize_offscreen(st.width.max(800), st.height.max(560));
                 self.apply_main_window_size();
             } else {
+                self.host.resize_offscreen(400, 580);
                 self.apply_login_window_size();
             }
-            self.host.mount_into(&self.zalo_container);
-            self.zalo_container.show_all();
-            self.stack.set_visible_child_name("zalo");
+            if !self.suppress_renderer_auto_show.get() {
+                self.host.mount_into(&self.zalo_container);
+                self.zalo_container.show_all();
+                self.stack.set_visible_child_name("zalo");
+            }
         } else {
             let snap = self.full_ui_snapshot();
             self.push_ui_state(&snap);
@@ -1552,6 +1688,7 @@ impl OlazAppWindow {
         }
         self.window.set_resizable(true);
         self.window.set_size_request(400, 560);
+        self.window.set_default_size(400, 580);
         self.window.resize(400, 580);
     }
 
@@ -1561,9 +1698,12 @@ impl OlazAppWindow {
         }
         self.in_login_mode.set(false);
         let st = self.saved_win_state.borrow().clone();
+        let w = st.width.max(800);
+        let h = st.height.max(560);
         self.window.set_resizable(true);
         self.window.set_size_request(800, 560);
-        self.window.resize(st.width.max(800), st.height.max(560));
+        self.window.set_default_size(w, h);
+        self.window.resize(w, h);
         if st.maximized {
             self.window.maximize();
         }
@@ -1576,7 +1716,26 @@ impl OlazAppWindow {
         self.saved_win_state.borrow().save(&self.win_state_path);
     }
 
-    fn present_window(&self) {
+    pub fn present_window(&self) {
+        self.suppress_renderer_auto_show.set(false);
+        self.main_process
+            .window_state()
+            .is_visible
+            .store(true, Ordering::Relaxed);
+        if !self.window.is_visible()
+            && !self.demo_mode
+            && self.host.is_direct_ui()
+            && !self.installing_runtime.get()
+        {
+            self.host.mount_into(&self.zalo_container);
+            self.zalo_container.show_all();
+            self.stack.set_visible_child_name("zalo");
+            if self.in_login_mode.get() {
+                self.apply_login_window_size();
+            } else {
+                self.apply_main_window_size();
+            }
+        }
         self.window.show_all();
         self.window.deiconify();
         self.window.present();

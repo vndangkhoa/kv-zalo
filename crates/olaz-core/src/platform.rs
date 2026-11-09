@@ -5,6 +5,7 @@
 //! `ZaloMainProcess.normalizeDatabaseAdapterState` (`ZaloMainProcess.swift:177-200`).
 
 use std::collections::{BTreeMap, VecDeque};
+use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
@@ -47,6 +48,17 @@ impl ClientIdentity {
     }
 }
 
+/// Resolves `$XDG_CONFIG_HOME/autostart` per the XDG Base Directory Specification,
+/// falling back to `<home_dir>/.config/autostart` when `XDG_CONFIG_HOME` is unset, empty, or relative.
+pub fn resolve_xdg_autostart_dir(xdg_config_home: Option<&OsStr>, home_dir: &Path) -> PathBuf {
+    let config_root = xdg_config_home
+        .filter(|val| !val.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home_dir.join(".config"));
+    config_root.join("autostart")
+}
+
 /// Host directories, device identity, JSON stores, and filesystem write sandbox.
 #[derive(Debug)]
 pub struct ZaloPlatform {
@@ -59,10 +71,14 @@ pub struct ZaloPlatform {
     cache_dir: PathBuf,
     temp_dir: PathBuf,
     home_dir: PathBuf,
+    autostart_dir: PathBuf,
+    isolated_root: bool,
     downloads_dir: PathBuf,
     documents_dir: PathBuf,
     desktop_dir: PathBuf,
     pictures_dir: PathBuf,
+    videos_dir: PathBuf,
+    music_dir: PathBuf,
     imei_cache: Mutex<Option<String>>,
     approved_write_paths: RwLock<Vec<PathBuf>>,
     approved_read_paths: RwLock<Vec<PathBuf>>,
@@ -76,6 +92,7 @@ impl ZaloPlatform {
     /// - `webkit_dir`: `~/.local/share/olaz/webkit`
     /// - `cache_dir`: `~/.cache/olaz`
     /// - `temp_dir`: `/tmp/olaz`
+    /// - `autostart_dir`: `$XDG_CONFIG_HOME/autostart` (or `~/.config/autostart`)
     pub fn new(app_version: impl Into<String>) -> Self {
         let base_dirs = BaseDirs::new();
         let home_dir = base_dirs
@@ -92,6 +109,10 @@ impl ZaloPlatform {
             .as_ref()
             .map(|b| b.cache_dir().to_path_buf())
             .unwrap_or_else(|| home_dir.join(".cache"));
+        let autostart_dir = resolve_xdg_autostart_dir(
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            &home_dir,
+        );
 
         let user_dirs = UserDirs::new();
         let downloads_dir = user_dirs
@@ -110,6 +131,14 @@ impl ZaloPlatform {
             .as_ref()
             .and_then(|u| u.picture_dir().map(Path::to_path_buf))
             .unwrap_or_else(|| home_dir.join("Pictures"));
+        let videos_dir = user_dirs
+            .as_ref()
+            .and_then(|u| u.video_dir().map(Path::to_path_buf))
+            .unwrap_or_else(|| home_dir.join("Videos"));
+        let music_dir = user_dirs
+            .as_ref()
+            .and_then(|u| u.audio_dir().map(Path::to_path_buf))
+            .unwrap_or_else(|| home_dir.join("Music"));
 
         let base_dir = data_root.join("olaz");
         let user_data = base_dir.join("ZaloData");
@@ -131,10 +160,14 @@ impl ZaloPlatform {
             cache_dir,
             temp_dir,
             home_dir,
+            autostart_dir,
+            isolated_root: false,
             downloads_dir,
             documents_dir,
             desktop_dir,
             pictures_dir,
+            videos_dir,
+            music_dir,
             imei_cache: Mutex::new(None),
             approved_write_paths: RwLock::new(Vec::new()),
             approved_read_paths: RwLock::new(Vec::new()),
@@ -150,10 +183,13 @@ impl ZaloPlatform {
         let cache_dir = base_dir.join("cache");
         let temp_dir = base_dir.join("tmp");
         let home_dir = base_dir.join("home");
+        let autostart_dir = base_dir.join("config/autostart");
         let downloads_dir = home_dir.join("Downloads");
         let documents_dir = home_dir.join("Documents");
         let desktop_dir = home_dir.join("Desktop");
         let pictures_dir = home_dir.join("Pictures");
+        let videos_dir = home_dir.join("Videos");
+        let music_dir = home_dir.join("Music");
 
         let _ = std::fs::create_dir_all(&user_data);
         let _ = std::fs::create_dir_all(&temp_dir);
@@ -169,10 +205,14 @@ impl ZaloPlatform {
             cache_dir,
             temp_dir,
             home_dir,
+            autostart_dir,
+            isolated_root: true,
             downloads_dir,
             documents_dir,
             desktop_dir,
             pictures_dir,
+            videos_dir,
+            music_dir,
             imei_cache: Mutex::new(None),
             approved_write_paths: RwLock::new(Vec::new()),
             approved_read_paths: RwLock::new(Vec::new()),
@@ -181,6 +221,17 @@ impl ZaloPlatform {
 
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
+    }
+
+    /// Directory where XDG autostart `.desktop` entries live (`$XDG_CONFIG_HOME/autostart` in
+    /// production, or `<root>/config/autostart` inside [`Self::with_root`] test sandboxes).
+    pub fn autostart_dir(&self) -> &Path {
+        &self.autostart_dir
+    }
+
+    /// Returns `true` when constructed via [`Self::with_root`] (isolated sandbox / test root).
+    pub fn is_isolated_root(&self) -> bool {
+        self.isolated_root
     }
 
     /// Returns the active Zalo PC app version (e.g. `"26.10.20"`).
@@ -266,6 +317,11 @@ impl ZaloPlatform {
         self.approved_read_paths.read().clone()
     }
 
+    /// Returns a snapshot of user-approved writable paths (`showSaveDialog`, `showOpenDialog` directory).
+    pub fn approved_write_paths(&self) -> Vec<PathBuf> {
+        self.approved_write_paths.read().clone()
+    }
+
     /// Stable per-install lowercase UUID v4 device identifier persisted in `<base_dir>/olaz-meta.json`.
     pub fn imei(&self) -> String {
         let mut guard = self.imei_cache.lock();
@@ -306,6 +362,8 @@ impl ZaloPlatform {
             "documents" => self.documents_dir.clone(),
             "desktop" => self.desktop_dir.clone(),
             "pictures" => self.pictures_dir.clone(),
+            "videos" => self.videos_dir.clone(),
+            "music" => self.music_dir.clone(),
             "logs" => self.user_data.join("logs"),
             other => {
                 tracing::debug!(path_name = other, "electron_path fallback -> userData");
@@ -421,6 +479,47 @@ impl ZaloPlatform {
                 .map(|canon_root| resolved.starts_with(&canon_root))
                 .unwrap_or(false)
         }) {
+            return true;
+        }
+        self.approved_write_paths
+            .read()
+            .iter()
+            .any(|approved| resolved.starts_with(approved))
+    }
+
+    /// Returns `true` if `path` resolves inside one of the confined app/media directories or
+    /// a user-approved read/write path.
+    pub fn is_readable(&self, path: &Path) -> bool {
+        if path.as_os_str().is_empty() {
+            return false;
+        }
+        let Some(resolved) = resolve_path_preserving_tail(path) else {
+            return false;
+        };
+        let allowed = [
+            &self.user_data,
+            &self.temp_dir,
+            &self.downloads_dir,
+            &self.cache_dir,
+            &self.documents_dir,
+            &self.desktop_dir,
+            &self.pictures_dir,
+            &self.videos_dir,
+            &self.music_dir,
+        ];
+        if allowed.iter().any(|root| {
+            resolve_path_preserving_tail(root)
+                .map(|canon_root| resolved.starts_with(&canon_root))
+                .unwrap_or(false)
+        }) {
+            return true;
+        }
+        if self
+            .approved_read_paths
+            .read()
+            .iter()
+            .any(|approved| resolved.starts_with(approved))
+        {
             return true;
         }
         self.approved_write_paths

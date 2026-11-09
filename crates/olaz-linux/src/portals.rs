@@ -240,9 +240,10 @@ async fn zenity_open_fallback(
         s.push("/");
         cmd.arg("--filename").arg(s);
     }
-    let Ok(out) = cmd.output().await else {
-        return Ok(Vec::new());
-    };
+    let out = cmd
+        .output()
+        .await
+        .context("neither XDG FileChooser portal nor zenity is available")?;
     if !out.status.success() {
         return Ok(Vec::new());
     }
@@ -275,9 +276,10 @@ async fn zenity_save_fallback(
     if let Some(c) = candidate {
         cmd.arg("--filename").arg(c);
     }
-    let Ok(out) = cmd.output().await else {
-        return Ok(None);
-    };
+    let out = cmd
+        .output()
+        .await
+        .context("neither XDG FileChooser portal nor zenity is available")?;
     if !out.status.success() {
         return Ok(None);
     }

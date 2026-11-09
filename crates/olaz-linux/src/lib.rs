@@ -16,12 +16,24 @@
 //! - [`engine`]: Rich `ZaloEngineState`, `zstate` reducer, `merge_chat`, `ComposerDraft` /
 //!   `FailedDraftStore` UTF-16 <-> UTF-8 mention shifting, `FileCard::may_execute`, and `fold_vietnamese`.
 
+pub mod autostart;
 pub mod call_stub;
 pub mod engine;
+pub mod instance;
 pub mod notifications;
 pub mod omarchy;
 pub mod portals;
 pub mod tray;
+
+pub use autostart::{
+    format_autostart_desktop_entry, format_desktop_exec_arg, parse_existing_desktop_entry,
+    reload_user_systemd_nonblocking, resolve_olaz_executable_path, AutostartManager,
+    AutostartState, AUTOSTART_DESKTOP_FILENAME, AUTOSTART_STATE_FILENAME,
+};
+pub use instance::{
+    acquire_or_notify_primary, instance_socket_path, AcquireInstanceOutcome, InstanceEvent,
+    SingleInstanceGuard,
+};
 
 pub use call_stub::{
     CallChunkReassembler, CallChunker, CallFrameDecoder, CallTransportCrypto, CallTransportError,
@@ -43,12 +55,12 @@ pub use notifications::{
     UNITY_LAUNCHER_OBJECT_PATH,
 };
 pub use omarchy::{
-    compute_accent_fg, compute_linux_webview_env_overrides, configure_linux_webview_env,
-    ensure_olaz_gst_plugin_staged, has_gstreamer_audio_sink, load_omarchy_theme,
-    load_omarchy_theme_with, olaz_gst_plugin_dir, parse_hex_rgb, query_hyprland_rounding_with,
-    relative_luminance, resolve_language, spawn_omarchy_watcher, spawn_omarchy_watcher_with,
-    system_has_nvidia_driver, DesktopTheme, OmarchyWatcherHandle, ACCENT_FG_DARK, ACCENT_FG_LIGHT,
-    HYPRCTL_TIMEOUT, WATCHER_DEBOUNCE, ZALO_ACCENT,
+    compute_accent_fg, compute_linux_gst_video_sink_overrides, compute_linux_webview_env_overrides,
+    configure_linux_webview_env, ensure_olaz_gst_plugin_staged, has_gstreamer_audio_sink,
+    load_omarchy_theme, load_omarchy_theme_with, olaz_gst_plugin_dir, parse_hex_rgb,
+    query_hyprland_rounding_with, relative_luminance, resolve_language, spawn_omarchy_watcher,
+    spawn_omarchy_watcher_with, system_has_nvidia_driver, DesktopTheme, OmarchyWatcherHandle,
+    ACCENT_FG_DARK, ACCENT_FG_LIGHT, HYPRCTL_TIMEOUT, WATCHER_DEBOUNCE, ZALO_ACCENT,
 };
 pub use portals::{
     build_media_file_filter, capture_interactive_screenshot, pick_open_dialog, pick_open_directory,

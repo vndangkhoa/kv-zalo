@@ -1825,11 +1825,40 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
     let mut hit_main_resizer = false;
     let mut hit_main_resizer_path = false;
     let mut hit_wasm_jxl_resizer_path = false;
+    let mut hit_lazy_main_resizer_path = false;
+    let mut hit_lazy_wasm_jxl_resizer_path = false;
+    let mut hit_zimg_complete = false;
     let mut hit_io_obs = false;
     let mut hit_io_win = false;
     let mut hit_zimg_eager = false;
+    let mut hit_autostart_ui = false;
+    let mut hit_autostart_lang_en = false;
+    let mut hit_autostart_lang_vi = false;
+    let mut hit_html_csp = 0usize;
     let mut preserved_client_type_23 = false;
     let mut patched_files = 0usize;
+
+    for html_name in ["pc-dist/index.html", "pc-dist/popup-viewer.html"] {
+        let raw_html = asar
+            .read_or_unpacked(html_name)
+            .unwrap_or_else(|| panic!("missing {html_name} in live app.asar"));
+        let patched_html = patch_asar_bundle(html_name, &raw_html)
+            .unwrap_or_else(|| panic!("expected CSP patch on {html_name}"));
+        let html_str = std::str::from_utf8(&patched_html).unwrap();
+        assert!(
+            !html_str.contains("upgrade-insecure-requests")
+                && html_str.contains("http://127.0.0.1:*")
+                && html_str.contains("zfile:")
+                && html_str.contains("data:"),
+            "expected CSP loopback/data:/zfile: allowance in {html_name}: {html_str}"
+        );
+        assert!(
+            patch_asar_bundle(html_name, &patched_html).is_none(),
+            "HTML CSP patch must be idempotent on {html_name}"
+        );
+        hit_html_csp += 1;
+    }
+    assert_eq!(hit_html_csp, 2);
 
     for path in asar.paths_with_prefix("pc-dist/") {
         if !path.ends_with(".js") {
@@ -1886,9 +1915,18 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
         }
         if s.contains("/*olaz-main-path*/") {
             hit_main_resizer_path = true;
+            if path.contains("lazy/default-login-main-startup-shared-worker-znotification.") {
+                hit_lazy_main_resizer_path = true;
+            }
         }
         if s.contains("/*olaz-wasm-jxl-path*/") {
             hit_wasm_jxl_resizer_path = true;
+            if path.contains("lazy/default-login-main-startup-shared-worker-znotification.") {
+                hit_lazy_wasm_jxl_resizer_path = true;
+            }
+        }
+        if s.contains("/*olaz-zimg-complete*/") {
+            hit_zimg_complete = true;
         }
         if s.contains("/*olaz-io-obs*/") {
             hit_io_obs = true;
@@ -1898,6 +1936,15 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
         }
         if s.contains(r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"async",loading:"eager""#) {
             hit_zimg_eager = true;
+        }
+        if s.contains("/*olaz-autostart-ui*/") && s.contains("/*olaz-autostart-fx*/") {
+            hit_autostart_ui = true;
+        }
+        if s.contains(r#""STR_OLAZ_START_IN_TRAY":"Launch minimized to system tray""#) {
+            hit_autostart_lang_en = true;
+        }
+        if s.contains(r#""STR_OLAZ_START_IN_TRAY":"Khởi động thu nhỏ dưới khay hệ thống""#) {
+            hit_autostart_lang_vi = true;
         }
         if !path.contains("dal-worker.") && !path.contains("sync-v2-sub-worker.") {
             assert!(
@@ -1932,9 +1979,15 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
     assert!(hit_main_resizer, "Expected ee.resizeImage JPEG/PNG MAIN canvas patch to match live app.asar");
     assert!(hit_main_resizer_path, "Expected 3Rxw MAIN canvas local-path/destinationPath patch to match live app.asar");
     assert!(hit_wasm_jxl_resizer_path, "Expected 3Rxw LIBJXL_WASM local-path/destinationPath patch to match live app.asar");
+    assert!(hit_lazy_main_resizer_path, "Expected 3Rxw MAIN canvas local-path patch to match index.html lazy_shared bundle");
+    assert!(hit_lazy_wasm_jxl_resizer_path, "Expected 3Rxw LIBJXL_WASM local-path patch to match index.html lazy_shared bundle");
+    assert!(hit_zimg_complete, "Expected Ze componentDidMount complete-image check patch to match live app.asar");
     assert!(hit_io_obs, "Expected 0tHf IntersectionObserver popup observe patch to match live app.asar");
     assert!(hit_io_win, "Expected 0tHf IntersectionObserver getObserver closed-window refresh patch to match live app.asar");
     assert!(hit_zimg_eager, "Expected Z.d.Image loading:\"eager\" patch to match live app.asar");
+    assert!(hit_autostart_ui, "Expected General Settings autostart + start-in-tray UI patch to match live app.asar");
+    assert!(hit_autostart_lang_en, "Expected STR_OLAZ_START_IN_TRAY English translation in live app.asar");
+    assert!(hit_autostart_lang_vi, "Expected STR_OLAZ_START_IN_TRAY Vietnamese translation in live app.asar");
 }
 
 #[test]
@@ -1978,4 +2031,709 @@ fn transform_local_url_unwraps_whatwg_url_objects_and_platform_permits_cache_and
             "https://stc-zalo.zadn.vn/sticker/ami.png"
         ])
     );
+}
+
+#[test]
+fn general_settings_autostart_and_start_in_tray_toggles_execute_cleanly_in_node() {
+    let tmp = TempDir::new().unwrap();
+    let platform = ZaloPlatform::with_root(tmp.path(), "26.10.20");
+    assert!(platform.is_isolated_root());
+    assert_eq!(platform.autostart_dir(), tmp.path().join("config/autostart"));
+
+    let spec = bridge_spec_script(&platform);
+    assert!(spec.contains(r#""$zconfig.getAutostartState":"async""#));
+    assert!(spec.contains(r#""$zconfig.setStartInTray":"async""#));
+    assert!(spec.contains(r#""$zconfig.migrateLegacyAutoLaunch":"async""#));
+
+    let synthetic = br#"function GeneralSettings(){const[d,c]=Object(i.useState)(o.g.getLaunch()),[u,f]=Object(i.useState)(p.default.currentLanguage());Object(i.useEffect)((()=>{$zconfig.checkAutoLaunchEnable().then((e=>{o.g.setLaunch(e),c(e)})).catch((()=>{}))}),[]);return [l.a.createElement(Za.Toggle,{key:"isAutoLauch",stateValue:d,onToggle:e=>{$zconfig.toggleAutoLaunch(e),o.g.setLaunch(e),c(e),v.default.logAction(e?248010301:248010302)},titleTextKey:"STR_START_ZALO_WITH_OS",className:"first general no-border-bottom"})]}"#;
+    let patched = patch_zalo_linux_renderer_bundle(synthetic)
+        .expect("GeneralSettings autostart patch must match");
+    assert!(patch_zalo_linux_renderer_bundle(&patched).is_none());
+    let patched_js = std::str::from_utf8(&patched).unwrap();
+
+    let script = format!(
+        r#"
+        let states = [];
+        let cursor = 0;
+        let effectFns = [];
+        const i = {{
+          useState(init) {{
+            const idx = cursor++;
+            if (!(idx in states)) states[idx] = init;
+            return [states[idx], (v) => {{ states[idx] = v; }}];
+          }},
+          useEffect(fn) {{ effectFns.push(fn); }},
+        }};
+        let launchStored = false;
+        const o = {{
+          g: {{
+            getLaunch: () => launchStored,
+            setLaunch: (v) => {{ launchStored = v; }},
+            getRemember: () => true,
+            isShowSettingRemember: () => true,
+          }},
+        }};
+        const p = {{ default: {{ currentLanguage: () => 'vi' }} }};
+        const l = {{ a: {{ createElement: (comp, props) => ({{ comp, props }}) }} }};
+        const Za = {{ Toggle: 'Toggle' }};
+        const v = {{ default: {{ logAction: () => {{}} }} }};
+
+        let hostState = {{ openAtLogin: false, startInTray: false }};
+        const calls = [];
+        globalThis.$zconfig = {{
+          getAutostartState: async () => ({{ ...hostState }}),
+          checkAutoLaunchEnable: async () => hostState.openAtLogin,
+          toggleAutoLaunch: async (enabled) => {{
+            calls.push(['toggleAutoLaunch', enabled]);
+            if (enabled && !hostState.openAtLogin) hostState.startInTray = true;
+            hostState.openAtLogin = enabled;
+            return {{ ...hostState }};
+          }},
+          setStartInTray: async (inTray) => {{
+            calls.push(['setStartInTray', inTray]);
+            hostState.startInTray = inTray;
+            return {{ ...hostState }};
+          }},
+        }};
+
+        function render() {{
+          cursor = 0;
+          effectFns = [];
+          return GeneralSettings();
+        }}
+
+        {patched_js}
+
+        (async () => {{
+          let rows = render();
+          for (const fx of effectFns) fx();
+          await new Promise(r => setTimeout(r, 10));
+          rows = render();
+          const initial = rows.map(x => ({{ key: x.props.key, val: x.props.stateValue, disabled: !!x.props.disabled, cls: x.props.className }}));
+
+          // Turn ON "Start with system" -> "Launch minimized to system tray" must default ON!
+          rows[0].props.onToggle(true);
+          await new Promise(r => setTimeout(r, 10));
+          rows = render();
+          const afterEnable = rows.map(x => ({{ key: x.props.key, val: x.props.stateValue, disabled: !!x.props.disabled }}));
+
+          // User turns OFF "Launch minimized to system tray" while keeping autostart ON
+          rows[1].props.onToggle(false);
+          await new Promise(r => setTimeout(r, 10));
+          rows = render();
+          const afterTrayOff = rows.map(x => ({{ key: x.props.key, val: x.props.stateValue, disabled: !!x.props.disabled }}));
+
+          // Turn OFF autostart and turn ON again -> tray toggle defaults back to ON!
+          rows[0].props.onToggle(false);
+          await new Promise(r => setTimeout(r, 10));
+          rows = render();
+          rows[0].props.onToggle(true);
+          await new Promise(r => setTimeout(r, 10));
+          rows = render();
+          const afterReEnable = rows.map(x => ({{ key: x.props.key, val: x.props.stateValue, disabled: !!x.props.disabled }}));
+
+          console.log(JSON.stringify({{ initial, afterEnable, afterTrayOff, afterReEnable, calls }}));
+        }})();
+        "#
+    );
+
+    let result = run_node_json(&script);
+    assert_eq!(
+        result["initial"],
+        json!([
+            { "key": "isAutoLauch", "val": false, "disabled": false, "cls": "first general no-border-bottom" },
+            { "key": "isStartInTray", "val": false, "disabled": true, "cls": "general no-border-bottom" },
+        ])
+    );
+    assert_eq!(
+        result["afterEnable"],
+        json!([
+            { "key": "isAutoLauch", "val": true, "disabled": false },
+            { "key": "isStartInTray", "val": true, "disabled": false },
+        ])
+    );
+    assert_eq!(
+        result["afterTrayOff"],
+        json!([
+            { "key": "isAutoLauch", "val": true, "disabled": false },
+            { "key": "isStartInTray", "val": false, "disabled": false },
+        ])
+    );
+    assert_eq!(
+        result["afterReEnable"],
+        json!([
+            { "key": "isAutoLauch", "val": true, "disabled": false },
+            { "key": "isStartInTray", "val": true, "disabled": false },
+        ])
+    );
+    assert_eq!(
+        result["calls"],
+        json!([
+            ["toggleAutoLaunch", true],
+            ["setStartInTray", false],
+            ["toggleAutoLaunch", false],
+            ["toggleAutoLaunch", true],
+        ])
+    );
+}
+
+#[tokio::test]
+async fn html_csp_patch_direct_ui_unused_filename_mp4thumb_media_stream_rewrite_and_video_thumb() {
+    // 1. HTML CSP patch strips `upgrade-insecure-requests;` and allows `http://127.0.0.1:*` + `zfile:`.
+    let raw_html = br#"<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests; default-src 'none'; img-src * data: blob: zfile: file:; media-src * blob: zfile: file:; connect-src 'self' https://*.zalo.me blob:"></head><body></body></html>"#;
+    let patched_html = patch_asar_bundle("pc-dist/index.html", raw_html)
+        .expect("HTML CSP meta tag must be rewritten");
+    let html_str = std::str::from_utf8(&patched_html).unwrap();
+    assert!(!html_str.contains("upgrade-insecure-requests"));
+    assert!(html_str.contains("media-src * blob: zfile: file: http://127.0.0.1:*"));
+    assert!(html_str.contains("img-src * data: blob: zfile: file: http://127.0.0.1:*"));
+    assert!(html_str.contains("connect-src 'self' https://*.zalo.me blob: http://127.0.0.1:* zfile:"));
+    assert!(
+        patch_asar_bundle("pc-dist/popup-viewer.html", &patched_html).is_none(),
+        "already-patched CSP must be idempotent"
+    );
+
+    // 2. Plain un-noised files MUST NOT be corrupted by `zcloudDenoiseFile`, and `zcloudNoiseFile` is idempotent.
+    let tmp = TempDir::new().unwrap();
+    let platform = Arc::new(ZaloPlatform::with_root(tmp.path(), "26.10.20"));
+    let fsb = FsBridge::new(Arc::clone(&platform));
+    let plain_src = platform.user_data().join("plain_sample.bin");
+    let plain_out = platform.user_data().join("plain_denoised.bin");
+    let noised_once = platform.user_data().join("noised_1.bin");
+    let noised_twice = platform.user_data().join("noised_2.bin");
+    let denoised_back = platform.user_data().join("denoised_back.bin");
+    let original_bytes: Vec<u8> = (0..256u16).map(|i| (i & 0xff) as u8).collect();
+    std::fs::write(&plain_src, &original_bytes).unwrap();
+
+    fsb.dispatch_sync(
+        "$zFileManager.zcloudDenoiseFile",
+        &[
+            json!(plain_src.to_string_lossy()),
+            json!(plain_out.to_string_lossy()),
+            json!(""),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&plain_out).unwrap(),
+        original_bytes,
+        "zcloudDenoiseFile must copy plain un-noised files verbatim without XOR corruption"
+    );
+
+    fsb.dispatch_sync(
+        "$zFileManager.zcloudNoiseFile",
+        &[
+            json!(plain_src.to_string_lossy()),
+            json!(noised_once.to_string_lossy()),
+            json!(""),
+        ],
+    )
+    .unwrap();
+    fsb.dispatch_sync(
+        "$zFileManager.zcloudNoiseFile",
+        &[
+            json!(noised_once.to_string_lossy()),
+            json!(noised_twice.to_string_lossy()),
+            json!(""),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&noised_once).unwrap(),
+        std::fs::read(&noised_twice).unwrap(),
+        "zcloudNoiseFile must be idempotent on already-noised files"
+    );
+    fsb.dispatch_sync(
+        "$zFileManager.zcloudDenoiseFile",
+        &[
+            json!(noised_twice.to_string_lossy()),
+            json!(denoised_back.to_string_lossy()),
+            json!(""),
+        ],
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&denoised_back).unwrap(), original_bytes);
+
+    // 3. Execute `LINUX_DIRECT_UI_SCRIPT` + `bridge.js` in Node to verify `$znode.unusedFilename`,
+    //    `$zFeatures.genThumb.writeSavePathFilePhoto`, `$znode.nativelibs.mp4thumb`, `<video>` proxy URL
+    //    rewriting, `<video poster>` rewriting, and `window.fetch('file:///...')` preservation!
+    let scripts = olaz_core::popup_user_scripts(&platform);
+    let spec_js = &scripts.iter().find(|(n, _)| n == "bridge-spec").unwrap().1;
+    let local_js = &scripts.iter().find(|(n, _)| n == "local-modules").unwrap().1;
+    let direct_js = &scripts.iter().find(|(n, _)| n == "linux-direct-ui").unwrap().1;
+    let bridge_js = &scripts.iter().find(|(n, _)| n == "bridge").unwrap().1;
+
+    let node_harness = format!(
+        r#"
+        const existing = new Set(['/dl/photo.jpg', '/dl/photo (1).jpg']);
+        const ipcCalls = [];
+        const asyncCalls = [];
+        class Element {{
+          constructor(tag) {{ this.tagName = tag; this._attrs = {{}}; }}
+          hasAttribute(k) {{ return Object.prototype.hasOwnProperty.call(this._attrs, k.toLowerCase()); }}
+          getAttribute(k) {{ return this._attrs[k.toLowerCase()] ?? null; }}
+          setAttribute(k, v) {{ this._attrs[k.toLowerCase()] = String(v); }}
+        }}
+        class HTMLImageElement extends Element {{
+          constructor() {{ super('IMG'); this._src = ''; }}
+          get src() {{ return this._src; }}
+          set src(v) {{ this._src = String(v); }}
+        }}
+        class HTMLMediaElement extends Element {{
+          constructor(tag) {{ super(tag || 'VIDEO'); this._src = ''; }}
+          get src() {{ return this._src; }}
+          set src(v) {{ this._src = String(v); }}
+        }}
+        class HTMLVideoElement extends HTMLMediaElement {{
+          constructor() {{ super('VIDEO'); this._poster = ''; }}
+          get poster() {{ return this._poster; }}
+          set poster(v) {{ this._poster = String(v); }}
+        }}
+        class HTMLSourceElement extends Element {{
+          constructor() {{ super('SOURCE'); this._src = ''; }}
+          get src() {{ return this._src; }}
+          set src(v) {{ this._src = String(v); }}
+        }}
+        globalThis.Element = Element;
+        globalThis.HTMLImageElement = HTMLImageElement;
+        globalThis.HTMLMediaElement = HTMLMediaElement;
+        globalThis.HTMLVideoElement = HTMLVideoElement;
+        globalThis.HTMLSourceElement = HTMLSourceElement;
+        globalThis.window = globalThis;
+        globalThis.location = {{ protocol: 'zalo-app:', href: 'zalo-app://local/login.html', pathname: '/login.html' }};
+        globalThis.document = {{ readyState: 'complete', addEventListener() {{}} }};
+        globalThis.addEventListener = () => {{}};
+        globalThis.__olazMediaProxyBase = 'http://127.0.0.1:43210/secret-tok';
+        globalThis.fetch = async (u) => ({{ url: String(u) }});
+        globalThis.__zaloNativeXHR = class {{
+          open(_m, _u) {{}}
+          send(body) {{
+            const req = JSON.parse(body);
+            if (req.path === '$znode.fs.existsSync') {{
+              this.responseText = JSON.stringify({{ value: existing.has(req.args[0]) }});
+            }} else {{
+              this.responseText = JSON.stringify({{ value: null }});
+            }}
+          }}
+        }};
+        globalThis.webkit = {{
+          messageHandlers: {{
+            zlog: {{ postMessage() {{}} }},
+            zstate: {{ postMessage() {{}} }},
+            __olaz_win_drag: {{ postMessage() {{}} }},
+            zbridge: {{
+              postMessage: async (msg) => {{
+                if (msg.kind === 'invoke') {{
+                  ipcCalls.push(msg);
+                  return '/saved/thumb_123.jpg';
+                }}
+                if (msg.kind === 'call') {{
+                  asyncCalls.push(msg);
+                  if (msg.path === '$znode.fs.exists') return existing.has(msg.args[0]);
+                  if (msg.path === '$zFileManager.generateVideoThumbnail') return msg.args[1];
+                }}
+                return null;
+              }},
+            }},
+          }},
+        }};
+        {spec_js}
+        {local_js}
+        {direct_js}
+        {bridge_js}
+        globalThis.__zaloBridge = {{
+          callSync: (path, args) => path === '$znode.fs.existsSync' ? existing.has(args[0]) : null,
+          callAsync: async (path, args) => {{
+            asyncCalls.push({{ path, args }});
+            if (path === '$znode.fs.exists') return existing.has(args[0]);
+            if (path === '$zFileManager.generateVideoThumbnail') return args[1];
+            return null;
+          }},
+        }};
+        (async () => {{
+          const syncFresh = window.$znode.unusedFilename.sync('/dl/fresh.jpg');
+          const syncCollided = window.$znode.unusedFilename.sync('/dl/photo.jpg');
+          const asyncCollided = await window.$znode.unusedFilename.async('/dl/photo.jpg');
+          const thumbSaved = await window.$zFeatures.genThumb.writeSavePathFilePhoto(
+            'u1', 'fb', new Uint8Array([0xff, 0xd8, 0xff]), {{ msgId: '99' }}
+          );
+          const mp4Out = await window.$znode.nativelibs.mp4thumb().generateThumbnail(
+            '/cache/in.mp4', '/cache/out.jpg', 320, 240
+          );
+          const vid = new HTMLVideoElement();
+          vid.src = 'file:///home/user/Zalo Received Files/clip 1.mp4';
+          vid.poster = 'file:///home/user/thumb 1.jpg';
+          const img = new HTMLImageElement();
+          img.src = 'file:///home/user/pic 1.jpg';
+          const fetched = await window.fetch('file:///home/user/local.jxl');
+          console.log(JSON.stringify({{
+            syncFresh,
+            syncCollided,
+            asyncCollided,
+            thumbSaved,
+            ipcChannel: ipcCalls[0] && ipcCalls[0].channel,
+            ipcHasBytes: Boolean(ipcCalls[0] && ipcCalls[0].args[2] && ipcCalls[0].args[2].__bytes),
+            mp4Out,
+            vidSrc: vid.src,
+            vidCrossOrigin: vid.getAttribute('crossorigin'),
+            vidPoster: vid.poster,
+            imgSrc: img.src,
+            fetchedUrl: fetched.url,
+          }}));
+        }})();
+        "#
+    );
+    let harness_path = tmp.path().join("direct_ui_harness.js");
+    std::fs::write(&harness_path, &node_harness).unwrap();
+    let out = Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("node must run direct-ui harness");
+    assert!(
+        out.status.success(),
+        "node harness failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let res: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(res["syncFresh"], "/dl/fresh.jpg");
+    assert_eq!(res["syncCollided"], "/dl/photo (2).jpg");
+    assert_eq!(res["asyncCollided"], "/dl/photo (2).jpg");
+    assert_eq!(res["thumbSaved"], "/saved/thumb_123.jpg");
+    assert_eq!(res["ipcChannel"], "gen-thumb_write-savepath-file-photo");
+    assert_eq!(res["ipcHasBytes"], true);
+    assert_eq!(res["mp4Out"], "/cache/out.jpg");
+    assert_eq!(
+        res["vidSrc"],
+        "http://127.0.0.1:43210/secret-tok/zfile/local/home/user/Zalo%20Received%20Files/clip%201.mp4"
+    );
+    assert_eq!(res["vidCrossOrigin"], "anonymous");
+    assert_eq!(res["vidPoster"], "zfile://local/home/user/thumb%201.jpg");
+    assert_eq!(res["imgSrc"], "zfile://local/home/user/pic%201.jpg");
+    assert_eq!(res["fetchedUrl"], "zfile://local/home/user/local.jxl");
+
+    // 4. Native `ffmpeg` video thumbnail extraction works on BOTH plain `.mp4` and `fileNoise` `.mp4`!
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        let sample_mp4 = platform.user_data().join("sample_vid.mp4");
+        let noised_mp4 = platform.user_data().join("sample_vid_noised");
+        let thumb_plain = platform.user_data().join("thumbs/plain.jpg");
+        let thumb_noised = platform.user_data().join("thumbs/noised.jpg");
+
+        let ff = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=green:s=160x120:d=0.5",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&sample_mp4)
+            .output()
+            .unwrap();
+        assert!(ff.status.success());
+
+        olaz_core::copy_with_noise_mode(&sample_mp4, &noised_mp4, true, "").unwrap();
+
+        let r1 = fsb
+            .dispatch_async(
+                "$zFileManager.generateVideoThumbnail",
+                &[
+                    json!(sample_mp4.to_string_lossy()),
+                    json!(thumb_plain.to_string_lossy()),
+                    json!(120),
+                    json!(120),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1, json!(thumb_plain.to_string_lossy()));
+        let jpg1 = std::fs::read(&thumb_plain).unwrap();
+        assert!(jpg1.starts_with(&[0xFF, 0xD8, 0xFF]));
+
+        let r2 = fsb
+            .dispatch_async(
+                "$zFileManager.generateVideoThumbnail",
+                &[
+                    json!(noised_mp4.to_string_lossy()),
+                    json!(thumb_noised.to_string_lossy()),
+                    json!(120),
+                    json!(120),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2, json!(thumb_noised.to_string_lossy()));
+        let jpg2 = std::fs::read(&thumb_noised).unwrap();
+        assert!(jpg2.starts_with(&[0xFF, 0xD8, 0xFF]));
+    }
+}
+
+#[test]
+fn fs_bridge_portal_granted_file_allows_ensure_dir_on_existing_parent_without_exposing_siblings() {
+    let tmp = TempDir::new().unwrap();
+    let app_root = tmp.path().join("app-root");
+    let external_dir = tmp.path().join("external-pictures");
+    std::fs::create_dir_all(&external_dir).unwrap();
+
+    let platform = Arc::new(ZaloPlatform::with_root(&app_root, "26.10.20"));
+    let fs_bridge = FsBridge::new(Arc::clone(&platform));
+
+    let chosen_photo = external_dir.join("saved_photo.jpg");
+    let sibling_photo = external_dir.join("other_photo.jpg");
+    let new_subdir = external_dir.join("unapproved_subdir");
+
+    // Before portal grant, writing to `chosen_photo` is rejected.
+    assert_eq!(
+        fs_bridge
+            .write_file_sync(&chosen_photo, b"jpeg-bytes")
+            .unwrap_err()
+            .code,
+        "EACCES"
+    );
+
+    // Granting only the chosen file allows `fsExtra.ensureDir(parent)` (`mkdir(parent, true)`)
+    // and writing/overwriting `chosen_photo`, while keeping siblings and new subdirs blocked.
+    platform.grant_writable_path(&chosen_photo);
+    fs_bridge
+        .mkdir_sync(&external_dir, true)
+        .expect("ensureDir on existing parent of portal-granted file must succeed");
+    fs_bridge
+        .write_file_sync(&chosen_photo, b"jpeg-bytes-v1")
+        .expect("writing portal-granted file must succeed");
+    assert_eq!(std::fs::read(&chosen_photo).unwrap(), b"jpeg-bytes-v1");
+
+    assert_eq!(
+        fs_bridge
+            .write_file_sync(&sibling_photo, b"unauthorized")
+            .unwrap_err()
+            .code,
+        "EACCES"
+    );
+    assert_eq!(
+        fs_bridge.mkdir_sync(&new_subdir, true).unwrap_err().code,
+        "EACCES"
+    );
+}
+
+#[test]
+fn linux_direct_ui_utility_process_media_unused_filename_and_anchor_download_work_in_node() {
+    let tmp = TempDir::new().unwrap();
+    let platform = ZaloPlatform::with_root(tmp.path(), "26.10.20");
+    let scripts = olaz_core::popup_user_scripts(&platform);
+
+    let find_script = |label: &str| -> &str {
+        scripts
+            .iter()
+            .find(|(name, _)| name == label)
+            .map(|(_, s)| s.as_str())
+            .unwrap_or_else(|| panic!("missing script {label}"))
+    };
+
+    let harness = format!(
+        r#"
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.location = {{ href: 'zalo-app://local/pc-dist/index.html', pathname: '/pc-dist/index.html', origin: 'zalo-app://local' }};
+globalThis.navigator = {{ userAgent: 'Mozilla/5.0', clipboard: {{}} }};
+class HTMLAnchorElement {{
+  constructor(href, download) {{
+    this.href = href;
+    this._dl = download;
+  }}
+  hasAttribute(k) {{ return k === 'download' && this._dl !== undefined; }}
+  getAttribute(k) {{ return k === 'download' ? (this._dl || '') : (k === 'href' ? this.href : null); }}
+  click() {{}}
+}}
+globalThis.HTMLAnchorElement = HTMLAnchorElement;
+globalThis.document = {{
+  readyState: 'loading',
+  documentElement: {{ style: {{ setProperty() {{}} }} }},
+  head: {{ appendChild() {{}} }},
+  createElement(tag) {{ return {{ tagName: tag, style: {{}}, setAttribute() {{}} }}; }},
+  addEventListener() {{}},
+}};
+globalThis.MutationObserver = class {{ observe() {{}} }};
+globalThis.addEventListener = () => {{}};
+
+const existingSet = new Set(['/tmp/photo.jpg', '/tmp/photo (1).jpg']);
+const writtenFiles = new Map();
+
+globalThis.XMLHttpRequest = class {{
+  open(_m, _u) {{}}
+  setRequestHeader() {{}}
+  send(body) {{
+    const req = JSON.parse(body);
+    this.status = 200;
+    if (req.path === '$znode.fs.existsSync') {{
+      this.responseText = JSON.stringify({{ value: existingSet.has(req.args[0]) }});
+    }} else {{
+      this.responseText = JSON.stringify({{ value: null }});
+    }}
+  }}
+}};
+
+globalThis.webkit = {{
+  messageHandlers: {{
+    zlog: {{ postMessage() {{}} }},
+    zstate: {{ postMessage() {{}} }},
+    znet: {{ postMessage: async () => ({{ status: 200, headers: {{}}, body: '' }}) }},
+    zbridge: {{
+      postMessage: async (msg) => {{
+        if (msg.kind === 'invoke' && msg.channel === 'show-save-dialog') {{
+          return {{ canceled: false, filePath: '/tmp/saved_from_blob.jpg' }};
+        }}
+        if (msg.kind === 'call' && msg.path === '$zFileManager.writeBufferToPath') {{
+          const raw = msg.args[1];
+          const bytes = raw && raw.__bytes ? Buffer.from(raw.__bytes, 'base64') : Buffer.from(raw);
+          writtenFiles.set(msg.args[0], Array.from(bytes));
+          return true;
+        }}
+        return null;
+      }}
+    }}
+  }}
+}};
+
+{bridge_spec}
+{local_modules}
+{direct_ui}
+{bridge_js}
+
+(async () => {{
+  'use strict';
+  // 1. `$znode.unusedFilename.sync` must return a string synchronously (not a Promise!).
+  const unused = window.$znode.unusedFilename.sync('/tmp/photo.jpg');
+  if (typeof unused !== 'string' || unused !== '/tmp/photo (2).jpg') {{
+    throw new Error('unexpected unusedFilename.sync: ' + String(unused));
+  }}
+
+  // 2. Simulate Zalo's strict-mode `Be()` overwriting `window.$zsub = {{}}` and assigning
+  //    `$zsub.$zMsgChannel.onReceiveTransferredPortV2` on `zalo-app://local` (non-`file://`).
+  window.$zsub = {{}};
+  let deliveredPort = null;
+  window.$zsub.$zMsgChannel.onReceiveTransferredPortV2((ev, payload) => {{
+    deliveredPort = {{ payload, port: ev && ev.ports && ev.ports[0] }};
+  }});
+
+  await window.$zMsgChannel.requestOpenChannelTo('main-renderer', 'utility-process-media', 'chan-test-1');
+  await new Promise((r) => setTimeout(r, 15));
+  if (!deliveredPort || !deliveredPort.port || deliveredPort.payload.channelID !== 'chan-test-1') {{
+    throw new Error('utility-process-media port was not delivered');
+  }}
+  let channelEstablished = false;
+  window.$zsub.$zMsgChannel.onChannelEstablished((_ev, info) => {{
+    if (Array.isArray(info) && info[2] === 'chan-test-1') channelEstablished = true;
+  }});
+  await window.$zMsgChannel.notifyPortDelivered('main-renderer', 'utility-process-media', 'chan-test-1', deliveredPort.payload.channelSessionID);
+  await new Promise((r) => setTimeout(r, 15));
+  if (!channelEstablished) {{
+    throw new Error('onChannelEstablished did not fire after notifyPortDelivered');
+  }}
+  const port = deliveredPort.port;
+  port.start();
+
+  const sendTask = (id, type, payload) => new Promise((resolve, reject) => {{
+    const onMsg = (ev) => {{
+      const d = ev.data || ev;
+      if (d && d.id === id && d.messageType === 'response') {{
+        port.removeEventListener('message', onMsg);
+        if (!d.error) resolve(d.result);
+        else reject(new Error(JSON.stringify(d.error)));
+      }}
+    }};
+    port.addEventListener('message', onMsg);
+    port.postMessage({{ id, type, messageType: 'request', params: {{ payload }} }});
+  }});
+
+  const pong = await sendTask(1, 'PING', null);
+  if (pong !== 'pong') throw new Error('expected pong, got ' + String(pong));
+
+  // Naked JXL codestream: FF 0A + SizeHeader (div8=0, h=480 -> 13-bit=479; w=640 -> ratio=0, 13-bit=639)
+  // + ImageMetadata (all_default=0, extra_fields=1, orientation_minus_1=5 => orientation=6).
+  const bits = [];
+  const pushBitsLE = (val, n) => {{ for (let i = 0; i < n; i++) bits.push((val >>> i) & 1); }};
+  pushBitsLE(0, 1);       // div8 = false
+  pushBitsLE(1, 2);       // h selector = 1 (13-bit)
+  pushBitsLE(480 - 1, 13);
+  pushBitsLE(0, 3);       // ratio = 0 (explicit width)
+  pushBitsLE(1, 2);       // w selector = 1 (13-bit)
+  pushBitsLE(640 - 1, 13);
+  pushBitsLE(0, 1);       // all_default = false
+  pushBitsLE(1, 1);       // extra_fields = true
+  pushBitsLE(6 - 1, 3);   // orientation = 6
+  const payloadBytes = new Uint8Array(Math.ceil(bits.length / 8) + 2);
+  payloadBytes[0] = 0xff;
+  payloadBytes[1] = 0x0a;
+  for (let i = 0; i < bits.length; i++) {{
+    if (bits[i]) payloadBytes[2 + (i >> 3)] |= (1 << (i & 7));
+  }}
+
+  // Wrap in ISO BMFF JXL container + apply Zalo `fileNoise` (`0x93` XOR + `07 7a 41 6c 4f 07`)!
+  const jxlSig = [0x00,0x00,0x00,0x0c,0x4a,0x58,0x4c,0x20,0x0d,0x0a,0x87,0x0a];
+  const jxlcLen = 8 + payloadBytes.length;
+  const container = new Uint8Array(jxlSig.length + jxlcLen);
+  container.set(jxlSig, 0);
+  container[12] = (jxlcLen >>> 24) & 0xff;
+  container[13] = (jxlcLen >>> 16) & 0xff;
+  container[14] = (jxlcLen >>> 8) & 0xff;
+  container[15] = jxlcLen & 0xff;
+  container.set([0x6a, 0x78, 0x6c, 0x63], 16); // 'jxlc'
+  container.set(payloadBytes, 20);
+
+  const noised = new Uint8Array(container.length + 6);
+  noised.set(container, 0);
+  for (let i = 0; i < Math.min(100, container.length); i++) noised[i] ^= 0x93;
+  noised.set([0x07, 0x7a, 0x41, 0x6c, 0x4f, 0x07], container.length);
+
+  const info = await sendTask(2, 'GET_JXL_INFO', {{ input: noised }});
+  if (info.width !== 640 || info.height !== 480 || info.orientation !== 6) {{
+    throw new Error('unexpected JXL info: ' + JSON.stringify(info));
+  }}
+
+  // 3. Detached `<a href="blob:..." download="chat.jpg">.click()` followed immediately by `revokeObjectURL`.
+  const blobBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x11, 0x22, 0xff, 0xd9]);
+  const blobUrl = URL.createObjectURL(new Blob([blobBytes], {{ type: 'image/jpeg' }}));
+  const a = new HTMLAnchorElement(blobUrl, 'chat.jpg');
+  a.click();
+  URL.revokeObjectURL(blobUrl);
+
+  await new Promise((r) => setTimeout(r, 50));
+  const saved = writtenFiles.get('/tmp/saved_from_blob.jpg');
+  if (!saved || JSON.stringify(saved) !== JSON.stringify(Array.from(blobBytes))) {{
+    throw new Error('blob anchor download did not persist expected bytes: ' + JSON.stringify(saved));
+  }}
+
+  port.close();
+  console.log('ALL_OK');
+  process.exit(0);
+}})().catch((e) => {{
+  console.error(e);
+  process.exit(1);
+}});
+"#,
+        bridge_spec = find_script("bridge-spec"),
+        local_modules = find_script("local-modules"),
+        direct_ui = find_script("linux-direct-ui"),
+        bridge_js = find_script("bridge"),
+    );
+
+    let harness_path = tmp.path().join("harness.js");
+    std::fs::write(&harness_path, &harness).expect("write harness.js");
+
+    let output = Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("node must execute harness");
+    assert!(
+        output.status.success(),
+        "node harness failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ALL_OK"));
 }

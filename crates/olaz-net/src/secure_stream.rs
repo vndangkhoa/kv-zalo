@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -107,6 +107,14 @@ impl DownloadFailure {
         Self {
             name: "GENERAL_MAIN_CONTROLLER_OBJ_DOWNLOAD_SAVE_DIR_INVALID".to_owned(),
             code: 1012,
+            message: String::new(),
+        }
+    }
+
+    pub fn copy_src_not_found() -> Self {
+        Self {
+            name: "COPY_SERVICE_SRC_NOT_FOUND".to_owned(),
+            code: 1013,
             message: String::new(),
         }
     }
@@ -794,12 +802,16 @@ pub struct DownloadOutcome {
     pub is_cached: bool,
 }
 
+type PathAuthorizer = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
 /// Main-process download manager handling `new-download-channel` (`new-download-file` & `abort`).
 #[derive(Clone)]
 pub struct DownloadManager {
     loader: MediaLoader,
     temp_dir: PathBuf,
     allowed_save_roots: Option<Vec<PathBuf>>,
+    save_authorizer: Option<PathAuthorizer>,
+    read_authorizer: Option<PathAuthorizer>,
     active_tokens: Arc<DashMap<String, HashMap<Uuid, CancelToken>>>,
     not_found: Arc<DashMap<String, Instant>>,
 }
@@ -827,9 +839,38 @@ impl DownloadManager {
             loader,
             temp_dir,
             allowed_save_roots,
+            save_authorizer: None,
+            read_authorizer: None,
             active_tokens: Arc::new(DashMap::new()),
             not_found: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Attaches a dynamic save-destination authorizer (e.g. checking `ZaloPlatform::is_writable`
+    /// so user-chosen `showSaveDialog` destinations outside static roots are honored).
+    pub fn with_save_authorizer<F>(mut self, authorizer: F) -> Self
+    where
+        F: Fn(&Path) -> bool + Send + Sync + 'static,
+    {
+        self.save_authorizer = Some(Arc::new(authorizer));
+        self
+    }
+
+    /// Attaches a dynamic local-source read authorizer for `options.srcPath` (`*Copy` transfers).
+    pub fn with_read_authorizer<F>(mut self, authorizer: F) -> Self
+    where
+        F: Fn(&Path) -> bool + Send + Sync + 'static,
+    {
+        self.read_authorizer = Some(Arc::new(authorizer));
+        self
+    }
+
+    /// Alias for [`Self::with_save_authorizer`] validating runtime portal-approved save targets.
+    pub fn with_writable_validator<F>(self, validator: F) -> Self
+    where
+        F: Fn(&Path) -> bool + Send + Sync + 'static,
+    {
+        self.with_save_authorizer(validator)
     }
 
     /// Cancels all in-flight downloads and clears the 404 negative URL cache (e.g. on logout).
@@ -927,21 +968,33 @@ impl DownloadManager {
                     .as_ref()
                     .map(DownloadFailure::to_json)
                     .unwrap_or(Value::Null);
+                let total_size = outcome
+                    .save_path
+                    .as_deref()
+                    .and_then(|p| fs::metadata(p).ok().map(|m| m.len()))
+                    .unwrap_or(0);
                 let save_path_json = outcome
                     .save_path
                     .map(Value::String)
                     .unwrap_or(Value::Null);
+                let p_key = data_obj.get("pKey").cloned();
+
+                let mut resp_data = json!({
+                    "downloadError": err_json,
+                    "savePath": save_path_json,
+                    "downloadFrom": download_from,
+                    "key": key_val,
+                    "type": dl_type,
+                    "isCached": outcome.is_cached,
+                    "totalSize": total_size,
+                });
+                if let (Some(pk), Some(map)) = (p_key, resp_data.as_object_mut()) {
+                    map.insert("pKey".to_owned(), pk);
+                }
 
                 Some(json!({
                     "channel": DOWNLOAD_RESP_CHANNEL,
-                    "data": {
-                        "downloadError": err_json,
-                        "savePath": save_path_json,
-                        "downloadFrom": download_from,
-                        "key": key_val,
-                        "type": dl_type,
-                        "isCached": outcome.is_cached,
-                    }
+                    "data": resp_data,
                 }))
             }
             DOWNLOAD_REQ_ABORT | "abort" => {
@@ -983,28 +1036,32 @@ impl DownloadManager {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let is_photo = dl_type.starts_with("Photo");
-
-        let Some(url_str) = data.and_then(|d| d.get("url")).and_then(|v| v.as_str()) else {
-            return DownloadOutcome {
-                save_path: None,
-                failure: Some(DownloadFailure::invalid_url()),
-                is_cached: false,
-            };
-        };
-        let Ok(parsed_url) = Url::parse(url_str) else {
-            return DownloadOutcome {
-                save_path: None,
-                failure: Some(DownloadFailure::invalid_url()),
-                is_cached: false,
-            };
-        };
-        if !matches!(parsed_url.scheme(), "http" | "https") || parsed_url.host_str().is_none() {
-            return DownloadOutcome {
-                save_path: None,
-                failure: Some(DownloadFailure::invalid_url()),
-                is_cached: false,
-            };
-        }
+        let is_copy_type = dl_type.contains("Copy")
+            || request
+                .get("entryFlow")
+                .and_then(|v| v.as_str())
+                .is_some_and(|f| f.eq_ignore_ascii_case("copyResource"));
+        let duplicate = options
+            .and_then(|o| o.get("duplicate"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let want_noise = options
+            .and_then(|o| o.get("noiseDownload"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || dl_type.ends_with("Noise");
+        let local_src_path = options
+            .and_then(|o| o.get("srcPath"))
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                options
+                    .and_then(|o| o.get("manualResourcePath"))
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| data.and_then(|d| d.get("localPath")).and_then(|v| v.as_str()))
+            .map(str::trim)
+            .filter(|s| s.starts_with('/') && !s.contains('\0'))
+            .map(PathBuf::from);
 
         let save_dir = options
             .and_then(|o| o.get("saveDir"))
@@ -1012,7 +1069,7 @@ impl DownloadManager {
         let file_name = data
             .and_then(|d| d.get("fileName"))
             .and_then(|v| v.as_str());
-        let Some(destination) = resolve_destination(save_dir, file_name) else {
+        let Some(initial_destination) = resolve_destination(save_dir, file_name) else {
             return DownloadOutcome {
                 save_path: None,
                 failure: Some(DownloadFailure::save_dir_invalid()),
@@ -1020,7 +1077,7 @@ impl DownloadManager {
             };
         };
 
-        if !self.is_save_dir_allowed(&destination) {
+        if !self.is_save_target_allowed(&initial_destination) {
             return DownloadOutcome {
                 save_path: None,
                 failure: Some(DownloadFailure::save_dir_invalid()),
@@ -1028,27 +1085,121 @@ impl DownloadManager {
             };
         }
 
-        let manual = options
-            .and_then(|o| o.get("srcAction"))
-            .and_then(|v| v.as_str())
-            == Some("Manual");
-        let headers = extract_request_headers(request);
+        let destination = if duplicate {
+            deduplicate_destination(&initial_destination)
+        } else {
+            initial_destination
+        };
+
         let secure = SecureSpec::parse(request.get("secure").unwrap_or(&Value::Null));
-
-        if is_usable_file(&destination) {
-            return DownloadOutcome {
-                save_path: Some(destination.to_string_lossy().into_owned()),
-                failure: None,
-                is_cached: true,
-            };
-        }
-
-        // Fail closed BEFORE touching the network: malformed e2ee/pcloud specs must NEVER save ciphertext!
+        // Fail closed BEFORE touching local disk or network: malformed e2ee/pcloud specs must NEVER save ciphertext!
         if secure.is_invalid() {
             return DownloadOutcome {
                 save_path: None,
                 failure: Some(DownloadFailure::decrypt_failed()),
                 is_cached: false,
+            };
+        }
+
+        // Local `*Copy*` / `srcPath` fast-path (e.g. `FileCopy`, `VideoCopy`, `PhotoCopy`,
+        // `FileCopyOneOneNoise`, `FileCopyGroupNoise`, or `copyResourceToZPC`), where Zalo
+        // copies an already-cached local file (denoise when saving to user dir, or apply
+        // `fileNoise` when caching into `ZaloDownloads/.../fileNoise/`) even when `data.url`
+        // is empty or expired.
+        if let Some(ref src) = local_src_path {
+            let resolved_src = if src.is_dir() {
+                options
+                    .and_then(|o| o.get("manualFileName"))
+                    .and_then(|v| v.as_str())
+                    .or(file_name)
+                    .map(|name| src.join(Path::new(name).file_name().unwrap_or_default()))
+                    .unwrap_or_else(|| src.clone())
+            } else {
+                src.clone()
+            };
+            if is_usable_file(&resolved_src) && self.is_read_path_allowed(&resolved_src) {
+                if cancel_token.is_cancelled() {
+                    return DownloadOutcome {
+                        save_path: None,
+                        failure: Some(DownloadFailure::aborted()),
+                        is_cached: false,
+                    };
+                }
+                if !duplicate && is_usable_file(&destination) {
+                    return DownloadOutcome {
+                        save_path: Some(destination.to_string_lossy().into_owned()),
+                        failure: None,
+                        is_cached: true,
+                    };
+                }
+                if matches!(secure, SecureSpec::Stream(_)) {
+                    return self
+                        .finalize_source_async(
+                            &destination,
+                            FetchedSource::File {
+                                path: resolved_src,
+                                owned: false,
+                            },
+                            secure,
+                            want_noise,
+                        )
+                        .await;
+                }
+                let dest = destination.clone();
+                let copy_res = tokio::task::spawn_blocking(move || {
+                    copy_local_with_noise_transform(&resolved_src, &dest, want_noise)
+                })
+                .await;
+                return match copy_res {
+                    Ok(Ok(())) if is_usable_file(&destination) => DownloadOutcome {
+                        save_path: Some(destination.to_string_lossy().into_owned()),
+                        failure: None,
+                        is_cached: false,
+                    },
+                    Ok(Err(failure)) => DownloadOutcome {
+                        save_path: None,
+                        failure: Some(failure),
+                        is_cached: false,
+                    },
+                    _ => DownloadOutcome {
+                        save_path: None,
+                        failure: Some(DownloadFailure::unknown()),
+                        is_cached: false,
+                    },
+                };
+            }
+        }
+
+        let raw_url = data.and_then(|d| d.get("url")).and_then(|v| v.as_str());
+        let valid_http_url = raw_url.and_then(|u| {
+            let parsed = Url::parse(u).ok()?;
+            (matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some())
+                .then_some(u)
+        });
+        let Some(url_str) = valid_http_url else {
+            let failure = if is_copy_type && local_src_path.is_some() {
+                DownloadFailure::copy_src_not_found()
+            } else {
+                DownloadFailure::invalid_url()
+            };
+            return DownloadOutcome {
+                save_path: None,
+                failure: Some(failure),
+                is_cached: false,
+            };
+        };
+
+        let manual = options
+            .and_then(|o| o.get("srcAction"))
+            .and_then(|v| v.as_str())
+            == Some("Manual");
+        let headers = extract_request_headers(request);
+
+        if !duplicate && is_usable_file(&destination) {
+            return DownloadOutcome {
+                save_path: Some(destination.to_string_lossy().into_owned()),
+                failure: None,
+                is_cached: true,
             };
         }
 
@@ -1079,6 +1230,7 @@ impl DownloadManager {
                 is_photo,
                 &headers,
                 secure,
+                want_noise,
                 ttfb,
                 cancel_token,
             )
@@ -1103,6 +1255,7 @@ impl DownloadManager {
         is_photo: bool,
         headers: &HashMap<String, String>,
         secure: SecureSpec,
+        want_noise: bool,
         ttfb: Option<Duration>,
         cancel_token: &CancelToken,
     ) -> DownloadOutcome {
@@ -1162,10 +1315,21 @@ impl DownloadManager {
             };
         }
 
+        self.finalize_source_async(destination, fetched, secure, want_noise)
+            .await
+    }
+
+    async fn finalize_source_async(
+        &self,
+        destination: &Path,
+        fetched: FetchedSource,
+        secure: SecureSpec,
+        want_noise: bool,
+    ) -> DownloadOutcome {
         let dest = destination.to_path_buf();
         let temp_dir = self.temp_dir.clone();
         let finalize_res = tokio::task::spawn_blocking(move || -> DownloadOutcome {
-            let result = finalize_fetched_to_dest(&dest, &temp_dir, fetched, secure);
+            let result = finalize_fetched_to_dest(&dest, &temp_dir, fetched, secure, want_noise);
             match result {
                 Ok(()) => {
                     if !is_usable_file(&dest) {
@@ -1222,10 +1386,20 @@ impl DownloadManager {
             .insert(url.to_owned(), now + NOT_FOUND_CACHE_TTL);
     }
 
-    fn is_save_dir_allowed(&self, destination: &Path) -> bool {
+    fn is_save_target_allowed(&self, destination: &Path) -> bool {
+        if let Some(ref auth) = self.save_authorizer {
+            if auth(destination) {
+                return true;
+            }
+        }
         let Some(parent) = destination.parent() else {
             return false;
         };
+        if let Some(ref auth) = self.save_authorizer {
+            if auth(parent) {
+                return true;
+            }
+        }
         if let Some(ref roots) = self.allowed_save_roots {
             let canon_parent = canonicalize_longest_ancestor(parent);
             return roots.iter().any(|root| {
@@ -1235,6 +1409,184 @@ impl DownloadManager {
         }
         true
     }
+
+    fn is_read_path_allowed(&self, src: &Path) -> bool {
+        if let Some(ref auth) = self.read_authorizer {
+            return auth(src);
+        }
+        if let Some(ref roots) = self.allowed_save_roots {
+            let canon_src = canonicalize_longest_ancestor(src);
+            return roots.iter().any(|root| {
+                let canon_root = canonicalize_longest_ancestor(root);
+                canon_src != canon_root && canon_src.starts_with(&canon_root)
+            });
+        }
+        true
+    }
+}
+
+const ZALO_NOISE_SIGN: [u8; 6] = [0x07, 0x7a, 0x41, 0x6c, 0x4f, 0x07];
+const ZALO_NOISE_XOR_LEN: u64 = 100;
+const ZALO_NOISE_XOR_KEY: u8 = 0x93;
+
+fn has_zalo_noise_trailer(file: &mut File, raw_len: u64) -> bool {
+    if raw_len <= ZALO_NOISE_SIGN.len() as u64 {
+        return false;
+    }
+    let sig_off = raw_len - ZALO_NOISE_SIGN.len() as u64;
+    let mut tail = [0u8; 6];
+    file.seek(SeekFrom::Start(sig_off)).is_ok()
+        && file.read_exact(&mut tail).is_ok()
+        && tail == ZALO_NOISE_SIGN
+}
+
+fn xor_noise_window(offset: u64, buf: &mut [u8]) {
+    if offset < ZALO_NOISE_XOR_LEN && !buf.is_empty() {
+        let end = ((ZALO_NOISE_XOR_LEN - offset) as usize).min(buf.len());
+        for b in &mut buf[..end] {
+            *b ^= ZALO_NOISE_XOR_KEY;
+        }
+    }
+}
+
+fn copy_local_with_noise_transform(
+    src: &Path,
+    destination: &Path,
+    want_noise: bool,
+) -> std::result::Result<(), DownloadFailure> {
+    if src == destination {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        if !parent.is_dir() {
+            fs::create_dir_all(parent).map_err(|_| DownloadFailure::save_dir_invalid())?;
+        }
+    }
+
+    let mut fin = File::open(src).map_err(|_| DownloadFailure::copy_src_not_found())?;
+    let raw_len = fin
+        .metadata()
+        .map(|m| m.len())
+        .map_err(|_| DownloadFailure::copy_src_not_found())?;
+    if raw_len == 0 {
+        return Err(DownloadFailure::empty_body());
+    }
+    let src_has_noise = has_zalo_noise_trailer(&mut fin, raw_len);
+    fin.seek(SeekFrom::Start(0))
+        .map_err(|_| DownloadFailure::unknown())?;
+
+    let logical_len = if src_has_noise {
+        raw_len - ZALO_NOISE_SIGN.len() as u64
+    } else {
+        raw_len
+    };
+    if logical_len == 0 {
+        return Err(DownloadFailure::empty_body());
+    }
+
+    let write_to = |fout: &mut File, fin: &mut File| -> std::io::Result<()> {
+        let read_limit = if src_has_noise && !want_noise {
+            logical_len
+        } else {
+            raw_len
+        };
+        let need_xor = src_has_noise != want_noise;
+        let mut remaining = read_limit;
+        let mut offset = 0u64;
+        let mut chunk = vec![0u8; 64 * 1024];
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(chunk.len());
+            let n = fin.read(&mut chunk[..to_read])?;
+            if n == 0 {
+                break;
+            }
+            if need_xor {
+                xor_noise_window(offset, &mut chunk[..n]);
+            }
+            fout.write_all(&chunk[..n])?;
+            offset += n as u64;
+            remaining -= n as u64;
+        }
+        if !src_has_noise && want_noise {
+            fout.write_all(&ZALO_NOISE_SIGN)?;
+        }
+        fout.flush()
+    };
+
+    let part_path = SecureStream::part_path_for(destination);
+    let _ = fs::remove_file(&part_path);
+    match File::create(&part_path) {
+        Ok(mut fout) => {
+            if write_to(&mut fout, &mut fin)
+                .and_then(|_| fout.sync_all())
+                .and_then(|_| {
+                    drop(fout);
+                    fs::rename(&part_path, destination)
+                })
+                .is_err()
+            {
+                let _ = fs::remove_file(&part_path);
+                return Err(DownloadFailure::unknown());
+            }
+            Ok(())
+        }
+        Err(_) => {
+            // Direct-open fallback for XDG document-portal FUSE mounts where sibling `.part` files are denied.
+            fin.seek(SeekFrom::Start(0))
+                .map_err(|_| DownloadFailure::unknown())?;
+            let mut fout = File::create(destination).map_err(|_| DownloadFailure::unknown())?;
+            write_to(&mut fout, &mut fin).map_err(|_| DownloadFailure::unknown())
+        }
+    }
+}
+
+fn apply_noise_in_place(path: &Path) -> std::io::Result<()> {
+    let mut f = fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let len = f.metadata()?.len();
+    if has_zalo_noise_trailer(&mut f, len) {
+        return Ok(());
+    }
+    let head_len = (len as usize).min(ZALO_NOISE_XOR_LEN as usize);
+    if head_len > 0 {
+        f.seek(SeekFrom::Start(0))?;
+        let mut head = vec![0u8; head_len];
+        f.read_exact(&mut head)?;
+        xor_noise_window(0, &mut head);
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(&head)?;
+    }
+    f.seek(SeekFrom::End(0))?;
+    f.write_all(&ZALO_NOISE_SIGN)?;
+    f.sync_all()
+}
+
+fn deduplicate_destination(initial: &Path) -> PathBuf {
+    if !initial.exists() {
+        return initial.to_path_buf();
+    }
+    let Some(parent) = initial.parent() else {
+        return initial.to_path_buf();
+    };
+    let stem = initial
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("download");
+    let ext = initial
+        .extension()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty());
+    for i in 1..10_000 {
+        let candidate_name = match ext {
+            Some(e) => format!("{stem} ({i}).{e}"),
+            None => format!("{stem} ({i})"),
+        };
+        let candidate = parent.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    initial.to_path_buf()
 }
 
 enum FetchedSource {
@@ -1247,6 +1599,7 @@ fn finalize_fetched_to_dest(
     temp_dir: &Path,
     source: FetchedSource,
     secure: SecureSpec,
+    want_noise: bool,
 ) -> std::result::Result<(), DownloadFailure> {
     let cleanup_owned = |src: &FetchedSource| {
         if let FetchedSource::File { path, owned: true } = src {
@@ -1264,14 +1617,16 @@ fn finalize_fetched_to_dest(
     };
 
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|_| {
-            cleanup_owned(&source);
-            DownloadFailure::save_dir_invalid()
-        })?;
+        if !parent.is_dir() {
+            fs::create_dir_all(parent).map_err(|_| {
+                cleanup_owned(&source);
+                DownloadFailure::save_dir_invalid()
+            })?;
+        }
     }
     let _ = fs::create_dir_all(temp_dir);
 
-    match (source, stream_opt) {
+    let res: std::result::Result<(), DownloadFailure> = match (source, stream_opt) {
         (FetchedSource::Bytes(bytes), Some(stream)) => {
             if bytes.is_empty() {
                 return Err(DownloadFailure::empty_body());
@@ -1295,14 +1650,15 @@ fn finalize_fetched_to_dest(
             if bytes.len() as u64 > MAX_PHOTO_BYTES {
                 return Err(DownloadFailure::too_large());
             }
-            write_atomic_part(destination, &bytes).map_err(|_| DownloadFailure::unknown())
+            write_atomic_part(destination, &bytes).map_err(|_| DownloadFailure::unknown())?;
+            Ok(())
         }
         (FetchedSource::File { path, owned }, Some(stream)) => {
-            let res = stream.decrypt_file(&path, destination);
+            let dec_res = stream.decrypt_file(&path, destination);
             if owned {
                 let _ = fs::remove_file(&path);
             }
-            let written = res.map_err(|_| DownloadFailure::decrypt_failed())?;
+            let written = dec_res.map_err(|_| DownloadFailure::decrypt_failed())?;
             if written == 0 {
                 let _ = fs::remove_file(destination);
                 return Err(DownloadFailure::empty_body());
@@ -1310,48 +1666,47 @@ fn finalize_fetched_to_dest(
             Ok(())
         }
         (FetchedSource::File { path, owned }, None) => {
-            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            if size == 0 {
-                if owned {
-                    let _ = fs::remove_file(&path);
-                }
-                return Err(DownloadFailure::empty_body());
+            let copy_res = copy_local_with_noise_transform(&path, destination, want_noise);
+            if owned {
+                let _ = fs::remove_file(&path);
             }
-            let part_path = SecureStream::part_path_for(destination);
-            let copy_res = (|| -> std::io::Result<()> {
-                fs::copy(&path, &part_path)?;
-                let f = File::open(&part_path)?;
+            copy_res
+        }
+    };
+
+    res?;
+    if want_noise {
+        apply_noise_in_place(destination).map_err(|_| {
+            let _ = fs::remove_file(destination);
+            DownloadFailure::unknown()
+        })?;
+    }
+    Ok(())
+}
+
+fn write_atomic_part(destination: &Path, data: &[u8]) -> std::io::Result<()> {
+    let part_path = SecureStream::part_path_for(destination);
+    let _ = fs::remove_file(&part_path);
+    match File::create(&part_path) {
+        Ok(mut f) => {
+            let res = (|| -> std::io::Result<()> {
+                f.write_all(data)?;
                 f.sync_all()?;
                 drop(f);
                 fs::rename(&part_path, destination)?;
                 Ok(())
             })();
-            if owned {
-                let _ = fs::remove_file(&path);
-            }
-            if copy_res.is_err() {
+            if res.is_err() {
                 let _ = fs::remove_file(&part_path);
-                return Err(DownloadFailure::unknown());
             }
-            Ok(())
+            res
+        }
+        Err(_) => {
+            let mut f = File::create(destination)?;
+            f.write_all(data)?;
+            f.flush()
         }
     }
-}
-fn write_atomic_part(destination: &Path, data: &[u8]) -> std::io::Result<()> {
-    let part_path = SecureStream::part_path_for(destination);
-    let _ = fs::remove_file(&part_path);
-    let res = (|| -> std::io::Result<()> {
-        let mut f = File::create(&part_path)?;
-        f.write_all(data)?;
-        f.sync_all()?;
-        drop(f);
-        fs::rename(&part_path, destination)?;
-        Ok(())
-    })();
-    if res.is_err() {
-        let _ = fs::remove_file(&part_path);
-    }
-    res
 }
 
 fn resolve_destination(save_dir: Option<&str>, file_name: Option<&str>) -> Option<PathBuf> {

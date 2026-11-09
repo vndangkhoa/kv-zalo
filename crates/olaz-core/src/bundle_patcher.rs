@@ -369,6 +369,10 @@ pub fn bridge_spec_script(platform: &ZaloPlatform) -> String {
         "$zFileManager.zcloudCloneAndMatchChecksum",
         "$zFileManager.zcloudDenoiseFile",
         "$zFileManager.zcloudNoiseFile",
+        "$zconfig.getAutostartState",
+        "$zconfig.setStartInTray",
+        "$zconfig.migrateLegacyAutoLaunch",
+        "$zFileManager.generateVideoThumbnail",
     ] {
         members.insert(path.to_string(), "async");
     }
@@ -475,10 +479,47 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
   const callAsync = (p, args) => window.__zaloBridge.callAsync(p, args || []);
   const sendIPC = (channel, args) => {
     try {
-      const p = window.webkit.messageHandlers.zbridge.postMessage({ kind: 'send', channel, args });
+      const p = window.webkit.messageHandlers.zbridge.postMessage({ kind: 'send', channel, args: encodeBridgeArg(args || []) });
       if (p && typeof p.catch === 'function') p.catch(() => {});
     } catch {}
   };
+  const encodeBridgeArg = (v) => {
+    if (v instanceof ArrayBuffer) v = new Uint8Array(v);
+    if (ArrayBuffer.isView(v)) {
+      const b = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+      let s = '';
+      for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+      return { __bytes: btoa(s) };
+    }
+    if (Array.isArray(v)) return v.map(encodeBridgeArg);
+    if (v && typeof v === 'object') {
+      const o = {};
+      for (const k of Object.keys(v)) {
+        if (typeof v[k] !== 'function') o[k] = encodeBridgeArg(v[k]);
+      }
+      return o;
+    }
+    return typeof v === 'function' ? undefined : v;
+  };
+  const decodeBridgeVal = (v) => {
+    if (Array.isArray(v)) return v.map(decodeBridgeVal);
+    if (v && typeof v === 'object') {
+      if (typeof v.__bytes === 'string') {
+        const s = atob(v.__bytes);
+        const u = new Uint8Array(s.length);
+        for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
+        return v.__arraybuffer ? u.buffer : u;
+      }
+      if (v.__undefined) return undefined;
+      const o = {};
+      for (const k of Object.keys(v)) o[k] = decodeBridgeVal(v[k]);
+      return o;
+    }
+    return v;
+  };
+  const invokeIPC = (channel, args) => window.webkit.messageHandlers.zbridge
+    .postMessage({ kind: 'invoke', channel, args: encodeBridgeArg(args || []) })
+    .then(decodeBridgeVal);
   const postState = (state) => {
     try { window.webkit.messageHandlers.zstate.postMessage(state); } catch {}
   };
@@ -898,6 +939,30 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     cancelCopy: () => callAsync('$znode.nativelibs.zfileAddon.cancelCopy', []),
   });
 
+  // 3b. `$znode.url.format`, `$znode.util`, `$znode.diskSpace`
+  if (local['$znode.url'] && typeof local['$znode.url'].format !== 'function') {
+    local['$znode.url'].format = (u) => {
+      if (typeof u === 'string') return u;
+      if (!u || typeof u !== 'object') return '';
+      if (typeof u.href === 'string' && u.href) return u.href;
+      const proto = u.protocol ? (u.protocol.endsWith(':') ? u.protocol : u.protocol + ':') : '';
+      const host = u.host || (u.hostname ? u.hostname + (u.port ? ':' + u.port : '') : '');
+      const slash = (u.slashes || proto === 'file:' || proto === 'http:' || proto === 'https:') ? '//' : '';
+      return proto + slash + host + (u.pathname || '') + (u.search || '') + (u.hash ? (u.hash.startsWith('#') ? u.hash : '#' + u.hash) : '');
+    };
+  }
+  local['$znode.util'] = {
+    promisify: (fn) => (...args) => new Promise((resolve, reject) => {
+      fn(...args, (err, res) => (err ? reject(err) : resolve(res)));
+    }),
+  };
+  local['$znode.diskSpace'] = async (dirPath) => {
+    const u = safe(() => sync('$znode.nativelibs.fileUtilsAddon.getDiskUsage', [String(dirPath || '/')]), null) || {};
+    const size = Number(u.total || u.totalSpace || 100 * 1024 * 1024 * 1024);
+    const free = Number(u.free || u.available || u.freeSpace || 50 * 1024 * 1024 * 1024);
+    return { diskPath: '/', free, size };
+  };
+
   // 4. `$zcall` preload serialization + incoming call alert WITHOUT suppressing native modals
   const packCallMsg = (message) => {
     const optional = !!(message && message._optional);
@@ -937,8 +1002,107 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     sendIPC('call-init', packCallMsg(message));
   };
   local['$znode.nativelibs.zcallAddon'] = { getListDevices: () => '[]' };
-  local['$zFeatures.genThumb'] = async (filePath) => {
-    if (!filePath) return '';
+
+  // 4b. `$znode.unusedFilename` (`sync` + `async`) required by photo/video/file/voice download dialogs
+  const splitPathForUnused = (fp) => {
+    const s = String(fp || '');
+    const slash = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
+    const dot = s.lastIndexOf('.');
+    if (dot > slash + 1) return [s.slice(0, dot), s.slice(dot)];
+    return [s, ''];
+  };
+  const nextUnusedCandidate = (orig, stem, ext, index, opts) => {
+    if (opts && typeof opts.incrementer === 'function') {
+      try {
+        const res = opts.incrementer(orig, ext);
+        if (Array.isArray(res) && typeof res[1] === 'string') return res[1];
+        if (typeof res === 'string') return res;
+      } catch {}
+    }
+    return stem + ' (' + index + ')' + ext;
+  };
+  const unusedFilenameSync = (filePath, opts) => {
+    if (typeof filePath !== 'string' || !filePath) return '';
+    const maxTries = Math.max(1, Number(opts && opts.maxTries) || 10000);
+    if (!safe(() => sync('$znode.fs.existsSync', [filePath]), false)) return filePath;
+    const [stem, ext] = splitPathForUnused(filePath);
+    for (let i = 1; i <= maxTries; i++) {
+      const cand = nextUnusedCandidate(filePath, stem, ext, i, opts);
+      if (!safe(() => sync('$znode.fs.existsSync', [cand]), false)) return cand;
+    }
+    return stem + ' (' + Date.now() + ')' + ext;
+  };
+  const unusedFilenameAsync = async (filePath, opts) => {
+    if (typeof filePath !== 'string' || !filePath) return '';
+    const maxTries = Math.max(1, Number(opts && opts.maxTries) || 10000);
+    const existsAsync = async (p) => {
+      try { return !!(await callAsync('$znode.fs.exists', [p])); } catch { return false; }
+    };
+    if (!(await existsAsync(filePath))) return filePath;
+    const [stem, ext] = splitPathForUnused(filePath);
+    for (let i = 1; i <= maxTries; i++) {
+      const cand = nextUnusedCandidate(filePath, stem, ext, i, opts);
+      if (!(await existsAsync(cand))) return cand;
+    }
+    return stem + ' (' + Date.now() + ')' + ext;
+  };
+  unusedFilenameAsync.sync = unusedFilenameSync;
+  unusedFilenameAsync.async = unusedFilenameAsync;
+  local['$znode.unusedFilename'] = unusedFilenameAsync;
+
+  // 5. Rewrite raw `file:///...` media/image/CSS subresources to `zfile://local/...`,
+  //    route `<video>`/`<audio>` local streams over the loopback HTTP 206 media proxy,
+  //    and normalize protocol-relative `//...` CDN URLs to `https://...` on `zalo-app://` pages.
+  const encodeLocalPathSegments = (rawPath) => {
+    const stripped = String(rawPath || '').replace(/^\/+/, '');
+    return stripped.split('/').map((seg) => {
+      let dec = seg;
+      try { dec = decodeURIComponent(seg); } catch {}
+      return encodeURIComponent(dec);
+    }).join('/');
+  };
+  const splitQueryHash = (raw) => {
+    const idx = raw.search(/[?#]/);
+    return idx >= 0 ? [raw.slice(0, idx), raw.slice(idx)] : [raw, ''];
+  };
+  const rewriteFileUrl = (u) => {
+    const s = (u && typeof u === 'object' && typeof u.href === 'string') ? u.href : u;
+    if (typeof s !== 'string') return u;
+    if (s.startsWith('file:')) {
+      const [pathPart, suffix] = splitQueryHash(s.replace(/^file:\/+/, ''));
+      return 'zfile://local/' + encodeLocalPathSegments(pathPart) + suffix;
+    }
+    if (s.startsWith('//')) return 'https:' + s;
+    return u;
+  };
+  const getMediaProxyBase = () => (
+    typeof window.__olazMediaProxyBase === 'string' && window.__olazMediaProxyBase
+      ? window.__olazMediaProxyBase.replace(/\/+$/, '')
+      : ''
+  );
+  const rewriteMediaStreamUrl = (u) => {
+    const first = rewriteFileUrl(u);
+    if (typeof first !== 'string') return first;
+    const base = getMediaProxyBase();
+    if (!base) return first;
+    if (first.startsWith('zfile:')) {
+      const after = first.replace(/^zfile:\/+/, '');
+      const rel = after.startsWith('local/') ? after.slice(6) : after;
+      const [pathPart, suffix] = splitQueryHash(rel);
+      return base + '/zfile/local/' + encodeLocalPathSegments(pathPart) + suffix;
+    }
+    if (first.startsWith('zalo-app:')) {
+      const after = first.replace(/^zalo-app:\/+/, '');
+      const rel = after.startsWith('local/') ? after.slice(6) : after;
+      const [pathPart, suffix] = splitQueryHash(rel);
+      return base + '/zalo-app/local/' + encodeLocalPathSegments(pathPart) + suffix;
+    }
+    return first;
+  };
+
+  // 5b. Video thumbnail generation (`$znode.nativelibs.mp4thumb` + `$zFeatures.genThumb`)
+  const genThumbFromVideoDom = (filePath, maxWidth = 480, maxHeight = 480) => {
+    if (!filePath) return Promise.resolve('');
     return new Promise((resolve) => {
       const video = document.createElement('video');
       let settled = false;
@@ -951,37 +1115,73 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
       const timer = setTimeout(() => done(''), 5000);
       video.muted = true;
       video.playsInline = true;
-      video.preload = 'metadata';
+      video.preload = 'auto';
+      video.crossOrigin = 'anonymous';
       video.onerror = () => { clearTimeout(timer); done(''); };
       video.onloadeddata = () => {
-        try { video.currentTime = Math.min(0.1, Math.max(0, (video.duration || 0) * 0.05)); } catch { video.onseeked(); }
+        try {
+          const target = Math.min(0.1, Math.max(0, (video.duration || 0) * 0.05));
+          if (target > 0) video.currentTime = target;
+          else video.onseeked();
+        } catch { video.onseeked(); }
       };
       video.onseeked = () => {
         clearTimeout(timer);
         try {
           const w = video.videoWidth || 320, h = video.videoHeight || 240;
-          const scale = Math.min(1, 480 / Math.max(w, h, 1));
+          const limW = Math.max(1, Number(maxWidth) || 480);
+          const limH = Math.max(1, Number(maxHeight) || 480);
+          const scale = Math.min(1, limW / Math.max(w, 1), limH / Math.max(h, 1));
           const cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
           const c = document.createElement('canvas');
           c.width = cw; c.height = ch;
           c.getContext('2d').drawImage(video, 0, 0, cw, ch);
-          done(c.toDataURL('image/jpeg', 0.8));
+          done(c.toDataURL('image/jpeg', 0.82));
         } catch { done(''); }
       };
       const raw = String(filePath);
-      video.src = raw.startsWith('zfile:') ? raw : ('zfile://local/' + raw.replace(/^file:\/+/, '').replace(/^\/+/, ''));
+      const zfileUri = (raw.startsWith('zfile:') || raw.startsWith('http:') || raw.startsWith('https:'))
+        ? raw
+        : (raw.startsWith('file:') ? rewriteFileUrl(raw) : ('zfile://local/' + encodeLocalPathSegments(raw)));
+      video.src = rewriteMediaStreamUrl(zfileUri);
     });
   };
+  const genThumbFn = (filePath) => genThumbFromVideoDom(filePath, 480, 480);
+  genThumbFn.writeSavePathFilePhoto = (...args) => invokeIPC('gen-thumb_write-savepath-file-photo', args);
+  local['$zFeatures.genThumb'] = genThumbFn;
+  local['$znode.nativelibs.mp4thumb'] = () => ({
+    generateThumbnail: async (inputPath, outputPath, maxWidth, maxHeight) => {
+      const inp = String(inputPath || '');
+      const out = String(outputPath || '');
+      if (!inp || !out) return '';
+      const mw = Math.max(1, Number(maxWidth) || 480);
+      const mh = Math.max(1, Number(maxHeight) || 480);
+      try {
+        const nativeRes = await callAsync('$zFileManager.generateVideoThumbnail', [inp, out, mw, mh]);
+        if (nativeRes && typeof nativeRes === 'string') return nativeRes;
+      } catch {}
+      try {
+        const dataUrl = await genThumbFromVideoDom(inp, mw, mh);
+        const comma = dataUrl.indexOf(',');
+        if (comma > 0) {
+          const bin = atob(dataUrl.slice(comma + 1));
+          const u8 = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+          if (u8.length > 0) {
+            const dir = path ? path.dirname(out) : out.slice(0, out.lastIndexOf('/'));
+            if (dir && dir !== '.' && dir !== '/') {
+              await callAsync('$znode.fsExtra.ensureDir', [dir]);
+            }
+            await callAsync('$zFileManager.writeBufferToPath', [out, u8]);
+            return out;
+          }
+        }
+      } catch {}
+      return '';
+    },
+    cancel: () => {},
+  });
 
-  // 5. Rewrite raw `file:///...` media/image/CSS subresources to `zfile://local/...`
-  //    and normalize protocol-relative `//...` CDN URLs to `https://...` on `zalo-app://` pages.
-  const rewriteFileUrl = (u) => {
-    const s = (u && typeof u === 'object' && typeof u.href === 'string') ? u.href : u;
-    if (typeof s !== 'string') return u;
-    if (s.startsWith('file:')) return 'zfile://local/' + s.replace(/^file:\/+/, '');
-    if (s.startsWith('//')) return 'https:' + s;
-    return u;
-  };
   const rewriteCssUrls = (val) => {
     if (typeof val !== 'string' || (!val.includes('file:') && !val.includes('//'))) return val;
     return val.replace(/url\(\s*(['"]?)(file:\/+[^'")\s]+|\/\/[^'")\s]+)\1\s*\)/gi, (_m, _q, raw) => {
@@ -991,7 +1191,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
   if (window.XMLHttpRequest && window.XMLHttpRequest.prototype && !window.XMLHttpRequest.prototype.open.__olazProtoRel) {
     const origOpen = window.XMLHttpRequest.prototype.open;
     const wrappedOpen = function (method, url, ...rest) {
-      const nextUrl = (typeof url === 'string' && url.startsWith('//')) ? ('https:' + url) : url;
+      const nextUrl = typeof url === 'string' ? rewriteFileUrl(url) : url;
       return origOpen.call(this, method, nextUrl, ...rest);
     };
     wrappedOpen.__olazProtoRel = true;
@@ -1000,7 +1200,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
   if (typeof window.fetch === 'function' && !window.fetch.__olazProtoRel) {
     const origFetch = window.fetch;
     const wrappedFetch = function (input, init) {
-      if (typeof input === 'string' && input.startsWith('//')) input = 'https:' + input;
+      if (typeof input === 'string') input = rewriteFileUrl(input);
       return origFetch.call(this, input, init);
     };
     wrappedFetch.__olazProtoRel = true;
@@ -1088,18 +1288,38 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     wrappedWinOpen.__olazPopupReady = true;
     window.open = wrappedWinOpen;
   }
-  const patchSrcProp = (Ctor) => {
+  const origSetAttr = (typeof Element !== 'undefined' && Element.prototype && typeof Element.prototype.setAttribute === 'function')
+    ? Element.prototype.setAttribute
+    : null;
+  const patchUrlProp = (Ctor, prop, rewriter) => {
+    if (!Ctor || !Ctor.prototype) return;
+    const desc = Object.getOwnPropertyDescriptor(Ctor.prototype, prop);
+    if (!desc || !desc.set || desc.set.__olazZfile) return;
+    const origSet = desc.set;
+    const wrappedSet = function (val) { return origSet.call(this, rewriter(val)); };
+    wrappedSet.__olazZfile = true;
+    Object.defineProperty(Ctor.prototype, prop, Object.assign({}, desc, { set: wrappedSet }));
+  };
+  const patchMediaSrcProp = (Ctor) => {
     if (!Ctor || !Ctor.prototype) return;
     const desc = Object.getOwnPropertyDescriptor(Ctor.prototype, 'src');
     if (!desc || !desc.set || desc.set.__olazZfile) return;
     const origSet = desc.set;
-    const wrappedSet = function (val) { return origSet.call(this, rewriteFileUrl(val)); };
+    const wrappedSet = function (val) {
+      const next = rewriteMediaStreamUrl(val);
+      const base = getMediaProxyBase();
+      if (base && typeof next === 'string' && next.startsWith(base + '/') && !this.hasAttribute('crossorigin')) {
+        try { if (origSetAttr) origSetAttr.call(this, 'crossorigin', 'anonymous'); } catch {}
+      }
+      return origSet.call(this, next);
+    };
     wrappedSet.__olazZfile = true;
     Object.defineProperty(Ctor.prototype, 'src', Object.assign({}, desc, { set: wrappedSet }));
   };
-  patchSrcProp(window.HTMLImageElement);
-  patchSrcProp(window.HTMLMediaElement);
-  patchSrcProp(window.HTMLSourceElement);
+  patchUrlProp(window.HTMLImageElement, 'src', rewriteFileUrl);
+  patchUrlProp(window.HTMLVideoElement, 'poster', rewriteFileUrl);
+  patchMediaSrcProp(window.HTMLMediaElement);
+  patchUrlProp(window.HTMLSourceElement, 'src', rewriteMediaStreamUrl);
   if (window.CSSStyleDeclaration && window.CSSStyleDeclaration.prototype) {
     const cssProto = window.CSSStyleDeclaration.prototype;
     if (typeof cssProto.setProperty === 'function' && !cssProto.setProperty.__olazZfile) {
@@ -1120,30 +1340,464 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
       }
     }
   }
-  const origSetAttr = Element.prototype.setAttribute;
-  Element.prototype.setAttribute = function (name, val) {
-    if (typeof name === 'string') {
-      const lower = name.toLowerCase();
-      if (lower === 'src') {
-        const tag = this.tagName;
-        if (tag === 'IMG' || tag === 'AUDIO' || tag === 'VIDEO' || tag === 'SOURCE') {
-          val = rewriteFileUrl(val);
+  if (origSetAttr) {
+    Element.prototype.setAttribute = function (name, val) {
+      if (typeof name === 'string') {
+        const lower = name.toLowerCase();
+        if (lower === 'src') {
+          const tag = this.tagName;
+          if (tag === 'IMG') {
+            val = rewriteFileUrl(val);
+          } else if (tag === 'AUDIO' || tag === 'VIDEO') {
+            val = rewriteMediaStreamUrl(val);
+            const base = getMediaProxyBase();
+            if (base && typeof val === 'string' && val.startsWith(base + '/') && !this.hasAttribute('crossorigin')) {
+              try { origSetAttr.call(this, 'crossorigin', 'anonymous'); } catch {}
+            }
+          } else if (tag === 'SOURCE') {
+            val = rewriteMediaStreamUrl(val);
+          }
+        } else if (lower === 'poster') {
+          if (this.tagName === 'VIDEO') {
+            val = rewriteFileUrl(val);
+          }
+        } else if (lower === 'style') {
+          val = rewriteCssUrls(val);
         }
-      } else if (lower === 'style') {
-        val = rewriteCssUrls(val);
       }
-    }
-    return origSetAttr.call(this, name, val);
-  };
+      return origSetAttr.call(this, name, val);
+    };
+  }
   if (typeof window.Audio === 'function' && !window.Audio.__olazZfile) {
     const NativeAudio = window.Audio;
     const WrappedAudio = function (src) {
-      return arguments.length ? new NativeAudio(rewriteFileUrl(src)) : new NativeAudio();
+      return arguments.length ? new NativeAudio(rewriteMediaStreamUrl(src)) : new NativeAudio();
     };
     WrappedAudio.prototype = NativeAudio.prototype;
     Object.setPrototypeOf(WrappedAudio, NativeAudio);
     WrappedAudio.__olazZfile = true;
     window.Audio = WrappedAudio;
+  }
+
+  // 5b. Intercept `<a download>` clicks (`blob:`, `data:`, `zfile:`, `file:`) in both
+  //     `index.html` and `popup-viewer.html` (`MediaViewer`) before `URL.revokeObjectURL`
+  //     runs (`w.a.markUsed`), prompting via `$zwindow.showSaveDialog` and writing to disk.
+  {
+    const handledAnchors = new WeakSet();
+    const nativeFetchForDl = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+    const triggerAnchorDownload = (anchor) => {
+      if (!anchor || typeof anchor.hasAttribute !== 'function' || !anchor.hasAttribute('download')) return false;
+      const href = String(anchor.getAttribute('href') || anchor.href || '').trim();
+      if (!href || !/^(blob:|data:|zfile:|file:)/i.test(href)) return false;
+      if (handledAnchors.has(anchor)) return true;
+      handledAnchors.add(anchor);
+      setTimeout(() => { try { handledAnchors.delete(anchor); } catch {} }, 1000);
+
+      const rawName = String(anchor.getAttribute('download') || '').trim();
+      const fallbackFromHref = (() => {
+        try {
+          const clean = href.split('?')[0].split('#')[0];
+          const seg = decodeURIComponent(clean.slice(clean.lastIndexOf('/') + 1));
+          return seg && !seg.includes(':') ? seg : '';
+        } catch {
+          return '';
+        }
+      })();
+      const suggested = rawName || fallbackFromHref || ('download_' + Date.now());
+
+      // Start reading bytes synchronously before `w.a.markUsed` revokes a `blob:` URL.
+      let bytesPromise;
+      if (/^(zfile:|file:)/i.test(href)) {
+        const localPath = (() => {
+          try {
+            if (/^zfile:\/\//i.test(href)) {
+              const rest = href.replace(/^zfile:\/\/[^/]*/i, '');
+              return decodeURIComponent(rest.startsWith('/') ? rest : '/' + rest);
+            }
+            return decodeURIComponent(new URL(href).pathname);
+          } catch {
+            return href.replace(/^(zfile:\/\/local|file:\/\/\/?)/i, '/');
+          }
+        })();
+        bytesPromise = callAsync('$zFileManager.getFileArrayBuffer', [localPath]).then((ab) => (window.__olazDenoiseU8 || ((x) => x))(toU8(ab)));
+      } else if (nativeFetchForDl) {
+        bytesPromise = nativeFetchForDl(href).then((r) => {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.arrayBuffer();
+        }).then((ab) => new Uint8Array(ab));
+      } else {
+        return false;
+      }
+
+      (async () => {
+        try {
+          const u8 = await bytesPromise;
+          const res = await window.$zwindow.showSaveDialog({ defaultPath: suggested });
+          if (!res || res.canceled || !res.filePath) return;
+          await callAsync('$zFileManager.writeBufferToPath', [String(res.filePath), u8]);
+        } catch (err) {
+          diag('anchor-download error: ' + String((err && err.message) || err));
+        }
+      })();
+      return true;
+    };
+
+    if (window.HTMLAnchorElement && window.HTMLAnchorElement.prototype && !window.HTMLAnchorElement.prototype.click.__olazDl) {
+      const origClick = window.HTMLAnchorElement.prototype.click;
+      const wrappedClick = function () {
+        if (triggerAnchorDownload(this)) return;
+        return origClick.apply(this, arguments);
+      };
+      wrappedClick.__olazDl = true;
+      window.HTMLAnchorElement.prototype.click = wrappedClick;
+    }
+    window.addEventListener('click', (ev) => {
+      if (ev.defaultPrevented || ev.button !== 0) return;
+      const t = ev.target;
+      const anchor = t && typeof t.closest === 'function' ? t.closest('a[download]') : null;
+      if (anchor && triggerAnchorDownload(anchor)) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+    }, true);
+  }
+
+  // 5c. In-renderer `utility-process-media` (`PHOTO_FS`, `RESIZE`, `RESIZE_JXL`, `GET_JXL_INFO`, `PING`)
+  //     and `$zMsgChannel` / `$zsub.$zMsgChannel` port handshake registered at `document-start`
+  //     so `PhotoLoaderModule.onApplicationReady` (`new HC("utility-process-media", ...)`)
+  //     receives a genuine `ZMessagePort` with zero startup race.
+  const ensureParentDir = async (filePath) => {
+    const s = String(filePath || '');
+    const dir = path ? path.dirname(s) : s.slice(0, s.lastIndexOf('/'));
+    if (dir && dir !== '.' && dir !== '/') {
+      await callAsync('$znode.fsExtra.ensureDir', [dir]);
+    }
+  };
+  const executePhotoFs = async (payload) => {
+    const t = payload || {};
+    switch (t.operation) {
+      case 'EXISTS': {
+        try { await callAsync('$znode.fsPromise.stat', [String(t.path)]); return true; } catch { return false; }
+      }
+      case 'STAT':
+        return await callAsync('$znode.fsPromise.stat', [String(t.path)]);
+      case 'READ_PARTIAL': {
+        const start = Math.max(0, Number(t.start) || 0);
+        const len = Math.max(0, (Number(t.end) || 0) - start);
+        if (!(len > 0)) return new ArrayBuffer(0);
+        const ab = await callAsync('$zFileManager.readFileSlice', [String(t.path), start, len, false]);
+        return toExactArrayBuffer(toU8(ab));
+      }
+      case 'READ_ARRAY_BUFFER':
+      case 'READ_BLOB': {
+        const ab = await callAsync('$zFileManager.getFileArrayBuffer', [String(t.path)]);
+        return toExactArrayBuffer(toU8(ab));
+      }
+      case 'WRITE_BUFFER':
+      case 'WRITE_BLOB': {
+        await ensureParentDir(t.path);
+        await callAsync('$zFileManager.writeBufferToPath', [String(t.path), toU8(t.buffer)]);
+        return true;
+      }
+      case 'DELETE': {
+        try {
+          await callAsync('$znode.fsPromise.unlink', [String(t.path)]);
+        } catch (err) {
+          const msg = String((err && (err.code || err.message)) || err || '');
+          if (!msg.includes('ENOENT')) throw err;
+        }
+        return true;
+      }
+      case 'COPY': {
+        await ensureParentDir(t.dest);
+        await callAsync('$znode.fsExtra.copy', [String(t.src), String(t.dest)]);
+        return true;
+      }
+      case 'MOVE': {
+        await ensureParentDir(t.dest);
+        try {
+          await callAsync('$znode.fsExtra.move', [String(t.src), String(t.dest)]);
+        } catch {
+          await callAsync('$znode.fsExtra.copy', [String(t.src), String(t.dest)]);
+          try { await callAsync('$znode.fsPromise.unlink', [String(t.src)]); } catch {}
+        }
+        return true;
+      }
+      case 'ENSURE_DIR':
+        await callAsync('$znode.fsExtra.ensureDir', [String(t.path)]);
+        return true;
+      default:
+        throw new Error('Unsupported PHOTO_FS operation: ' + String(t.operation));
+    }
+  };
+  const denoiseZaloU8 = (raw) => {
+    const u8 = toU8(raw);
+    const n = u8.byteLength;
+    if (
+      n > 6
+      && u8[n - 6] === 0x07 && u8[n - 5] === 0x7a && u8[n - 4] === 0x41
+      && u8[n - 3] === 0x6c && u8[n - 2] === 0x4f && u8[n - 1] === 0x07
+    ) {
+      const out = u8.slice(0, n - 6);
+      const xorEnd = Math.min(100, out.byteLength);
+      for (let i = 0; i < xorEnd; i++) out[i] ^= 0x93;
+      return out;
+    }
+    return u8;
+  };
+  window.__olazDenoiseU8 = denoiseZaloU8;
+  const executeResizeTask = async (payload) => {
+    const p = payload || {};
+    const ab = await callAsync('$zFileManager.getFileArrayBuffer', [String(p.src)]);
+    const srcU8 = denoiseZaloU8(ab);
+    const mime = p.outputFormat === 'image/png' || p.outputFormat === 'png' ? 'image/png' : 'image/jpeg';
+    const blob = new Blob([srcU8]);
+    const bmp = typeof createImageBitmap === 'function' ? await createImageBitmap(blob) : await new Promise((res, rej) => {
+      const img = new Image();
+      const url = URL.createObjectURL(blob);
+      img.onload = () => { URL.revokeObjectURL(url); res(img); };
+      img.onerror = (e) => { URL.revokeObjectURL(url); rej(e); };
+      img.src = url;
+    });
+    const sw = bmp.width || 1, sh = bmp.height || 1;
+    const tw = Number(p.width) || sw, th = Number(p.height) || sh;
+    const scale = Math.min(1, tw / sw, th / sh);
+    const dw = Math.max(1, Math.round(sw * scale)), dh = Math.max(1, Math.round(sh * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = dw; canvas.height = dh;
+    canvas.getContext('2d').drawImage(bmp, 0, 0, dw, dh);
+    if (bmp && typeof bmp.close === 'function') { try { bmp.close(); } catch {} }
+    const q = Math.max(0.1, Math.min(1, (Number(p.quality) || 85) > 1 ? Number(p.quality) / 100 : (Number(p.quality) || 0.85)));
+    const outBlob = await new Promise((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error('canvas.toBlob null'))), mime, q));
+    const outBytes = new Uint8Array(await outBlob.arrayBuffer());
+    if (p.destinationPath) {
+      await ensureParentDir(p.destinationPath);
+      await callAsync('$zFileManager.writeBufferToPath', [String(p.destinationPath), outBytes]);
+    }
+    return toExactArrayBuffer(outBytes);
+  };
+  const parseJxlInfo = (rawInput) => {
+    const bytes = denoiseZaloU8(rawInput);
+    let cs = null;
+    if (bytes.byteLength >= 2 && bytes[0] === 0xff && bytes[1] === 0x0a) {
+      cs = bytes;
+    } else if (
+      bytes.byteLength >= 12
+      && bytes[0] === 0x00 && bytes[1] === 0x00 && bytes[2] === 0x00 && bytes[3] === 0x0c
+      && bytes[4] === 0x4a && bytes[5] === 0x58 && bytes[6] === 0x4c && bytes[7] === 0x20
+      && bytes[8] === 0x0d && bytes[9] === 0x0a && bytes[10] === 0x87 && bytes[11] === 0x0a
+    ) {
+      const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const parts = [];
+      let off = 0;
+      while (off + 8 <= bytes.byteLength) {
+        let size = dv.getUint32(off, false);
+        const type = String.fromCharCode(bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7]);
+        let hdr = 8;
+        if (size === 1) {
+          if (off + 16 > bytes.byteLength) break;
+          const hi = dv.getUint32(off + 8, false);
+          const lo = dv.getUint32(off + 12, false);
+          size = hi * 4294967296 + lo;
+          hdr = 16;
+        } else if (size === 0) {
+          size = bytes.byteLength - off;
+        }
+        if (size < hdr || off + size > bytes.byteLength) break;
+        const body = bytes.subarray(off + hdr, off + size);
+        if (type === 'jxlc') {
+          cs = body;
+          break;
+        }
+        if (type === 'jxlp' && body.byteLength > 4) {
+          parts.push(body.subarray(4));
+          const total = parts.reduce((acc, p) => acc + p.byteLength, 0);
+          if (total >= 32) break;
+        }
+        off += size;
+      }
+      if (!cs && parts.length) cs = concatManyU8(parts);
+    }
+    if (!cs || cs.byteLength < 4 || cs[0] !== 0xff || cs[1] !== 0x0a) {
+      throw new Error('Invalid JXL codestream');
+    }
+    let bitPos = 16;
+    const readBits = (n) => {
+      let val = 0;
+      for (let i = 0; i < n; i++) {
+        const byteIdx = bitPos >>> 3;
+        if (byteIdx >= cs.byteLength) throw new Error('Truncated JXL SizeHeader');
+        const bit = (cs[byteIdx] >>> (bitPos & 7)) & 1;
+        val += bit * (2 ** i);
+        bitPos++;
+      }
+      return val;
+    };
+    const div8 = readBits(1);
+    const u32Widths = [9, 13, 18, 30];
+    const height = div8 ? 8 * (1 + readBits(5)) : (1 + readBits(u32Widths[readBits(2)]));
+    const ratio = readBits(3);
+    let width;
+    if (ratio === 0) width = div8 ? 8 * (1 + readBits(5)) : (1 + readBits(u32Widths[readBits(2)]));
+    else if (ratio === 1) width = height;
+    else if (ratio === 2) width = Math.floor((height * 12) / 10);
+    else if (ratio === 3) width = Math.floor((height * 4) / 3);
+    else if (ratio === 4) width = Math.floor((height * 3) / 2);
+    else if (ratio === 5) width = Math.floor((height * 16) / 9);
+    else if (ratio === 6) width = Math.floor((height * 5) / 4);
+    else width = height * 2;
+    let orientation = 1;
+    try {
+      const allDefault = readBits(1);
+      if (!allDefault && readBits(1)) {
+        orientation = 1 + readBits(3);
+      }
+    } catch {}
+    return { width, height, orientation };
+  };
+  const createUtilityMediaPort = () => {
+    const ch = new MessageChannel();
+    const hostPort = ch.port2;
+    hostPort.addEventListener('message', async (ev) => {
+      const msg = ev && ev.data;
+      if (!msg || msg.messageType !== 'request') return;
+      try {
+        let result;
+        const payload = msg.params && msg.params.payload;
+        if (msg.type === 'PING') {
+          result = 'pong';
+        } else if (msg.type === 'PHOTO_FS') {
+          result = await executePhotoFs(payload);
+        } else if (msg.type === 'RESIZE') {
+          result = await executeResizeTask(payload);
+        } else if (msg.type === 'GET_JXL_INFO') {
+          result = parseJxlInfo(payload && payload.input);
+        } else {
+          throw new Error('Unsupported utility-process-media task: ' + String(msg.type));
+        }
+        const xfer = result instanceof ArrayBuffer ? [result] : [];
+        hostPort.postMessage({
+          id: msg.id,
+          type: msg.type,
+          connectionId: msg.connectionId,
+          params: msg.params,
+          checkpoint: msg.checkpoint,
+          messageType: 'response',
+          result,
+          priority: msg.priority,
+          addToFront: msg.addToFront,
+        }, xfer);
+      } catch (err) {
+        hostPort.postMessage({
+          id: msg.id,
+          type: msg.type,
+          connectionId: msg.connectionId,
+          params: msg.params,
+          messageType: 'response',
+          error: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+          priority: msg.priority,
+          addToFront: msg.addToFront,
+        });
+      }
+    });
+    hostPort.start();
+    return ch.port1;
+  };
+  {
+    const portV2Cbs = new Set();
+    const establishedCbs = new Set();
+    const disconnectedCbs = new Set();
+    const terminatedCbs = new Set();
+    let msgChannelSessionSeq = 0;
+
+    const addListener = (set) => (cb) => {
+      if (typeof cb === 'function') set.add(cb);
+      return () => set.delete(cb);
+    };
+    const removeListener = (set) => (cb) => {
+      if (typeof cb === 'function') set.delete(cb);
+      else set.clear();
+    };
+
+    const msgChannelSubOverrides = {
+      onReceiveTransferredPortV2: addListener(portV2Cbs),
+      removeListenReceiveTransferredPortV2: removeListener(portV2Cbs),
+      onChannelEstablished: addListener(establishedCbs),
+      removeListenChannelEstablished: removeListener(establishedCbs),
+      onChannelDisconnected: addListener(disconnectedCbs),
+      removeListenChannelDisconnected: removeListener(disconnectedCbs),
+      onChannelTerminated: addListener(terminatedCbs),
+      removeListenChannelTerminated: removeListener(terminatedCbs),
+    };
+    for (const [k, fn] of Object.entries(msgChannelSubOverrides)) {
+      local['$zMsgChannel.' + k] = fn;
+    }
+    local['$zMsgChannel.requestOpenChannelTo'] = (fromScript, targetScript, channelID) => {
+      if (targetScript === 'utility-process-media') {
+        const port1 = createUtilityMediaPort();
+        const sessionId = ++msgChannelSessionSeq;
+        setTimeout(() => {
+          const payload = {
+            nameOfCurrentScript: fromScript,
+            nameOfTargetScript: targetScript,
+            channelID,
+            channelSessionID: sessionId,
+            isReconnect: false,
+          };
+          for (const cb of Array.from(portV2Cbs)) {
+            try { cb({ ports: [port1] }, payload); } catch {}
+          }
+        }, 0);
+      }
+      return Promise.resolve();
+    };
+    local['$zMsgChannel.notifyPortDelivered'] = (fromScript, targetScript, channelID, _sessionId) => {
+      if (targetScript === 'utility-process-media') {
+        // `ZMessageChannelManager.waitUntilPortIsReady` invokes `notifyPortDelivered` synchronously
+        // BEFORE `addActivatePortCallback`, so `onChannelEstablished` must fire on the next tick.
+        setTimeout(() => {
+          for (const cb of Array.from(establishedCbs)) {
+            try { cb({}, [fromScript, targetScript, channelID]); } catch {}
+          }
+        }, 0);
+      }
+      return Promise.resolve();
+    };
+
+    const msgChannelProxy = new Proxy(Object.assign({}, msgChannelSubOverrides), {
+      get(target, prop) {
+        return Object.prototype.hasOwnProperty.call(msgChannelSubOverrides, prop)
+          ? msgChannelSubOverrides[prop]
+          : target[prop];
+      },
+      set(target, prop, val) {
+        if (!Object.prototype.hasOwnProperty.call(msgChannelSubOverrides, prop)) {
+          target[prop] = val;
+        }
+        return true;
+      },
+    });
+    const attachZSubProxy = (obj) => {
+      if (!obj || typeof obj !== 'object') return obj;
+      try {
+        Object.defineProperty(obj, '$zMsgChannel', {
+          configurable: true,
+          enumerable: true,
+          get: () => msgChannelProxy,
+          set: () => {},
+        });
+      } catch {}
+      return obj;
+    };
+    let zsubRef = attachZSubProxy(window.$zsub || {});
+    try {
+      Object.defineProperty(window, '$zsub', {
+        configurable: true,
+        enumerable: true,
+        get: () => zsubRef,
+        set: (v) => { zsubRef = attachZSubProxy(v); },
+      });
+    } catch {}
   }
 
   // 6. Capture-phase `drop` listener: leave regular dropped files/images as pure disk-backed
@@ -1248,147 +1902,6 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     return;
   }
   if (page !== 'index.html' && page !== 'popup-viewer.html') return;
-
-  // In-renderer replacement for Electron's `utility-process-media` (`PHOTO_FS`, `RESIZE`, `PING`)
-  const ensureParentDir = async (filePath) => {
-    const s = String(filePath || '');
-    const dir = path ? path.dirname(s) : s.slice(0, s.lastIndexOf('/'));
-    if (dir && dir !== '.' && dir !== '/') {
-      await callAsync('$znode.fsExtra.ensureDir', [dir]);
-    }
-  };
-  const executePhotoFs = async (payload) => {
-    const t = payload || {};
-    switch (t.operation) {
-      case 'EXISTS': {
-        try { await callAsync('$znode.fsPromise.stat', [String(t.path)]); return true; } catch { return false; }
-      }
-      case 'STAT':
-        return await callAsync('$znode.fsPromise.stat', [String(t.path)]);
-      case 'READ_PARTIAL': {
-        const start = Math.max(0, Number(t.start) || 0);
-        const len = Math.max(0, (Number(t.end) || 0) - start);
-        if (!(len > 0)) return new ArrayBuffer(0);
-        const ab = await callAsync('$zFileManager.readFileSlice', [String(t.path), start, len, false]);
-        return toExactArrayBuffer(toU8(ab));
-      }
-      case 'READ_ARRAY_BUFFER':
-      case 'READ_BLOB': {
-        const ab = await callAsync('$zFileManager.getFileArrayBuffer', [String(t.path)]);
-        return toExactArrayBuffer(toU8(ab));
-      }
-      case 'WRITE_BUFFER':
-      case 'WRITE_BLOB': {
-        await ensureParentDir(t.path);
-        await callAsync('$zFileManager.writeBufferToPath', [String(t.path), toU8(t.buffer)]);
-        return true;
-      }
-      case 'DELETE': {
-        try {
-          await callAsync('$znode.fsPromise.unlink', [String(t.path)]);
-        } catch (err) {
-          const msg = String((err && (err.code || err.message)) || err || '');
-          if (!msg.includes('ENOENT')) throw err;
-        }
-        return true;
-      }
-      case 'COPY': {
-        await ensureParentDir(t.dest);
-        await callAsync('$znode.fsExtra.copy', [String(t.src), String(t.dest)]);
-        return true;
-      }
-      case 'MOVE': {
-        await ensureParentDir(t.dest);
-        try {
-          await callAsync('$znode.fsExtra.move', [String(t.src), String(t.dest)]);
-        } catch {
-          await callAsync('$znode.fsExtra.copy', [String(t.src), String(t.dest)]);
-          try { await callAsync('$znode.fsPromise.unlink', [String(t.src)]); } catch {}
-        }
-        return true;
-      }
-      case 'ENSURE_DIR':
-        await callAsync('$znode.fsExtra.ensureDir', [String(t.path)]);
-        return true;
-      default:
-        throw new Error('Unsupported PHOTO_FS operation: ' + String(t.operation));
-    }
-  };
-  const executeResizeTask = async (payload) => {
-    const p = payload || {};
-    const ab = await callAsync('$zFileManager.getFileArrayBuffer', [String(p.src)]);
-    const srcU8 = toU8(ab);
-    const mime = p.outputFormat === 'image/png' || p.outputFormat === 'png' ? 'image/png' : 'image/jpeg';
-    const blob = new Blob([srcU8]);
-    const bmp = typeof createImageBitmap === 'function' ? await createImageBitmap(blob) : await new Promise((res, rej) => {
-      const img = new Image();
-      const url = URL.createObjectURL(blob);
-      img.onload = () => { URL.revokeObjectURL(url); res(img); };
-      img.onerror = (e) => { URL.revokeObjectURL(url); rej(e); };
-      img.src = url;
-    });
-    const sw = bmp.width || 1, sh = bmp.height || 1;
-    const tw = Number(p.width) || sw, th = Number(p.height) || sh;
-    const scale = Math.min(1, tw / sw, th / sh);
-    const dw = Math.max(1, Math.round(sw * scale)), dh = Math.max(1, Math.round(sh * scale));
-    const canvas = document.createElement('canvas');
-    canvas.width = dw; canvas.height = dh;
-    canvas.getContext('2d').drawImage(bmp, 0, 0, dw, dh);
-    if (bmp && typeof bmp.close === 'function') { try { bmp.close(); } catch {} }
-    const q = Math.max(0.1, Math.min(1, (Number(p.quality) || 85) > 1 ? Number(p.quality) / 100 : (Number(p.quality) || 0.85)));
-    const outBlob = await new Promise((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error('canvas.toBlob null'))), mime, q));
-    const outBytes = new Uint8Array(await outBlob.arrayBuffer());
-    if (p.destinationPath) {
-      await ensureParentDir(p.destinationPath);
-      await callAsync('$zFileManager.writeBufferToPath', [String(p.destinationPath), outBytes]);
-    }
-    return toExactArrayBuffer(outBytes);
-  };
-  const createUtilityMediaPort = () => {
-    const ch = new MessageChannel();
-    const hostPort = ch.port2;
-    hostPort.addEventListener('message', async (ev) => {
-      const msg = ev && ev.data;
-      if (!msg || msg.messageType !== 'request') return;
-      try {
-        let result;
-        if (msg.type === 'PING') {
-          result = 'pong';
-        } else if (msg.type === 'PHOTO_FS') {
-          result = await executePhotoFs(msg.params && msg.params.payload);
-        } else if (msg.type === 'RESIZE') {
-          result = await executeResizeTask(msg.params && msg.params.payload);
-        } else {
-          throw new Error('Unsupported utility-process-media task: ' + String(msg.type));
-        }
-        const xfer = result instanceof ArrayBuffer ? [result] : [];
-        hostPort.postMessage({
-          id: msg.id,
-          type: msg.type,
-          connectionId: msg.connectionId,
-          params: msg.params,
-          checkpoint: msg.checkpoint,
-          messageType: 'response',
-          result,
-          priority: msg.priority,
-          addToFront: msg.addToFront,
-        }, xfer);
-      } catch (err) {
-        hostPort.postMessage({
-          id: msg.id,
-          type: msg.type,
-          connectionId: msg.connectionId,
-          params: msg.params,
-          messageType: 'response',
-          error: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
-          priority: msg.priority,
-          addToFront: msg.addToFront,
-        });
-      }
-    });
-    hostPort.start();
-    return ch.port1;
-  };
 
   const eachExport = (req, visit) => {
     for (const [id, mod] of Object.entries((req && req.c) || {})) {
@@ -1513,10 +2026,10 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
       setTimeout(() => clearInterval(t), 60000);
     }
 
-    // Wire in-renderer `PhotoFs` + `utility-process-media` `MessageChannel` port responder
+    // Fast-path `PhotoFs.prototype.run` in-renderer (`utility-process-media` `ZMessagePort`
+    // is already handled at `document-start` via `$zMsgChannel` / `$zsub.$zMsgChannel`).
     const patchMediaUtility = () => {
       let hookedPhotoFs = false;
-      let hookedChannelMgr = false;
       for (const reg of diRegistrations(req)) {
         for (const c of [reg.instance, reg.provider && reg.provider.useClass, reg.provider]) {
           const proto = typeof c === 'function' ? c.prototype : (c && typeof c === 'object' ? Object.getPrototypeOf(c) : null);
@@ -1530,24 +2043,9 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
             }
             hookedPhotoFs = true;
           }
-          if (typeof proto.requestOpenChannelTo === 'function') {
-            if (!proto.requestOpenChannelTo.__olazMediaPort) {
-              const origOpen = proto.requestOpenChannelTo;
-              const wrappedOpen = function (scriptName, channelId, ...rest) {
-                if (scriptName === 'utility-process-media') {
-                  diag('media: opened in-renderer MessagePort for ' + String(channelId));
-                  return Promise.resolve(createUtilityMediaPort());
-                }
-                return origOpen.call(this, scriptName, channelId, ...rest);
-              };
-              wrappedOpen.__olazMediaPort = true;
-              proto.requestOpenChannelTo = wrappedOpen;
-            }
-            hookedChannelMgr = true;
-          }
         }
       }
-      return hookedPhotoFs && hookedChannelMgr;
+      return hookedPhotoFs;
     };
     if (!patchMediaUtility()) {
       const t = setInterval(() => { if (patchMediaUtility()) clearInterval(t); }, 100);
@@ -1555,6 +2053,15 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     }
 
     if (page !== 'index.html') return true;
+
+    // One-shot migration if user previously toggled Zalo's startup switch ON in localStorage
+    try {
+      const ls = window.localStorage;
+      const legacyLaunch = ls && (ls.getItem('sh_ud_launch') === 'true' || ls.getItem('ud_launch') === 'true');
+      if (legacyLaunch && window.$zconfig && typeof window.$zconfig.migrateLegacyAutoLaunch === 'function') {
+        window.$zconfig.migrateLegacyAutoLaunch(true).catch(() => {});
+      }
+    } catch {}
 
     // Attach Redux store once for user identity & window transition notification (event-driven, no polling)
     const attachStore = () => {
@@ -1771,11 +2278,85 @@ pub fn patch_asar_bundle(path: &str, bytes: &[u8]) -> Option<Vec<u8>> {
         return step1;
     }
 
+    if rel.ends_with(".html") {
+        return patch_zalo_html_csp(bytes);
+    }
+
     if rel.ends_with(".js") && (!rel.contains('/') || rel.starts_with("lazy/")) {
         return patch_zalo_linux_renderer_bundle(bytes);
     }
 
     None
+}
+
+static HTML_CSP_META_DQ_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?i)(<meta\s+[^>]*http-equiv\s*=\s*["']Content-Security-Policy["'][^>]*content\s*=\s*")([^"]+)(")"#,
+    )
+    .expect("valid double-quoted HTML CSP meta regex")
+});
+
+static HTML_CSP_META_SQ_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?i)(<meta\s+[^>]*http-equiv\s*=\s*["']Content-Security-Policy["'][^>]*content\s*=\s*')([^']+)(')"#,
+    )
+    .expect("valid single-quoted HTML CSP meta regex")
+});
+
+fn rewrite_csp_directives(raw_csp: &str) -> String {
+    let mut directives = Vec::new();
+    for part in raw_csp.split(';') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case("upgrade-insecure-requests") {
+            continue;
+        }
+        let mut dir = trimmed.to_string();
+        let dir_name = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(dir_name.as_str(), "media-src" | "img-src" | "connect-src") {
+            if !dir.contains("http://127.0.0.1:*") {
+                dir.push_str(" http://127.0.0.1:*");
+            }
+            if !dir.contains("zfile:") {
+                dir.push_str(" zfile:");
+            }
+            if dir_name == "connect-src" && !dir.contains("data:") {
+                dir.push_str(" data:");
+            }
+        }
+        directives.push(dir);
+    }
+    directives.join("; ")
+}
+
+/// Rewrites `<meta http-equiv="Content-Security-Policy" ...>` in `pc-dist/*.html` so
+/// loopback HTTP 206 media range URLs (`http://127.0.0.1:<port>/...`) are not upgraded to
+/// `https://127.0.0.1:<port>/...` by `upgrade-insecure-requests;` and are permitted in
+/// `media-src`, `img-src`, and `connect-src`.
+pub fn patch_zalo_html_csp(bytes: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    if !text.to_ascii_lowercase().contains("content-security-policy") {
+        return None;
+    }
+
+    let step1 = HTML_CSP_META_DQ_RE.replace_all(text, |caps: &regex::Captures<'_>| {
+        format!("{}{}{}", &caps[1], rewrite_csp_directives(&caps[2]), &caps[3])
+    });
+    let step2 = HTML_CSP_META_SQ_RE.replace_all(&step1, |caps: &regex::Captures<'_>| {
+        format!("{}{}{}", &caps[1], rewrite_csp_directives(&caps[2]), &caps[3])
+    });
+
+    if step2.as_ref() == text {
+        None
+    } else {
+        Some(step2.into_owned().into_bytes())
+    }
 }
 
 const WIN32_TITLEBAR_CONTROLS_TEMPLATE: &str = r#"r.a.createElement("div",{className:"titlebar__btns"+(this.state.isMaximized?" is-maximized":""),style:t},this.props.isPopupWindow||!this.props.status||this.props.status.isAppLock?null:r.a.createElement("i",{className:`fa fa-Lock_24_Line btn titlebar__menu__btn ${s}`,onClick:this._showAppLock.bind(this)}),r.a.createElement("i",{className:`fa fa-Minus_24_Line btn titlebar__menu__btn ${s}`,onClick:this.minimize.bind(this)}),this.props.hideMaximize?null:this.state.isMaximized?r.a.createElement("i",{className:`fa fa-Maximize_24_Line btn titlebar__menu__btn ${s}`,onClick:this.maximize.bind(this)}):r.a.createElement("i",{className:`fa fa-Minimize_24_Line btn titlebar__menu__btn ${s}`,onClick:this.maximize.bind(this)}),!this.props.hideClose&&r.a.createElement("i",{className:`fa fa-Close_24_Line btn titlebar__menu__btn ${s}`,onClick:this.quit.bind(this)}))))"#;
@@ -1897,11 +2478,39 @@ static OBSERVER_GET_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("valid IntersectionObserver getObserver regex")
 });
 
+static MAIN_CANVAS_RESIZER_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"async resizeImage\(e,\{width:t,height:n,quality:a,format:[A-Za-z_$][\w$]*\}\)\{const [A-Za-z_$][\w$]*=\{\};[A-Za-z_$][\w$]*\.promise=new Promise\(\(\(e,t\)=>\{[A-Za-z_$][\w$]*\.resolve=e,[A-Za-z_$][\w$]*\.reject=t\}\)\);try\{const [A-Za-z_$][\w$]*=await createImageBitmap\(e\);this\.canvas\.width=t,this\.canvas\.height=n,this\.ctx\.drawImage\([A-Za-z_$][\w$]*,0,0,t,n\),this\.canvas\.toBlob\(\(e=>\{this\.canvas\.width=0,this\.canvas\.height=0,this\.ctx\.clearRect\(0,0,0,0\),[A-Za-z_$][\w$]*\.close\(\),[A-Za-z_$][\w$]*\.resolve\(e\)\}\),[A-Za-z_$][\w$]*,a\)\}catch\([A-Za-z_$][\w$]*\)\{[A-Za-z_$][\w$]*\.reject\([A-Za-z_$][\w$]*\)\}return [A-Za-z_$][\w$]*\.promise\}"#,
+    )
+    .expect("valid MAIN canvas resizer local-path regex")
+});
+
 static WASM_JXL_RESIZER_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"async resizeImage\(e,\{width:t,height:n,quality:a\}\)\{const i=new ([A-Za-z_$][\w$]*),r=new FileReader;return r\.onload=async e=>\{var r;const o=null===\(r=e\.target\)\|\|void 0===r\?void 0:r\.result;try\{const e=([A-Za-z_$][\w$]*\.d)\.getWorkerByType\(([A-Za-z_$][\w$]*\.b\.NONE)\);e\.asignTask\(([A-Za-z_$][\w$]*)\.getNewId\(\),"resizeJxl"\);const r=await ([A-Za-z_$][\w$]*\.a)\.postMessageAsync\(e\.worker,([A-Za-z_$][\w$]*\.a\.JXL_DECODE),\{buffer:o,outputWidth:t,outputHeight:n,quality:a,timeout:([A-Za-z_$][\w$]*\.a\.jxl\.jxl_task_timeout)\},\[o\],\{\}\),l=new Blob\(\[r\],\{type:"image/jpeg"\}\);i\.resolve\(l\)\}catch\(e\)\{i\.reject\(e\)\}\},r\.onerror=\(\)=>i\.reject\(new ([A-Za-z_$][\w$]*)\),r\.readAsArrayBuffer\(e\),i\.promise\}"#,
+        r#"async resizeImage\(e,\{width:t,height:n,quality:a\}\)\{const [A-Za-z_$][\w$]*=new ([A-Za-z_$][\w$]*),[A-Za-z_$][\w$]*=new FileReader;return [A-Za-z_$][\w$]*\.onload=async e=>\{var [A-Za-z_$][\w$]*;const [A-Za-z_$][\w$]*=null===\([A-Za-z_$][\w$]*=e\.target\)\|\|void 0===[A-Za-z_$][\w$]*\?void 0:[A-Za-z_$][\w$]*\.result;try\{const e=([A-Za-z_$][\w$]*\.d)\.getWorkerByType\(([A-Za-z_$][\w$]*\.b\.NONE)\);e\.asignTask\(([A-Za-z_$][\w$]*)\.getNewId\(\),"resizeJxl"\);const [A-Za-z_$][\w$]*=await ([A-Za-z_$][\w$]*\.a)\.postMessageAsync\(e\.worker,([A-Za-z_$][\w$]*\.a\.JXL_DECODE),\{buffer:[A-Za-z_$][\w$]*,outputWidth:t,outputHeight:n,quality:a,timeout:([A-Za-z_$][\w$]*\.a\.jxl\.jxl_task_timeout)\},\[[A-Za-z_$][\w$]*\],\{\}\),[A-Za-z_$][\w$]*=new Blob\(\[[A-Za-z_$][\w$]*\],\{type:"image/jpeg"\}\);[A-Za-z_$][\w$]*\.resolve\([A-Za-z_$][\w$]*\)\}catch\(e\)\{[A-Za-z_$][\w$]*\.reject\(e\)\}\},[A-Za-z_$][\w$]*\.onerror=\(\)=>[A-Za-z_$][\w$]*\.reject\(new ([A-Za-z_$][\w$]*)\),[A-Za-z_$][\w$]*\.readAsArrayBuffer\(e\),[A-Za-z_$][\w$]*\.promise\}"#,
     )
     .expect("valid WASM JXL resizer local-path regex")
+});
+
+static AUTOSTART_EFFECT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"\[([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\]=Object\(([A-Za-z_$][\w$]*)\.useState\)\(([A-Za-z_$][\w$]*)\.g\.getLaunch\(\)\),(\[[A-Za-z_$][\w$]*,[A-Za-z_$][\w$]*\]=Object\([A-Za-z_$][\w$]*\.useState\)\([A-Za-z_$][\w$]*\.default\.currentLanguage\(\)\));Object\([A-Za-z_$][\w$]*\.useEffect\)\(\(\(\)=>\{\$zconfig\.checkAutoLaunchEnable\(\)\.then\(\(e=>\{[A-Za-z_$][\w$]*\.g\.setLaunch\(e\),[A-Za-z_$][\w$]*\(e\)\}\)\)\.catch\(\(\(\)=>\{\}\)\)\}\),\[\]\);"#,
+    )
+    .expect("valid autostart useEffect regex")
+});
+
+static AUTOSTART_TOGGLE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"([A-Za-z_$][\w$]*)\.a\.createElement\(([A-Za-z_$][\w$]*)\.Toggle,\{key:"isAutoLauch",stateValue:([A-Za-z_$][\w$]*),onToggle:e=>\{\$zconfig\.toggleAutoLaunch\(e\),([A-Za-z_$][\w$]*)\.g\.setLaunch\(e\),([A-Za-z_$][\w$]*)\(e\),([A-Za-z_$][\w$]*)\.default\.logAction\(e\?248010301:248010302\)\},titleTextKey:"STR_START_ZALO_WITH_OS",className:"first general no-border-bottom"\}\)"#,
+    )
+    .expect("valid autostart Toggle JSX regex")
+});
+
+static ZIMG_MOUNT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"componentDidMount\(\)\{this\._mounted=!0,this\.props\.src&&([A-Za-z_$][\w$]*)\.register\(this\.props\.src\)\}"#,
+    )
+    .expect("valid Z.d.Image componentDidMount regex")
 });
 
 /// Applies `vndangkhoa/zalo-linux` renderer patches on-the-fly without altering `getClientType() == 23`:
@@ -1912,6 +2521,7 @@ static WASM_JXL_RESIZER_RE: Lazy<Regex> = Lazy::new(|| {
 /// - Linux call support gate (`Number(e.split(".")[0])<17` + `isSupport()`)
 /// - Incoming call caller name/avatar enrichment (`e._caller`) & chat call-log outcome bubbles
 /// - WASM JXL encode/decode/resize routing + HTML `<canvas>` (`MAIN`) JPEG/PNG resizer routing
+/// - General Settings Linux autostart + "Launch minimized to system tray" toggle (`STR_OLAZ_START_IN_TRAY`)
 pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
     const FAST_NEEDLES: &[&[u8]] = &[
         b"handlerMinimiseAppWindowOS",
@@ -1932,6 +2542,8 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         b"createResizer(",
         b"this.getObserver=",
         b"\"data-z-element-type\":\"image\"",
+        b"STR_START_ZALO_WITH_OS",
+        b"isAutoLauch",
     ];
     if !FAST_NEEDLES
         .iter()
@@ -2205,13 +2817,21 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         }
     }
 
-    // 11. Support local file-path `string` inputs + `destinationPath` writes in `3Rxw` `MAIN` (`ue`)
-    //     and `LIBJXL_WASM` (`Ze`) resizers when called from `TImageRegenerator.regenImageFromLocal`.
-    const MAIN_CANVAS_RESIZER_FIND: &str = r#"async resizeImage(e,{width:t,height:n,quality:a,format:i}){const r={};r.promise=new Promise(((e,t)=>{r.resolve=e,r.reject=t}));try{const s=await createImageBitmap(e);this.canvas.width=t,this.canvas.height=n,this.ctx.drawImage(s,0,0,t,n),this.canvas.toBlob((e=>{this.canvas.width=0,this.canvas.height=0,this.ctx.clearRect(0,0,0,0),s.close(),r.resolve(e)}),i,a)}catch(s){r.reject(s)}return r.promise}"#;
-    const MAIN_CANVAS_RESIZER_REPL: &str = r#"async resizeImage(e,{width:t,height:n,quality:a,format:i,destinationPath:_dp}){/*olaz-main-path*/const r={};r.promise=new Promise(((e,t)=>{r.resolve=e,r.reject=t}));try{const _in="string"==typeof e?new Blob([await $zFileManager.getFileArrayBuffer(e)]):e,s=await createImageBitmap(_in);this.canvas.width=t,this.canvas.height=n,this.ctx.drawImage(s,0,0,t,n),this.canvas.toBlob((async e=>{try{this.canvas.width=0,this.canvas.height=0,this.ctx.clearRect(0,0,0,0),s.close();if(!e)return r.reject(new Error("canvas.toBlob null"));if(_dp){const _dir=$znode.path.dirname(String(_dp));_dir&&await $znode.fsExtra.ensureDir(_dir),await $zFileManager.writeBufferToPath(String(_dp),new Uint8Array(await e.arrayBuffer()))}r.resolve(e)}catch(_err){r.reject(_err)}}),i,a)}catch(s){r.reject(s)}return r.promise}"#;
-    if s.contains(MAIN_CANVAS_RESIZER_FIND) {
-        s = s.replace(MAIN_CANVAS_RESIZER_FIND, MAIN_CANVAS_RESIZER_REPL);
-        changed = true;
+    // 11. Support local file-path `string` inputs + `destinationPath` writes in `3Rxw` `MAIN` (`ue`/`se`)
+    //     and `LIBJXL_WASM` (`Ge`/`je`) resizers across both `compact-app-pc.*.js` and `lazy/*.js`
+    //     when called from `TImageRegenerator.regenImageFromLocal`.
+    const MAIN_CANVAS_RESIZER_REPL: &str = r#"async resizeImage(e,{width:t,height:n,quality:a,format:_fmt,destinationPath:_dp}){/*olaz-main-path*/const _d={};_d.promise=new Promise(((e,t)=>{_d.resolve=e,_d.reject=t}));try{const _raw="string"==typeof e?await $zFileManager.getFileArrayBuffer(e):null,_in=null!==_raw?new Blob([("undefined"!=typeof window&&window.__olazDenoiseU8?window.__olazDenoiseU8(_raw):new Uint8Array(_raw))]):e,_bmp=await createImageBitmap(_in);this.canvas.width=t,this.canvas.height=n,this.ctx.drawImage(_bmp,0,0,t,n),this.canvas.toBlob((async e=>{try{this.canvas.width=0,this.canvas.height=0,this.ctx.clearRect(0,0,0,0),_bmp.close();if(!e)return _d.reject(new Error("canvas.toBlob null"));if(_dp){const _dir=$znode.path.dirname(String(_dp));_dir&&await $znode.fsExtra.ensureDir(_dir),await $zFileManager.writeBufferToPath(String(_dp),new Uint8Array(await e.arrayBuffer()))}_d.resolve(e)}catch(_err){_d.reject(_err)}}),_fmt,a)}catch(_err){_d.reject(_err)}return _d.promise}"#;
+    if !s.contains("/*olaz-main-path*/")
+        && s.contains("createImageBitmap(")
+        && MAIN_CANVAS_RESIZER_RE.is_match(&s)
+    {
+        let next = MAIN_CANVAS_RESIZER_RE
+            .replace_all(&s, regex::NoExpand(MAIN_CANVAS_RESIZER_REPL))
+            .into_owned();
+        if next != s {
+            s = next;
+            changed = true;
+        }
     }
     if !s.contains("/*olaz-wasm-jxl-path*/")
         && s.contains(r#""resizeJxl""#)
@@ -2220,7 +2840,7 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         let next = WASM_JXL_RESIZER_RE
             .replace_all(
                 &s,
-                r#"async resizeImage(e,{width:t,height:n,quality:a,destinationPath:_dp}){/*olaz-wasm-jxl-path*/const _in="string"==typeof e?new Blob([await $$zFileManager.getFileArrayBuffer(e)]):e,i=new ${1},r=new FileReader;return r.onload=async e=>{var r;const o=null===(r=e.target)||void 0===r?void 0:r.result;try{const e=${2}.getWorkerByType(${3});e.asignTask(${4}.getNewId(),"resizeJxl");const r=await ${5}.postMessageAsync(e.worker,${6},{buffer:o,outputWidth:t,outputHeight:n,quality:a,timeout:${7}},[o],{}),l=new Blob([r],{type:"image/jpeg"});if(_dp){const _dir=$$znode.path.dirname(String(_dp));_dir&&await $$znode.fsExtra.ensureDir(_dir),await $$zFileManager.writeBufferToPath(String(_dp),new Uint8Array(r))}i.resolve(l)}catch(e){i.reject(e)}},r.onerror=()=>i.reject(new ${8}),r.readAsArrayBuffer(_in),i.promise}"#,
+                r#"async resizeImage(e,{width:t,height:n,quality:a,destinationPath:_dp}){/*olaz-wasm-jxl-path*/const _raw="string"==typeof e?await $$zFileManager.getFileArrayBuffer(e):null,_in=null!==_raw?new Blob([("undefined"!=typeof window&&window.__olazDenoiseU8?window.__olazDenoiseU8(_raw):new Uint8Array(_raw))]):e,_d=new ${1},_fr=new FileReader;return _fr.onload=async e=>{var _t;const _buf=null===(_t=e.target)||void 0===_t?void 0:_t.result;try{const _w=${2}.getWorkerByType(${3});_w.asignTask(${4}.getNewId(),"resizeJxl");const _res=await ${5}.postMessageAsync(_w.worker,${6},{buffer:_buf,outputWidth:t,outputHeight:n,quality:a,timeout:${7}},[_buf],{}),_blob=new Blob([_res],{type:"image/jpeg"});if(_dp){const _dir=$$znode.path.dirname(String(_dp));_dir&&await $$znode.fsExtra.ensureDir(_dir),await $$zFileManager.writeBufferToPath(String(_dp),new Uint8Array(_res))}_d.resolve(_blob)}catch(_err){_d.reject(_err)}},_fr.onerror=()=>_d.reject(new ${8}),_fr.readAsArrayBuffer(_in),_d.promise}"#,
             )
             .into_owned();
         if next != s {
@@ -2234,7 +2854,7 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
     //     `MediaViewer` (`IMAGE_VIEWER` + `IMAGE_VIEW_SLIDER`) never stalls on dead/unmapped observers.
     const OBSERVER_OBSERVE_FIND: &str =
         r#"this.observe=e=>{this._observer&&this._observer.observe(e)}"#;
-    const OBSERVER_OBSERVE_REPL: &str = r#"this.observe=e=>{/*olaz-io-obs*/this._observer&&this._observer.observe(e),this.ctxWindow&&this.ctxWindow!==window&&e&&"function"==typeof e.onVisible&&(this.ctxWindow.setTimeout||window.setTimeout)((()=>{try{e.onVisible&&e.onVisible()}catch(_){}}),0)}"#;
+    const OBSERVER_OBSERVE_REPL: &str = r#"this.observe=e=>{/*olaz-io-obs*/this._observer&&this._observer.observe(e),((this.ctxWindow&&this.ctxWindow!==window)||(e&&e.ownerDocument&&e.ownerDocument!==window.document))&&e&&"function"==typeof e.onVisible&&((this.ctxWindow&&this.ctxWindow.setTimeout)||window.setTimeout)((()=>{try{e.onVisible&&e.onVisible()}catch(_){}}),0)}"#;
     if s.contains(OBSERVER_OBSERVE_FIND) {
         s = s.replace(OBSERVER_OBSERVE_FIND, OBSERVER_OBSERVE_REPL);
         changed = true;
@@ -2255,8 +2875,9 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         }
     }
 
-    // 13. Use `loading:"eager"` on `Z.d.Image` (`Ze`) so WebKit2GTK never defers `<img style="visibility:hidden">`
-    //     inside child `related_view` popups (`popup-viewer.html`), `"Kho lưu trữ"`, or Sticker popovers.
+    // 13. Use `loading:"eager"` on `Z.d.Image` (`Ze`) and fire `interceptOnLoad` when a cached
+    //     `zfile://`/`blob:` `<img>` in `popup-viewer.html` completed before `componentDidMount`
+    //     set `this._mounted=!0` (preventing stuck `visibility:"hidden"` + `mvr-spinner`).
     const ZIMG_LAZY_1_FIND: &str = r#"visibility:this.state.loaded?"visible":"hidden"}),loading:"lazy"}"#;
     const ZIMG_LAZY_1_REPL: &str = r#"visibility:this.state.loaded?"visible":"hidden"}),loading:"eager"}"#;
     const ZIMG_LAZY_2_FIND: &str = r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"async",loading:"lazy""#;
@@ -2268,6 +2889,60 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
     if s.contains(ZIMG_LAZY_2_FIND) {
         s = s.replace(ZIMG_LAZY_2_FIND, ZIMG_LAZY_2_REPL);
         changed = true;
+    }
+    if !s.contains("/*olaz-zimg-complete*/")
+        && s.contains("._mounted=!0,this.props.src&&")
+        && ZIMG_MOUNT_RE.is_match(&s)
+    {
+        let next = ZIMG_MOUNT_RE
+            .replace_all(
+                &s,
+                r#"componentDidMount(){/*olaz-zimg-complete*/this._mounted=!0,this.props.src&&${1}.register(this.props.src);const _el=this.imageRef&&this.imageRef.current;_el&&_el.complete&&_el.naturalWidth>0&&!this.state.loaded&&setTimeout((()=>{this._mounted&&!this.state.loaded&&this.interceptOnLoad({target:_el,currentTarget:_el})}),0)}"#,
+            )
+            .into_owned();
+        if next != s {
+            s = next;
+            changed = true;
+        }
+    }
+
+    // 14. General Settings ("Cài đặt chung") Linux autostart + "Launch minimized to system tray"
+    //     toggle (`STR_OLAZ_START_IN_TRAY`), defaulting to ON whenever "Start with system" turns ON.
+    const LANG_EN_AUTOSTART_FIND: &str = r#""STR_START_ZALO_WITH_OS":"Start Zalo on system startup""#;
+    const LANG_EN_AUTOSTART_REPL: &str = r#""STR_START_ZALO_WITH_OS":"Start Zalo on system startup","STR_OLAZ_START_IN_TRAY":"Launch minimized to system tray""#;
+    const LANG_VI_AUTOSTART_FIND: &str = r#""STR_START_ZALO_WITH_OS":"Khởi động Zalo khi mở máy""#;
+    const LANG_VI_AUTOSTART_REPL: &str = r#""STR_START_ZALO_WITH_OS":"Khởi động Zalo khi mở máy","STR_OLAZ_START_IN_TRAY":"Khởi động thu nhỏ dưới khay hệ thống""#;
+    if !s.contains("STR_OLAZ_START_IN_TRAY") {
+        if s.contains(LANG_EN_AUTOSTART_FIND) {
+            s = s.replace(LANG_EN_AUTOSTART_FIND, LANG_EN_AUTOSTART_REPL);
+            changed = true;
+        }
+        if s.contains(LANG_VI_AUTOSTART_FIND) {
+            s = s.replace(LANG_VI_AUTOSTART_FIND, LANG_VI_AUTOSTART_REPL);
+            changed = true;
+        }
+    }
+    if !s.contains("/*olaz-autostart-ui*/")
+        && s.contains("isAutoLauch")
+        && AUTOSTART_EFFECT_RE.is_match(&s)
+        && AUTOSTART_TOGGLE_RE.is_match(&s)
+    {
+        let step_fx = AUTOSTART_EFFECT_RE
+            .replace_all(
+                &s,
+                r#"[${1},${2}]=Object(${3}.useState)(${4}.g.getLaunch()),[__olazTray,__setOlazTray]=Object(${3}.useState)(!0),${5};Object(${3}.useEffect)((()=>{/*olaz-autostart-fx*/($$zconfig.getAutostartState?$$zconfig.getAutostartState():$$zconfig.checkAutoLaunchEnable().then((e=>({openAtLogin:!!e,startInTray:!0})))).then((e=>{const t=!!(e&&e.openAtLogin),n=!e||void 0===e.startInTray||!!e.startInTray;${4}.g.setLaunch(t),${2}(t),__setOlazTray(n)})).catch((()=>{}))}),[]);"#,
+            )
+            .into_owned();
+        let step_ui = AUTOSTART_TOGGLE_RE
+            .replace_all(
+                &step_fx,
+                r#"${1}.a.createElement(${2}.Toggle,{key:"isAutoLauch",stateValue:${3},onToggle:e=>{/*olaz-autostart-ui*/e&&__setOlazTray(!0),Promise.resolve($$zconfig.toggleAutoLaunch(e)).then((t=>{t&&"object"==typeof t&&"boolean"==typeof t.startInTray&&__setOlazTray(t.startInTray)})).catch((()=>{})),${4}.g.setLaunch(e),${5}(e),${6}.default.logAction(e?248010301:248010302)},titleTextKey:"STR_START_ZALO_WITH_OS",className:"first general no-border-bottom"}),${1}.a.createElement(${2}.Toggle,{key:"isStartInTray",stateValue:${3}?__olazTray:!1,disabled:!${3},onToggle:e=>{__setOlazTray(e),$$zconfig.setStartInTray&&$$zconfig.setStartInTray(e)},titleTextKey:"STR_OLAZ_START_IN_TRAY",className:${4}.g.isShowSettingRemember()?"general no-border-bottom":"last general"})"#,
+            )
+            .into_owned();
+        if step_ui != s {
+            s = step_ui;
+            changed = true;
+        }
     }
 
     if changed {

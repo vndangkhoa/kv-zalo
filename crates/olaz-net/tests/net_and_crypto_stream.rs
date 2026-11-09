@@ -1687,4 +1687,318 @@ fn serve_local_media_range_denoises_zalo_file_noise_and_sniffs_mime() {
         Some("bytes 80-140/256")
     );
     assert_eq!(part.body.as_slice(), &plain[80..=140]);
+
+    // 3. Exact portal-approved regular file in `allowed_roots` + JXL magic sniffing (`image/jxl`).
+    let portal_jxl = tmp.path().join("portal_only.bin");
+    fs::write(&portal_jxl, &[0xFF, 0x0A, 0x00, 0x10, 0x20, 0x30]).expect("write jxl");
+    let file_only_roots = vec![portal_jxl.clone()];
+    let jxl_resp = serve_local_media_range(&portal_jxl, None, &file_only_roots)
+        .expect("serve exact portal-approved file");
+    assert_eq!(jxl_resp.status, 200);
+    assert_eq!(jxl_resp.mime_type, "image/jxl");
+    assert!(
+        serve_local_media_range(&noised_path, None, &file_only_roots).is_err(),
+        "sibling file outside exact file grant must be denied"
+    );
+}
+
+#[tokio::test]
+async fn download_manager_local_copy_denoise_ennoise_duplicate_and_portal_writable_validator() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cache_dir = tmp.path().join("cache");
+    let temp_dl = tmp.path().join("temp-dl");
+    let static_save_dir = tmp.path().join("static-save");
+    let portal_save_dir = tmp.path().join("portal-pictures");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::create_dir_all(&static_save_dir).unwrap();
+    fs::create_dir_all(&portal_save_dir).unwrap();
+
+    // Start local HTTP server serving raw image bytes for `noiseDownload: true` test.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut raw_photo = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    while raw_photo.len() < 180 {
+        raw_photo.push(((raw_photo.len() * 17 + 3) & 0xFF) as u8);
+    }
+    let srv_bytes = raw_photo.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                srv_bytes.len()
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, hdr.as_bytes()).await;
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &srv_bytes).await;
+        }
+    });
+
+    let approved_target = portal_save_dir.join("exported.jpg");
+    let approved_for_validator = approved_target.clone();
+    let loader =
+        MediaLoader::new(&cache_dir, Arc::new(ZaloDnsResolver::new())).expect("MediaLoader");
+    let dm = DownloadManager::new(loader, temp_dl, Some(vec![static_save_dir.clone()]))
+        .with_writable_validator(move |p| p == approved_for_validator);
+
+    // 1. HTTP download with `options.noiseDownload: true` produces a `fileNoise`-encoded cache file.
+    let resp_noise = dm
+        .handle_message(json!({
+            "channel": "new-download-file",
+            "data": {
+                "key": "dl-noise-1",
+                "type": "PhotoNoise",
+                "data": {
+                    "url": format!("http://{addr}/photo.jpg"),
+                    "fileName": "cached_noised.jpg",
+                },
+                "options": {
+                    "saveDir": static_save_dir.to_str().unwrap(),
+                    "noiseDownload": true,
+                }
+            }
+        }))
+        .await
+        .unwrap();
+    assert!(resp_noise["data"]["downloadError"].is_null());
+    assert_eq!(resp_noise["data"]["totalSize"], (raw_photo.len() + 6) as u64);
+    let noised_src = PathBuf::from(resp_noise["data"]["savePath"].as_str().unwrap());
+    let noised_disk = fs::read(&noised_src).unwrap();
+    assert_eq!(noised_disk.len(), raw_photo.len() + 6);
+    assert_eq!(&noised_disk[raw_photo.len()..], &[0x07, 0x7a, 0x41, 0x6c, 0x4f, 0x07]);
+    assert_ne!(&noised_disk[..100], &raw_photo[..100]);
+
+    // 2. Unapproved path in `portal_save_dir` is rejected with `SAVE_DIR_INVALID` (`1012`).
+    let resp_denied = dm
+        .handle_message(json!({
+            "channel": "new-download-file",
+            "data": {
+                "key": "copy-denied",
+                "type": "PhotoCopy",
+                "data": { "url": "", "fileName": "unapproved.jpg" },
+                "options": {
+                    "srcPath": noised_src.to_str().unwrap(),
+                    "saveDir": portal_save_dir.to_str().unwrap(),
+                }
+            }
+        }))
+        .await
+        .unwrap();
+    assert_eq!(resp_denied["data"]["downloadError"]["code"], 1012);
+
+    // 3. `PhotoCopy` from `noised_src` (with empty `data.url`) to portal-approved `exported.jpg`
+    //    succeeds AND strips `fileNoise` so the user receives clean JPEG bytes!
+    let resp_copy = dm
+        .handle_message(json!({
+            "channel": "new-download-file",
+            "data": {
+                "key": "copy-portal-ok",
+                "type": "PhotoCopy",
+                "data": { "url": "", "fileName": "exported.jpg" },
+                "options": {
+                    "srcPath": noised_src.to_str().unwrap(),
+                    "saveDir": portal_save_dir.to_str().unwrap(),
+                }
+            }
+        }))
+        .await
+        .unwrap();
+    assert!(resp_copy["data"]["downloadError"].is_null());
+    assert_eq!(
+        PathBuf::from(resp_copy["data"]["savePath"].as_str().unwrap()),
+        approved_target
+    );
+    assert_eq!(fs::read(&approved_target).unwrap(), raw_photo);
+
+    // 4. `options.duplicate: true` deduplicates to `exported (1).jpg` while honoring the original
+    //    portal grant on `exported.jpg`.
+    let resp_dup = dm
+        .handle_message(json!({
+            "channel": "new-download-file",
+            "data": {
+                "key": "copy-portal-dup",
+                "type": "PhotoCopy",
+                "data": { "url": "", "fileName": "exported.jpg" },
+                "options": {
+                    "srcPath": noised_src.to_str().unwrap(),
+                    "saveDir": portal_save_dir.to_str().unwrap(),
+                    "duplicate": true,
+                }
+            }
+        }))
+        .await
+        .unwrap();
+    assert!(resp_dup["data"]["downloadError"].is_null());
+    let dup_target = portal_save_dir.join("exported (1).jpg");
+    assert_eq!(
+        PathBuf::from(resp_dup["data"]["savePath"].as_str().unwrap()),
+        dup_target
+    );
+    assert_eq!(fs::read(&dup_target).unwrap(), raw_photo);
+}
+
+#[tokio::test]
+async fn open_local_media_range_head_streaming_and_download_manager_save_authorizer_src_path_and_noise() {
+    use olaz_net::open_local_media_range;
+    use parking_lot::RwLock;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let cache_root = tmp.path().join("cache");
+    let static_dl_root = tmp.path().join("Downloads");
+    let custom_videos_dir = tmp.path().join("CustomVideos");
+    fs::create_dir_all(&cache_root).unwrap();
+    fs::create_dir_all(&static_dl_root).unwrap();
+    fs::create_dir_all(&custom_videos_dir).unwrap();
+
+    // 1. Streaming `open_local_media_range` (`HEAD` without body + chunked `Read` across `fileNoise` XOR boundary).
+    let mut mp4_plain = vec![0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm'];
+    while mp4_plain.len() < 300 {
+        mp4_plain.push(((mp4_plain.len() * 17 + 3) & 0xff) as u8);
+    }
+    let noised_cache_mp4 = cache_root.join("cached_video_noise");
+    olaz_core::copy_with_noise_mode(
+        &{
+            let p = cache_root.join("raw_src.mp4");
+            fs::write(&p, &mp4_plain).unwrap();
+            p
+        },
+        &noised_cache_mp4,
+        true,
+        "",
+    )
+    .unwrap();
+
+    let allowed = vec![cache_root.clone()];
+    let head = open_local_media_range(&noised_cache_mp4, None, &allowed, false).unwrap();
+    assert_eq!(head.status, 200);
+    assert_eq!(head.mime_type, "video/mp4");
+    assert_eq!(head.content_length, 300);
+    assert!(head.reader.is_none(), "HEAD must not open body reader");
+
+    let mut ranged =
+        open_local_media_range(&noised_cache_mp4, Some("bytes=70-150"), &allowed, true).unwrap();
+    assert_eq!(ranged.status, 206);
+    assert_eq!(ranged.content_length, 81);
+    let mut streamed = Vec::new();
+    let mut tiny = [0u8; 13];
+    let reader = ranged.reader.as_mut().unwrap();
+    loop {
+        let n = reader.read(&mut tiny).unwrap();
+        if n == 0 {
+            break;
+        }
+        streamed.extend_from_slice(&tiny[..n]);
+    }
+    assert_eq!(streamed.as_slice(), &mp4_plain[70..=150]);
+
+    // 2. `DownloadManager`: dynamic `save_authorizer`, `options.srcPath` (`VideoCopy` with empty URL,
+    //    auto-denoising `fileNoise` cache source), and `options.noiseDownload = true` (`FileOneOneNoise`).
+    let approved_save_dirs: Arc<RwLock<Vec<PathBuf>>> = Arc::new(RwLock::new(Vec::new()));
+    let loader = MediaLoader::new(
+        &tmp.path().join("net_cache"),
+        Arc::new(ZaloDnsResolver::new()),
+    )
+    .unwrap();
+    let mgr = DownloadManager::new(
+        loader,
+        tmp.path().join("dl_tmp"),
+        Some(vec![static_dl_root.clone()]),
+    )
+    .with_save_authorizer({
+        let approved = Arc::clone(&approved_save_dirs);
+        move |p| approved.read().iter().any(|dir| p.starts_with(dir))
+    })
+    .with_read_authorizer({
+        let cr = cache_root.clone();
+        move |p| p.starts_with(&cr)
+    });
+
+    // Before portal approval, saving to `custom_videos_dir` is rejected (`1012` = `save_dir_invalid`).
+    let denied = mgr
+        .handle_message(serde_json::json!({
+            "channel": "new-download-file",
+            "data": {
+                "key": "vid-1",
+                "type": "VideoCopy",
+                "data": { "url": "", "fileName": "saved_clip.mp4" },
+                "options": {
+                    "saveDir": custom_videos_dir.to_str().unwrap(),
+                    "srcPath": noised_cache_mp4.to_str().unwrap(),
+                    "srcAction": "Manual",
+                }
+            }
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        denied["data"]["downloadError"]["code"],
+        DownloadFailure::save_dir_invalid().code
+    );
+
+    // Grant `custom_videos_dir` (simulating user picking `~/Videos/saved_clip.mp4` in Save-As dialog).
+    approved_save_dirs.write().push(custom_videos_dir.clone());
+    let copied = mgr
+        .handle_message(serde_json::json!({
+            "channel": "new-download-file",
+            "data": {
+                "key": "vid-2",
+                "type": "VideoCopy",
+                "data": { "url": "", "fileName": "saved_clip.mp4" },
+                "options": {
+                    "saveDir": custom_videos_dir.to_str().unwrap(),
+                    "srcPath": noised_cache_mp4.to_str().unwrap(),
+                    "srcAction": "Manual",
+                }
+            }
+        }))
+        .await
+        .unwrap();
+    assert!(copied["data"]["downloadError"].is_null(), "got {copied}");
+    let saved_video_path = custom_videos_dir.join("saved_clip.mp4");
+    assert_eq!(
+        fs::read(&saved_video_path).unwrap(),
+        mp4_plain,
+        "VideoCopy from fileNoise cache must produce clean playable MP4 bytes"
+    );
+
+    // `FileOneOneNoise` (`noiseDownload: true`) writes `fileNoise` obfuscated output.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body_src = mp4_plain.clone();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = listener.accept().await {
+            let mut req = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut s, &mut req).await;
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body_src.len()
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut s, hdr.as_bytes()).await;
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut s, &body_src).await;
+        }
+    });
+
+    let noised_dl = mgr
+        .handle_message(serde_json::json!({
+            "channel": "new-download-file",
+            "data": {
+                "key": "noise-1",
+                "type": "FileOneOneNoise",
+                "data": {
+                    "url": format!("http://{addr}/clip.mp4"),
+                    "fileName": "cache_entry_noise"
+                },
+                "options": {
+                    "saveDir": static_dl_root.to_str().unwrap(),
+                    "noiseDownload": true,
+                }
+            }
+        }))
+        .await
+        .unwrap();
+    assert!(noised_dl["data"]["downloadError"].is_null(), "got {noised_dl}");
+    let noised_out = fs::read(static_dl_root.join("cache_entry_noise")).unwrap();
+    assert_eq!(noised_out.len(), mp4_plain.len() + 6);
+    assert!(noised_out.ends_with(b"\x07zAlO\x07"));
+    assert_eq!(noised_out[0], mp4_plain[0] ^ 0x93);
 }

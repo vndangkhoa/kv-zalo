@@ -815,6 +815,11 @@ pub fn sniff_media_mime(bytes: &[u8], fallback_path: &Path) -> &'static str {
     if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
         return "image/gif";
     }
+    if bytes.starts_with(&[0xFF, 0x0A])
+        || bytes.starts_with(b"\x00\x00\x00\x0cJXL \x0d\x0a\x87\x0a")
+    {
+        return "image/jxl";
+    }
     if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" {
         if &bytes[8..12] == b"WEBP" {
             return "image/webp";
@@ -884,14 +889,64 @@ pub struct MediaRangeResponse {
     pub body: Vec<u8>,
 }
 
-/// Serves a local media file strictly confined within `allowed_roots`, supporting HTTP `200 OK`
-/// and `206 Partial Content` (`Content-Range: bytes start-end/total`, `Accept-Ranges: bytes`)
-/// for smooth HTML5 `<video>` and `<audio>` scrubbing.
-pub fn serve_local_media_range(
+/// Streaming reader over a confined local media file byte range, transparently removing
+/// Zalo's `fileNoise` `0x93` header XOR (`0..100`) and 6-byte EOF signature without buffering
+/// the entire file into memory.
+#[derive(Debug)]
+pub struct LocalMediaRangeReader {
+    file: File,
+    pos: u64,
+    remaining: u64,
+    has_noise: bool,
+}
+
+impl Read for LocalMediaRangeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let max_to_read = (self.remaining as usize).min(buf.len());
+        let n = self.file.read(&mut buf[..max_to_read])?;
+        if n == 0 {
+            self.remaining = 0;
+            return Ok(0);
+        }
+        const ZALO_NOISE_XOR_LEN: u64 = 100;
+        const ZALO_NOISE_XOR_KEY: u8 = 0x93;
+        if self.has_noise && self.pos < ZALO_NOISE_XOR_LEN {
+            let xor_end = ((ZALO_NOISE_XOR_LEN - self.pos) as usize).min(n);
+            for b in &mut buf[..xor_end] {
+                *b ^= ZALO_NOISE_XOR_KEY;
+            }
+        }
+        self.pos += n as u64;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Streaming HTTP `200` / `206` / `416` response descriptor returned by [`open_local_media_range`].
+#[derive(Debug)]
+pub struct LocalMediaStream {
+    pub status: u16,
+    pub status_text: &'static str,
+    pub mime_type: &'static str,
+    pub content_length: u64,
+    pub total_length: u64,
+    pub content_range: Option<String>,
+    pub accept_ranges: &'static str,
+    pub headers: HashMap<String, String>,
+    pub reader: Option<LocalMediaRangeReader>,
+}
+
+/// Opens a confined local media file for streaming HTTP `200 OK`, `206 Partial Content`,
+/// or `HEAD` (`include_body = false`) without buffering the full file in memory.
+pub fn open_local_media_range(
     path: &Path,
     range_header: Option<&str>,
     allowed_roots: &[PathBuf],
-) -> Result<MediaRangeResponse> {
+    include_body: bool,
+) -> Result<LocalMediaStream> {
     if allowed_roots.is_empty() {
         bail!("access denied: no allowed media roots configured");
     }
@@ -905,11 +960,13 @@ pub fn serve_local_media_range(
         .with_context(|| format!("failed to resolve media path {}", path.display()))?;
 
     let is_confined = allowed_roots.iter().any(|root| {
-        fs::canonicalize(root)
-            .ok()
-            .is_some_and(|canon_root| {
+        fs::canonicalize(root).ok().is_some_and(|canon_root| {
+            if canon_root.is_file() {
+                canonical_target == canon_root
+            } else {
                 canonical_target != canon_root && canonical_target.starts_with(&canon_root)
-            })
+            }
+        })
     });
 
     if !is_confined {
@@ -948,14 +1005,6 @@ pub fn serve_local_media_range(
     } else {
         raw_len
     };
-    let denoise_slice = |offset: u64, buf: &mut [u8]| {
-        if has_noise && offset < ZALO_NOISE_XOR_LEN && !buf.is_empty() {
-            let xor_end = ((ZALO_NOISE_XOR_LEN - offset) as usize).min(buf.len());
-            for b in &mut buf[..xor_end] {
-                *b ^= ZALO_NOISE_XOR_KEY;
-            }
-        }
-    };
 
     // Sniff magic bytes from first 64 logical bytes without reading the entire file into memory.
     file.seek(SeekFrom::Start(0))?;
@@ -966,22 +1015,31 @@ pub fn serve_local_media_range(
     } else {
         0
     };
-    denoise_slice(0, &mut magic_buf[..magic_read]);
+    if has_noise && magic_read > 0 {
+        let xor_end = (ZALO_NOISE_XOR_LEN as usize).min(magic_read);
+        for b in &mut magic_buf[..xor_end] {
+            *b ^= ZALO_NOISE_XOR_KEY;
+        }
+    }
     let mime_type = sniff_media_mime(&magic_buf[..magic_read], &canonical_target);
 
-    let trimmed_range = range_header.map(str::trim).filter(|s| !s.is_empty());
-    let Some(range_raw) = trimmed_range else {
-        file.seek(SeekFrom::Start(0))?;
-        let mut body = Vec::with_capacity(total_len as usize);
-        (&mut file).take(total_len).read_to_end(&mut body)?;
-        denoise_slice(0, &mut body);
-
+    let build_full_200 = |mut f: File| -> Result<LocalMediaStream> {
+        let reader = if include_body && total_len > 0 {
+            f.seek(SeekFrom::Start(0))?;
+            Some(LocalMediaRangeReader {
+                file: f,
+                pos: 0,
+                remaining: total_len,
+                has_noise,
+            })
+        } else {
+            None
+        };
         let mut headers = HashMap::new();
         headers.insert("Content-Type".to_owned(), mime_type.to_owned());
         headers.insert("Content-Length".to_owned(), total_len.to_string());
         headers.insert("Accept-Ranges".to_owned(), "bytes".to_owned());
-
-        return Ok(MediaRangeResponse {
+        Ok(LocalMediaStream {
             status: 200,
             status_text: "OK",
             mime_type,
@@ -990,8 +1048,13 @@ pub fn serve_local_media_range(
             content_range: None,
             accept_ranges: "bytes",
             headers,
-            body,
-        });
+            reader,
+        })
+    };
+
+    let trimmed_range = range_header.map(str::trim).filter(|s| !s.is_empty());
+    let Some(range_raw) = trimmed_range else {
+        return build_full_200(file);
     };
 
     // Per RFC 9110 §14.2: ignore unknown range units and return 200 OK.
@@ -999,27 +1062,7 @@ pub fn serve_local_media_range(
         .strip_prefix("bytes=")
         .or_else(|| range_raw.strip_prefix("BYTES="))
     else {
-        file.seek(SeekFrom::Start(0))?;
-        let mut body = Vec::with_capacity(total_len as usize);
-        (&mut file).take(total_len).read_to_end(&mut body)?;
-        denoise_slice(0, &mut body);
-
-        let mut headers = HashMap::new();
-        headers.insert("Content-Type".to_owned(), mime_type.to_owned());
-        headers.insert("Content-Length".to_owned(), total_len.to_string());
-        headers.insert("Accept-Ranges".to_owned(), "bytes".to_owned());
-
-        return Ok(MediaRangeResponse {
-            status: 200,
-            status_text: "OK",
-            mime_type,
-            content_length: total_len,
-            total_length: total_len,
-            content_range: None,
-            accept_ranges: "bytes",
-            headers,
-            body,
-        });
+        return build_full_200(file);
     };
 
     let first_range = spec_part.split(',').next().unwrap_or("").trim();
@@ -1031,7 +1074,7 @@ pub fn serve_local_media_range(
         headers.insert("Accept-Ranges".to_owned(), "bytes".to_owned());
         headers.insert("Content-Range".to_owned(), unsatisfied.clone());
 
-        return Ok(MediaRangeResponse {
+        return Ok(LocalMediaStream {
             status: 416,
             status_text: "Range Not Satisfiable",
             mime_type,
@@ -1040,15 +1083,22 @@ pub fn serve_local_media_range(
             content_range: Some(unsatisfied),
             accept_ranges: "bytes",
             headers,
-            body: Vec::new(),
+            reader: None,
         });
     };
 
     let slice_len = end - start + 1;
-    file.seek(SeekFrom::Start(start))?;
-    let mut body = vec![0u8; slice_len as usize];
-    file.read_exact(&mut body)?;
-    denoise_slice(start, &mut body);
+    let reader = if include_body && slice_len > 0 {
+        file.seek(SeekFrom::Start(start))?;
+        Some(LocalMediaRangeReader {
+            file,
+            pos: start,
+            remaining: slice_len,
+            has_noise,
+        })
+    } else {
+        None
+    };
 
     let content_range = format!("bytes {start}-{end}/{total_len}");
     let mut headers = HashMap::new();
@@ -1057,7 +1107,7 @@ pub fn serve_local_media_range(
     headers.insert("Accept-Ranges".to_owned(), "bytes".to_owned());
     headers.insert("Content-Range".to_owned(), content_range.clone());
 
-    Ok(MediaRangeResponse {
+    Ok(LocalMediaStream {
         status: 206,
         status_text: "Partial Content",
         mime_type,
@@ -1066,6 +1116,32 @@ pub fn serve_local_media_range(
         content_range: Some(content_range),
         accept_ranges: "bytes",
         headers,
+        reader,
+    })
+}
+
+/// Serves a local media file strictly confined within `allowed_roots`, supporting HTTP `200 OK`
+/// and `206 Partial Content` (`Content-Range: bytes start-end/total`, `Accept-Ranges: bytes`)
+/// for smooth HTML5 `<video>` and `<audio>` scrubbing.
+pub fn serve_local_media_range(
+    path: &Path,
+    range_header: Option<&str>,
+    allowed_roots: &[PathBuf],
+) -> Result<MediaRangeResponse> {
+    let mut stream = open_local_media_range(path, range_header, allowed_roots, true)?;
+    let mut body = Vec::with_capacity(stream.content_length as usize);
+    if let Some(ref mut reader) = stream.reader {
+        reader.read_to_end(&mut body)?;
+    }
+    Ok(MediaRangeResponse {
+        status: stream.status,
+        status_text: stream.status_text,
+        mime_type: stream.mime_type,
+        content_length: stream.content_length,
+        total_length: stream.total_length,
+        content_range: stream.content_range,
+        accept_ranges: stream.accept_ranges,
+        headers: stream.headers,
         body,
     })
 }

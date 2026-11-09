@@ -759,12 +759,42 @@ pub fn has_gstreamer_audio_sink() -> bool {
     false
 }
 
+/// Pure decision helper computing GStreamer video-sink overrides when WebKit2GTK runs
+/// with DMABUF or accelerated compositing disabled (`WEBKIT_DISABLE_DMABUF_RENDERER=1` /
+/// `WEBKIT_DISABLE_COMPOSITING_MODE=1`), forcing software `webkitvideosink` instead of
+/// EGL/GBM `webkitglvideosink` so `<video>` never renders black GL textures.
+pub fn compute_linux_gst_video_sink_overrides(
+    effective_disable_dmabuf: Option<&OsStr>,
+    effective_disable_compositing: Option<&OsStr>,
+    gst_disable_gl_sink: Option<&OsStr>,
+    gst_dmabuf_sink_disabled: Option<&OsStr>,
+) -> Vec<(&'static str, &'static str)> {
+    let is_truthy = |v: Option<&OsStr>| {
+        v.is_some_and(|s| {
+            let t = s.to_string_lossy();
+            let trimmed = t.trim();
+            !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
+        })
+    };
+    let mut out = Vec::new();
+    if is_truthy(effective_disable_dmabuf) || is_truthy(effective_disable_compositing) {
+        if gst_dmabuf_sink_disabled.is_none() {
+            out.push(("WEBKIT_GST_DMABUF_SINK_DISABLED", "1"));
+        }
+        if gst_disable_gl_sink.is_none() {
+            out.push(("WEBKIT_GST_DISABLE_GL_SINK", "1"));
+        }
+    }
+    out
+}
+
 /// Safely configures WebKit2GTK / GDK / GStreamer environment variables at process startup (before GTK init):
 /// - Stages `libgstolazauto.so` into `<XDG_CACHE_HOME>/olaz/gst-plugins` and prepends it to `GST_PLUGIN_PATH_1_0`.
 /// - Sets `WEBKIT_GST_ALLOWED_URI_PROTOCOLS=olaz-media,zfile,zalo-app` if unset so WebKit routes custom media schemes.
 /// - Sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` if unset when running under Wayland.
 /// - Sets `WEBKIT_DISABLE_COMPOSITING_MODE=1` if unset when running under Wayland with NVIDIA drivers
 ///   (`/sys/module/nvidia_drm` or `/proc/driver/nvidia/version`).
+/// - Sets `WEBKIT_GST_DMABUF_SINK_DISABLED=1` and `WEBKIT_GST_DISABLE_GL_SINK=1` if unset when DMABUF/compositing is disabled.
 /// - Sets `GDK_BACKEND=wayland,x11` if `GDK_BACKEND` is unset.
 pub fn configure_linux_webview_env() {
     if let Some(gst_dir) = ensure_olaz_gst_plugin_staged() {
@@ -806,6 +836,20 @@ pub fn configure_linux_webview_env() {
     ) {
         tracing::info!("setting {key}={value} for Linux WebKit2GTK compatibility");
         // Called once at early single-threaded startup prior to GTK/WebKit initialization.
+        std::env::set_var(key, value);
+    }
+
+    let eff_dmabuf = std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER");
+    let eff_compositing = std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE");
+    let gst_gl = std::env::var_os("WEBKIT_GST_DISABLE_GL_SINK");
+    let gst_dmabuf = std::env::var_os("WEBKIT_GST_DMABUF_SINK_DISABLED");
+    for (key, value) in compute_linux_gst_video_sink_overrides(
+        eff_dmabuf.as_deref(),
+        eff_compositing.as_deref(),
+        gst_gl.as_deref(),
+        gst_dmabuf.as_deref(),
+    ) {
+        tracing::info!("setting {key}={value} for Linux WebKit2GTK GStreamer software sink");
         std::env::set_var(key, value);
     }
 }

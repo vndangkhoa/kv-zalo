@@ -23,8 +23,10 @@
 #endif
 
 #include <dlfcn.h>
+#include <math.h>
 #include <gst/gst.h>
 #include <gst/base/gstadapter.h>
+#include <gst/base/gstbasetransform.h>
 #include <gst/audio/audio.h>
 #include <gst/audio/streamvolume.h>
 #include <gst/video/video.h>
@@ -1089,6 +1091,8 @@ olaz_build_custom_protocols_once (gpointer unused)
   (void) unused;
   GPtrArray *arr = g_ptr_array_new ();
   g_ptr_array_add (arr, g_strdup ("olaz-media"));
+  g_ptr_array_add (arr, g_strdup ("zfile"));
+  g_ptr_array_add (arr, g_strdup ("zalo-app"));
 
   const char *allowed_env = g_getenv ("WEBKIT_GST_ALLOWED_URI_PROTOCOLS");
   if (allowed_env != NULL && allowed_env[0] != '\0') {
@@ -1116,6 +1120,34 @@ olaz_build_custom_protocols_once (gpointer unused)
 
   g_ptr_array_add (arr, NULL);
   return g_ptr_array_free (arr, FALSE);
+}
+
+static char *
+olaz_rewrite_custom_scheme_uri (const char *uri)
+{
+  if (uri == NULL)
+    return NULL;
+  const char *proxy_base = g_getenv ("OLAZ_GST_MEDIA_PROXY_BASE");
+  const char *sep = strstr (uri, "://");
+  if (proxy_base != NULL && proxy_base[0] != '\0' && sep != NULL && sep > uri) {
+    char *scheme = g_strndup (uri, (gsize) (sep - uri));
+    char *scheme_lower = g_ascii_strdown (scheme, -1);
+    g_free (scheme);
+
+    if (!olaz_is_builtin_webkit_scheme (scheme_lower)) {
+      const char *rest = sep + 3;
+      gsize base_len = strlen (proxy_base);
+      while (base_len > 0 && proxy_base[base_len - 1] == '/')
+        base_len--;
+      char *trimmed_base = g_strndup (proxy_base, base_len);
+      char *rewritten = g_strdup_printf ("%s/%s/%s", trimmed_base, scheme_lower, rest);
+      g_free (trimmed_base);
+      g_free (scheme_lower);
+      return rewritten;
+    }
+    g_free (scheme_lower);
+  }
+  return g_strdup (uri);
 }
 
 static GstURIType
@@ -1164,31 +1196,10 @@ olaz_webkit_media_src_set_uri (GstURIHandler *handler, const gchar *uri, GError 
     return olaz_webkit_parent_uri_iface->set_uri (handler, NULL, error);
   }
 
-  const char *proxy_base = g_getenv ("OLAZ_GST_MEDIA_PROXY_BASE");
-  const char *sep = strstr (uri, "://");
-  if (proxy_base != NULL && proxy_base[0] != '\0' && sep != NULL && sep > uri) {
-    char *scheme = g_strndup (uri, (gsize) (sep - uri));
-    char *scheme_lower = g_ascii_strdown (scheme, -1);
-    g_free (scheme);
-
-    if (!olaz_is_builtin_webkit_scheme (scheme_lower)) {
-      const char *rest = sep + 3;
-      gsize base_len = strlen (proxy_base);
-      while (base_len > 0 && proxy_base[base_len - 1] == '/')
-        base_len--;
-      char *trimmed_base = g_strndup (proxy_base, base_len);
-      char *rewritten = g_strdup_printf ("%s/%s/%s", trimmed_base, scheme_lower, rest);
-      g_free (trimmed_base);
-      g_free (scheme_lower);
-
-      gboolean ok = olaz_webkit_parent_uri_iface->set_uri (handler, rewritten, error);
-      g_free (rewritten);
-      return ok;
-    }
-    g_free (scheme_lower);
-  }
-
-  return olaz_webkit_parent_uri_iface->set_uri (handler, uri, error);
+  char *rewritten = olaz_rewrite_custom_scheme_uri (uri);
+  gboolean ok = olaz_webkit_parent_uri_iface->set_uri (handler, rewritten, error);
+  g_free (rewritten);
+  return ok;
 }
 
 static void
@@ -1219,7 +1230,7 @@ olaz_webkit_media_src_class_init (gpointer g_class, gpointer class_data)
   gst_element_class_set_static_metadata (element_class,
       "Olaz WebKit Custom Scheme Source",
       "Source/Network",
-      "Routes custom WebKit URI schemes (olaz-media://) through WebKitWebSrc",
+      "Routes custom WebKit URI schemes (olaz-media://, zfile://) through WebKitWebSrc",
       "Olaz Contributors");
   if (gst_element_class_get_pad_template (element_class, "src") == NULL) {
     gst_element_class_add_static_pad_template (element_class, &olaz_media_src_pad_template);
@@ -1229,9 +1240,11 @@ olaz_webkit_media_src_class_init (gpointer g_class, gpointer class_data)
 static GType
 olaz_webkit_media_src_get_or_register_subclass (void)
 {
-  static gsize registered_type = 0;
-  if (g_once_init_enter (&registered_type)) {
-    GType result = 0;
+  static GMutex reg_lock;
+  static GType registered_type = 0;
+
+  g_mutex_lock (&reg_lock);
+  if (registered_type == 0) {
     GstElementFactory *wf = gst_element_factory_find ("webkitwebsrc");
     if (wf != NULL) {
       GstPluginFeature *loaded = gst_plugin_feature_load (GST_PLUGIN_FEATURE (wf));
@@ -1247,22 +1260,122 @@ olaz_webkit_media_src_get_or_register_subclass (void)
             info.class_init = olaz_webkit_media_src_class_init;
             info.instance_size = (guint16) query.instance_size;
 
-            result = g_type_register_static (parent_type, "OlazWebKitMediaSrc", &info, 0);
+            registered_type = g_type_register_static (parent_type, "OlazWebKitMediaSrc", &info, 0);
             static const GInterfaceInfo uri_info = {
               olaz_webkit_media_src_uri_handler_init,
               NULL,
               NULL,
             };
-            g_type_add_interface_static (result, GST_TYPE_URI_HANDLER, &uri_info);
+            g_type_add_interface_static (registered_type, GST_TYPE_URI_HANDLER, &uri_info);
           }
         }
         gst_object_unref (loaded);
       }
       gst_object_unref (wf);
     }
-    g_once_init_leave (&registered_type, (gsize) result);
   }
-  return (GType) registered_type;
+  GType out = registered_type;
+  g_mutex_unlock (&reg_lock);
+  return out;
+}
+
+/* `OlazMediaSrcBin`: registered at plugin-scan time (before WebKit registers `webkitwebsrc`
+ * inside `WebCore::ensureGStreamerInitialized()`), then delegates dynamically to `webkitwebsrc`
+ * at `set_uri()` time so even the very first `zfile://` / `olaz-media://` media load succeeds! */
+typedef struct _OlazMediaSrcBin
+{
+  GstBin parent;
+  GstPad *srcpad;
+  GstElement *inner_src;
+  char *uri;
+} OlazMediaSrcBin;
+
+typedef struct _OlazMediaSrcBinClass
+{
+  GstBinClass parent_class;
+} OlazMediaSrcBinClass;
+
+static gchar *
+olaz_media_src_bin_get_uri (GstURIHandler *handler)
+{
+  OlazMediaSrcBin *self = (OlazMediaSrcBin *) handler;
+  return g_strdup (self->uri);
+}
+
+static gboolean
+olaz_media_src_bin_set_uri (GstURIHandler *handler, const gchar *uri, GError **error)
+{
+  OlazMediaSrcBin *self = (OlazMediaSrcBin *) handler;
+  olaz_ensure_dynamic_webkit_media_src ();
+
+  g_free (self->uri);
+  self->uri = g_strdup (uri);
+  if (uri == NULL)
+    return TRUE;
+
+  if (self->inner_src == NULL) {
+    GstElement *ws = gst_element_factory_make ("webkitwebsrc", "olaz-inner-webkit-src");
+    if (ws == NULL)
+      return olaz_media_src_stub_set_uri (handler, uri, error);
+    if (!gst_bin_add (GST_BIN (self), ws)) {
+      gst_object_unref (ws);
+      return olaz_media_src_stub_set_uri (handler, uri, error);
+    }
+    self->inner_src = ws;
+    GstPad *inner_pad = gst_element_get_static_pad (ws, "src");
+    if (inner_pad != NULL) {
+      gst_ghost_pad_set_target (GST_GHOST_PAD (self->srcpad), inner_pad);
+      gst_object_unref (inner_pad);
+    }
+  }
+
+  if (!GST_IS_URI_HANDLER (self->inner_src))
+    return olaz_media_src_stub_set_uri (handler, uri, error);
+
+  char *rewritten = olaz_rewrite_custom_scheme_uri (uri);
+  gboolean ok = gst_uri_handler_set_uri (GST_URI_HANDLER (self->inner_src), rewritten, error);
+  g_free (rewritten);
+  return ok;
+}
+
+static void
+olaz_media_src_bin_uri_init (gpointer g_iface, gpointer iface_data)
+{
+  (void) iface_data;
+  GstURIHandlerInterface *iface = (GstURIHandlerInterface *) g_iface;
+  iface->get_type = olaz_media_src_uri_get_type;
+  iface->get_protocols = olaz_media_src_uri_get_protocols;
+  iface->get_uri = olaz_media_src_bin_get_uri;
+  iface->set_uri = olaz_media_src_bin_set_uri;
+}
+
+static void
+olaz_media_src_bin_finalize (GObject *object)
+{
+  OlazMediaSrcBin *self = (OlazMediaSrcBin *) object;
+  g_free (self->uri);
+  self->uri = NULL;
+  GObjectClass *parent_class = G_OBJECT_CLASS (g_type_class_peek (GST_TYPE_BIN));
+  if (parent_class != NULL && parent_class->finalize != NULL)
+    parent_class->finalize (object);
+}
+
+static void
+olaz_media_src_bin_init (GTypeInstance *instance, gpointer g_class)
+{
+  (void) g_class;
+  OlazMediaSrcBin *self = (OlazMediaSrcBin *) instance;
+  self->srcpad = gst_ghost_pad_new_no_target_from_template ("src",
+      gst_static_pad_template_get (&olaz_media_src_pad_template));
+  gst_element_add_pad (GST_ELEMENT (self), self->srcpad);
+}
+
+static void
+olaz_media_src_bin_class_init (gpointer g_class, gpointer class_data)
+{
+  olaz_webkit_media_src_class_init (g_class, class_data);
+  GObjectClass *gobject_class = G_OBJECT_CLASS (g_class);
+  gobject_class->finalize = olaz_media_src_bin_finalize;
 }
 
 static GType
@@ -1272,13 +1385,14 @@ olaz_media_src_stub_get_type (void)
   if (g_once_init_enter (&stub_type)) {
     GTypeInfo info;
     memset (&info, 0, sizeof (info));
-    info.class_size = sizeof (GstElementClass);
-    info.class_init = olaz_webkit_media_src_class_init;
-    info.instance_size = sizeof (GstElement);
+    info.class_size = sizeof (OlazMediaSrcBinClass);
+    info.class_init = olaz_media_src_bin_class_init;
+    info.instance_size = sizeof (OlazMediaSrcBin);
+    info.instance_init = olaz_media_src_bin_init;
 
-    GType result = g_type_register_static (GST_TYPE_ELEMENT, "OlazMediaSrcStub", &info, 0);
+    GType result = g_type_register_static (GST_TYPE_BIN, "OlazMediaSrcStub", &info, 0);
     static const GInterfaceInfo uri_info = {
-      olaz_webkit_media_src_uri_handler_init,
+      olaz_media_src_bin_uri_init,
       NULL,
       NULL,
     };
@@ -1346,6 +1460,8 @@ struct _OlazAvDemux
   gboolean worker_started;
 
   gint64 pending_seek_ns;
+  gboolean pending_seek_flush;
+  gdouble pending_seek_rate;
   guint32 last_seek_seqnum;
   GstClockTime duration_ns;
 
@@ -1549,6 +1665,13 @@ olaz_av_src_event (GstPad *pad, GstObject *parent, GstEvent *event)
       g_mutex_unlock (&self->io_lock);
 
       if (is_new_seek) {
+        g_mutex_lock (&self->io_lock);
+        self->pending_seek_ns = target_ns;
+        self->pending_seek_flush = do_flush;
+        self->pending_seek_rate = (rate != 0.0) ? rate : 1.0;
+        g_cond_broadcast (&self->io_cond);
+        g_mutex_unlock (&self->io_lock);
+
         if (do_flush) {
           if (apad != NULL) {
             GstEvent *fs = gst_event_new_flush_start ();
@@ -1561,10 +1684,6 @@ olaz_av_src_event (GstPad *pad, GstObject *parent, GstEvent *event)
             gst_pad_push_event (vpad, fs);
           }
         }
-        g_mutex_lock (&self->io_lock);
-        self->pending_seek_ns = target_ns;
-        g_cond_broadcast (&self->io_cond);
-        g_mutex_unlock (&self->io_lock);
         if (apad != NULL)
           gst_object_unref (apad);
         if (vpad != NULL)
@@ -1577,12 +1696,14 @@ olaz_av_src_event (GstPad *pad, GstObject *parent, GstEvent *event)
 }
 
 static void
-olaz_av_push_segment_to (GstPad *pad, GstClockTime start_ns, GstClockTime dur_ns, guint32 seq)
+olaz_av_push_segment_to (GstPad *pad, GstClockTime start_ns, GstClockTime dur_ns,
+    gdouble rate, guint32 seq)
 {
   if (pad == NULL)
     return;
   GstSegment seg;
   gst_segment_init (&seg, GST_FORMAT_TIME);
+  seg.rate = (rate != 0.0) ? rate : 1.0;
   seg.start = start_ns;
   seg.time = start_ns;
   seg.position = start_ns;
@@ -1593,12 +1714,24 @@ olaz_av_push_segment_to (GstPad *pad, GstClockTime start_ns, GstClockTime dur_ns
   gst_pad_push_event (pad, ev);
 }
 
+static gboolean
+olaz_av_has_pending_seek_or_stop (OlazAvDemux *self)
+{
+  g_mutex_lock (&self->io_lock);
+  gboolean bail = self->stop_worker || self->pending_seek_ns >= 0;
+  g_mutex_unlock (&self->io_lock);
+  return bail;
+}
+
 static GstFlowReturn
 olaz_av_drain_audio (OlazAvDemux *self, AVCodecContext *actx, AVStream *ast,
     SwrContext *swr, int out_rate, int out_ch, AVFrame *frame,
     GstClockTime *next_pts, GstClockTime seg_start_ns)
 {
   while (TRUE) {
+    if (olaz_av_has_pending_seek_or_stop (self))
+      return GST_FLOW_FLUSHING;
+
     int r = avcodec_receive_frame (actx, frame);
     if (r == AVERROR (EAGAIN) || r == AVERROR_EOF || r < 0)
       break;
@@ -1636,7 +1769,7 @@ olaz_av_drain_audio (OlazAvDemux *self, AVCodecContext *actx, AVStream *ast,
     *next_pts = pts + dur;
     av_frame_unref (frame);
 
-    if (pts + dur <= seg_start_ns) {
+    if (pts + dur <= seg_start_ns || olaz_av_has_pending_seek_or_stop (self)) {
       gst_buffer_unref (buf);
       continue;
     }
@@ -1658,6 +1791,9 @@ olaz_av_drain_video (OlazAvDemux *self, AVCodecContext *vctx, AVStream *vst,
     GstClockTime *next_pts, GstClockTime seg_start_ns)
 {
   while (TRUE) {
+    if (olaz_av_has_pending_seek_or_stop (self))
+      return GST_FLOW_FLUSHING;
+
     int r = avcodec_receive_frame (vctx, frame);
     if (r == AVERROR (EAGAIN) || r == AVERROR_EOF || r < 0)
       break;
@@ -1686,7 +1822,7 @@ olaz_av_drain_video (OlazAvDemux *self, AVCodecContext *vctx, AVStream *vst,
     }
     *next_pts = pts + dur;
 
-    if (pts + dur <= seg_start_ns) {
+    if (pts + dur <= seg_start_ns || olaz_av_has_pending_seek_or_stop (self)) {
       av_frame_unref (frame);
       continue;
     }
@@ -1931,8 +2067,8 @@ olaz_av_worker_main (gpointer data)
     goto beach;
   }
 
-  olaz_av_push_segment_to (self->audio_pad, 0, dur_ns, 0);
-  olaz_av_push_segment_to (self->video_pad, 0, dur_ns, 0);
+  olaz_av_push_segment_to (self->audio_pad, 0, dur_ns, 1.0, 0);
+  olaz_av_push_segment_to (self->video_pad, 0, dur_ns, 1.0, 0);
 
   pkt = av_packet_alloc ();
   frame = av_frame_alloc ();
@@ -1944,24 +2080,30 @@ olaz_av_worker_main (gpointer data)
     g_mutex_lock (&self->io_lock);
     gboolean stop = self->stop_worker;
     gint64 seek_ns = self->pending_seek_ns;
+    gboolean seek_flush = self->pending_seek_flush;
+    gdouble seek_rate = self->pending_seek_rate;
     guint32 seek_seq = self->last_seek_seqnum;
-    if (seek_ns >= 0)
+    if (seek_ns >= 0) {
       self->pending_seek_ns = -1;
+      self->pending_seek_flush = FALSE;
+    }
     g_mutex_unlock (&self->io_lock);
 
     if (stop)
       break;
 
     if (seek_ns >= 0) {
-      if (self->audio_pad != NULL) {
-        GstEvent *fstop = gst_event_new_flush_stop (TRUE);
-        gst_event_set_seqnum (fstop, seek_seq);
-        gst_pad_push_event (self->audio_pad, fstop);
-      }
-      if (self->video_pad != NULL) {
-        GstEvent *fstop = gst_event_new_flush_stop (TRUE);
-        gst_event_set_seqnum (fstop, seek_seq);
-        gst_pad_push_event (self->video_pad, fstop);
+      if (seek_flush) {
+        if (self->audio_pad != NULL) {
+          GstEvent *fstop = gst_event_new_flush_stop (TRUE);
+          gst_event_set_seqnum (fstop, seek_seq);
+          gst_pad_push_event (self->audio_pad, fstop);
+        }
+        if (self->video_pad != NULL) {
+          GstEvent *fstop = gst_event_new_flush_stop (TRUE);
+          gst_event_set_seqnum (fstop, seek_seq);
+          gst_pad_push_event (self->video_pad, fstop);
+        }
       }
       int64_t seek_tb = av_rescale_q (seek_ns,
           (AVRational) { 1, GST_SECOND }, (AVRational) { 1, AV_TIME_BASE });
@@ -1976,8 +2118,8 @@ olaz_av_worker_main (gpointer data)
       seg_start_ns = (GstClockTime) seek_ns;
       next_audio_pts = seg_start_ns;
       next_video_pts = seg_start_ns;
-      olaz_av_push_segment_to (self->audio_pad, seg_start_ns, dur_ns, seek_seq);
-      olaz_av_push_segment_to (self->video_pad, seg_start_ns, dur_ns, seek_seq);
+      olaz_av_push_segment_to (self->audio_pad, seg_start_ns, dur_ns, seek_rate, seek_seq);
+      olaz_av_push_segment_to (self->video_pad, seg_start_ns, dur_ns, seek_rate, seek_seq);
     }
 
     int r = av_read_frame (fmt_ctx, pkt);
@@ -2191,6 +2333,8 @@ olaz_av_demux_stop_and_reset (OlazAvDemux *self)
   self->upstream_eos = FALSE;
   self->worker_started = FALSE;
   self->pending_seek_ns = -1;
+  self->pending_seek_flush = FALSE;
+  self->pending_seek_rate = 1.0;
   self->last_seek_seqnum = 0;
   self->duration_ns = GST_CLOCK_TIME_NONE;
   g_mutex_unlock (&self->io_lock);
@@ -2243,6 +2387,8 @@ olaz_av_demux_init (OlazAvDemux *self)
   self->memfd = -1;
   self->total_size = -1;
   self->pending_seek_ns = -1;
+  self->pending_seek_flush = FALSE;
+  self->pending_seek_rate = 1.0;
   self->duration_ns = GST_CLOCK_TIME_NONE;
 
   self->sinkpad = gst_pad_new_from_static_template (&olaz_av_sink_full_template, "sink");
@@ -2346,6 +2492,338 @@ static void olaz_av_audio_caps_class_init (OlazAvAudioCapsClass *klass) {
 #endif /* OLAZ_HAVE_FFMPEG */
 
 /* ============================================================================
+ * 6. `OlazScaletempo` (`scaletempo`) & `playsink` video filter fallbacks
+ *
+ * WebKit2GTK's `MediaPlayerPrivateGStreamer::createAudioSink()` instantiates
+ * `scaletempo` (`GStreamer element scaletempo not found. Please install it`
+ * when `gst-plugins-good` is absent), and `GstPlaySink` instantiates
+ * `videobalance` + `deinterlace` (`soft-colorbalance` / `deinterlace` flags).
+ * ============================================================================ */
+
+static gboolean
+olaz_system_has_gst_plugin_so (const char *so_name, const char *force_env_key)
+{
+  static const char *const kDirs[] = {
+    "/usr/lib/gstreamer-1.0",
+    "/usr/lib64/gstreamer-1.0",
+    "/usr/lib/x86_64-linux-gnu/gstreamer-1.0",
+    "/usr/lib/aarch64-linux-gnu/gstreamer-1.0",
+    "/usr/local/lib/gstreamer-1.0",
+    "/usr/local/lib64/gstreamer-1.0",
+  };
+  if (force_env_key != NULL) {
+    const char *force_val = g_getenv (force_env_key);
+    if (force_val != NULL && force_val[0] != '\0' && strcmp (force_val, "0") != 0)
+      return FALSE;
+  }
+  for (gsize i = 0; i < G_N_ELEMENTS (kDirs); i++) {
+    char *full = g_build_filename (kDirs[i], so_name, NULL);
+    gboolean ok = g_file_test (full, G_FILE_TEST_IS_REGULAR);
+    g_free (full);
+    if (ok)
+      return TRUE;
+  }
+  return FALSE;
+}
+
+#define OLAZ_TYPE_SCALETEMPO (olaz_scaletempo_get_type ())
+G_DECLARE_FINAL_TYPE (OlazScaletempo, olaz_scaletempo, OLAZ, SCALETEMPO, GstElement)
+
+struct _OlazScaletempo
+{
+  GstElement parent;
+  GstPad *sinkpad;
+  GstPad *srcpad;
+  gdouble rate;
+  guint stride_ms;
+  gdouble overlap;
+  guint search_ms;
+  guint bpf;
+  guint sample_rate;
+};
+
+enum
+{
+  ST_PROP_0,
+  ST_PROP_RATE,
+  ST_PROP_STRIDE,
+  ST_PROP_OVERLAP,
+  ST_PROP_SEARCH,
+};
+
+static GstStaticPadTemplate olaz_scaletempo_sink_template =
+GST_STATIC_PAD_TEMPLATE ("sink",
+    GST_PAD_SINK,
+    GST_PAD_ALWAYS,
+    GST_STATIC_CAPS (
+        "audio/x-raw, "
+        "format = (string) { S16LE, S32LE, F32LE, F64LE }, "
+        "rate = (int) [ 1, 384000 ], "
+        "channels = (int) [ 1, 32 ], "
+        "layout = (string) interleaved"));
+
+static GstStaticPadTemplate olaz_scaletempo_src_template =
+GST_STATIC_PAD_TEMPLATE ("src",
+    GST_PAD_SRC,
+    GST_PAD_ALWAYS,
+    GST_STATIC_CAPS (
+        "audio/x-raw, "
+        "format = (string) { S16LE, S32LE, F32LE, F64LE }, "
+        "rate = (int) [ 1, 384000 ], "
+        "channels = (int) [ 1, 32 ], "
+        "layout = (string) interleaved"));
+
+G_DEFINE_TYPE (OlazScaletempo, olaz_scaletempo, GST_TYPE_ELEMENT)
+
+static void
+olaz_scaletempo_set_property (GObject *object, guint prop_id,
+    const GValue *value, GParamSpec *pspec)
+{
+  OlazScaletempo *self = OLAZ_SCALETEMPO (object);
+  switch (prop_id) {
+    case ST_PROP_STRIDE:
+      self->stride_ms = g_value_get_uint (value);
+      break;
+    case ST_PROP_OVERLAP:
+      self->overlap = g_value_get_double (value);
+      break;
+    case ST_PROP_SEARCH:
+      self->search_ms = g_value_get_uint (value);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      break;
+  }
+}
+
+static void
+olaz_scaletempo_get_property (GObject *object, guint prop_id,
+    GValue *value, GParamSpec *pspec)
+{
+  OlazScaletempo *self = OLAZ_SCALETEMPO (object);
+  switch (prop_id) {
+    case ST_PROP_RATE:
+      g_value_set_double (value, self->rate);
+      break;
+    case ST_PROP_STRIDE:
+      g_value_set_uint (value, self->stride_ms);
+      break;
+    case ST_PROP_OVERLAP:
+      g_value_set_double (value, self->overlap);
+      break;
+    case ST_PROP_SEARCH:
+      g_value_set_uint (value, self->search_ms);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      break;
+  }
+}
+
+static gboolean
+olaz_scaletempo_sink_event (GstPad *pad, GstObject *parent, GstEvent *event)
+{
+  OlazScaletempo *self = OLAZ_SCALETEMPO (parent);
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_CAPS: {
+      GstCaps *caps = NULL;
+      gst_event_parse_caps (event, &caps);
+      if (caps != NULL) {
+        GstAudioInfo info;
+        if (gst_audio_info_from_caps (&info, caps)) {
+          self->bpf = (guint) GST_AUDIO_INFO_BPF (&info);
+          self->sample_rate = (guint) GST_AUDIO_INFO_RATE (&info);
+        }
+      }
+      return gst_pad_push_event (self->srcpad, event);
+    }
+    case GST_EVENT_SEGMENT: {
+      const GstSegment *in_seg = NULL;
+      gst_event_parse_segment (event, &in_seg);
+      if (in_seg != NULL && in_seg->format == GST_FORMAT_TIME) {
+        gdouble new_rate = (in_seg->rate > 0.0) ? in_seg->rate : 1.0;
+        self->rate = new_rate;
+        if (fabs (new_rate - 1.0) > 1e-3) {
+          GstSegment out_seg = *in_seg;
+          gdouble prev_applied = (in_seg->applied_rate != 0.0) ? in_seg->applied_rate : 1.0;
+          out_seg.applied_rate = prev_applied * new_rate;
+          out_seg.rate = 1.0;
+          GstEvent *new_ev = gst_event_new_segment (&out_seg);
+          gst_event_set_seqnum (new_ev, gst_event_get_seqnum (event));
+          gst_event_unref (event);
+          return gst_pad_push_event (self->srcpad, new_ev);
+        }
+      }
+      return gst_pad_push_event (self->srcpad, event);
+    }
+    default:
+      return gst_pad_event_default (pad, parent, event);
+  }
+}
+
+static gboolean
+olaz_scaletempo_sink_query (GstPad *pad, GstObject *parent, GstQuery *query)
+{
+  OlazScaletempo *self = OLAZ_SCALETEMPO (parent);
+  if (GST_QUERY_TYPE (query) == GST_QUERY_CAPS) {
+    GstCaps *filter = NULL;
+    gst_query_parse_caps (query, &filter);
+    GstCaps *peer = gst_pad_peer_query_caps (self->srcpad, filter);
+    if (peer != NULL) {
+      GstCaps *tmpl = gst_pad_get_pad_template_caps (pad);
+      GstCaps *res = gst_caps_intersect_full (peer, tmpl, GST_CAPS_INTERSECT_FIRST);
+      gst_caps_unref (tmpl);
+      gst_caps_unref (peer);
+      gst_query_set_caps_result (query, res);
+      gst_caps_unref (res);
+      return TRUE;
+    }
+  }
+  return gst_pad_query_default (pad, parent, query);
+}
+
+static GstFlowReturn
+olaz_scaletempo_chain (GstPad *pad, GstObject *parent, GstBuffer *buf)
+{
+  (void) pad;
+  OlazScaletempo *self = OLAZ_SCALETEMPO (parent);
+  gdouble rate = self->rate;
+  if (rate <= 0.0 || fabs (rate - 1.0) <= 1e-3 || self->bpf == 0 || self->sample_rate == 0) {
+    return gst_pad_push (self->srcpad, buf);
+  }
+
+  GstMapInfo in_map;
+  if (!gst_buffer_map (buf, &in_map, GST_MAP_READ)) {
+    return gst_pad_push (self->srcpad, buf);
+  }
+
+  gsize bpf = (gsize) self->bpf;
+  gsize in_frames = in_map.size / bpf;
+  if (in_frames == 0) {
+    gst_buffer_unmap (buf, &in_map);
+    gst_buffer_unref (buf);
+    return GST_FLOW_OK;
+  }
+
+  gsize out_frames = (gsize) llround ((double) in_frames / rate);
+  if (out_frames == 0)
+    out_frames = 1;
+
+  gsize stride_frames = ((gsize) self->sample_rate * (gsize) MAX (self->stride_ms, 8u)) / 1000u;
+  if (stride_frames < 32)
+    stride_frames = 32;
+
+  GstBuffer *out_buf = gst_buffer_new_allocate (NULL, out_frames * bpf, NULL);
+  GstMapInfo out_map;
+  if (!gst_buffer_map (out_buf, &out_map, GST_MAP_WRITE)) {
+    gst_buffer_unref (out_buf);
+    gst_buffer_unmap (buf, &in_map);
+    return gst_pad_push (self->srcpad, buf);
+  }
+
+  gsize written = 0;
+  while (written < out_frames) {
+    gsize chunk = MIN (stride_frames, out_frames - written);
+    gsize in_start = (gsize) ((double) written * rate);
+    if (in_start >= in_frames)
+      in_start = in_frames - 1;
+    for (gsize f = 0; f < chunk; f++) {
+      gsize src_idx = MIN (in_start + f, in_frames - 1);
+      memcpy (out_map.data + (written + f) * bpf, in_map.data + src_idx * bpf, bpf);
+    }
+    written += chunk;
+  }
+
+  gst_buffer_unmap (out_buf, &out_map);
+  gst_buffer_unmap (buf, &in_map);
+
+  if (GST_BUFFER_PTS_IS_VALID (buf))
+    GST_BUFFER_PTS (out_buf) = GST_BUFFER_PTS (buf);
+  if (GST_BUFFER_DTS_IS_VALID (buf))
+    GST_BUFFER_DTS (out_buf) = GST_BUFFER_DTS (buf);
+  GST_BUFFER_DURATION (out_buf) =
+      gst_util_uint64_scale_int ((guint64) out_frames, GST_SECOND, (gint) self->sample_rate);
+
+  gst_buffer_unref (buf);
+  return gst_pad_push (self->srcpad, out_buf);
+}
+
+static void
+olaz_scaletempo_init (OlazScaletempo *self)
+{
+  self->rate = 1.0;
+  self->stride_ms = 30;
+  self->overlap = 0.2;
+  self->search_ms = 14;
+  self->bpf = 0;
+  self->sample_rate = 0;
+
+  self->sinkpad = gst_pad_new_from_static_template (&olaz_scaletempo_sink_template, "sink");
+  gst_pad_set_chain_function (self->sinkpad, GST_DEBUG_FUNCPTR (olaz_scaletempo_chain));
+  gst_pad_set_event_function (self->sinkpad, GST_DEBUG_FUNCPTR (olaz_scaletempo_sink_event));
+  gst_pad_set_query_function (self->sinkpad, GST_DEBUG_FUNCPTR (olaz_scaletempo_sink_query));
+  GST_PAD_SET_PROXY_CAPS (self->sinkpad);
+  gst_element_add_pad (GST_ELEMENT (self), self->sinkpad);
+
+  self->srcpad = gst_pad_new_from_static_template (&olaz_scaletempo_src_template, "src");
+  GST_PAD_SET_PROXY_CAPS (self->srcpad);
+  gst_element_add_pad (GST_ELEMENT (self), self->srcpad);
+}
+
+static void
+olaz_scaletempo_class_init (OlazScaletempoClass *klass)
+{
+  GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
+  GstElementClass *element_class = GST_ELEMENT_CLASS (klass);
+
+  gobject_class->set_property = olaz_scaletempo_set_property;
+  gobject_class->get_property = olaz_scaletempo_get_property;
+
+  g_object_class_install_property (gobject_class, ST_PROP_RATE,
+      g_param_spec_double ("rate", "Playback Rate", "Current playback rate",
+          G_MINDOUBLE, G_MAXDOUBLE, 1.0, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, ST_PROP_STRIDE,
+      g_param_spec_uint ("stride", "Stride Length", "Length in milliseconds to output each stride",
+          1, 5000, 30, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, ST_PROP_OVERLAP,
+      g_param_spec_double ("overlap", "Overlap Length", "Percentage of stride to overlap",
+          0.0, 1.0, 0.2, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, ST_PROP_SEARCH,
+      g_param_spec_uint ("search", "Search Length", "Length in milliseconds to search for best overlap",
+          0, 500, 14, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  gst_element_class_set_static_metadata (element_class,
+      "Olaz Scaletempo Audio Filter",
+      "Filter/Effect/Audio",
+      "Sync audio tempo with playback rate without shifting pitch",
+      "Olaz Contributors");
+  gst_element_class_add_static_pad_template (element_class, &olaz_scaletempo_sink_template);
+  gst_element_class_add_static_pad_template (element_class, &olaz_scaletempo_src_template);
+}
+
+/* Passthrough `deinterlace` fallback so `GstPlaySink` never emits
+ * `Missing element 'deinterlace'` warnings when `gst-plugins-good` is not installed. */
+static GstStaticPadTemplate olaz_raw_video_sink_tmpl =
+GST_STATIC_PAD_TEMPLATE ("sink", GST_PAD_SINK, GST_PAD_ALWAYS, GST_STATIC_CAPS ("video/x-raw(ANY)"));
+static GstStaticPadTemplate olaz_raw_video_src_tmpl =
+GST_STATIC_PAD_TEMPLATE ("src", GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS ("video/x-raw(ANY)"));
+
+typedef struct _OlazDeinterlace { GstBaseTransform parent; } OlazDeinterlace;
+typedef struct _OlazDeinterlaceClass { GstBaseTransformClass parent_class; } OlazDeinterlaceClass;
+GType olaz_deinterlace_get_type (void);
+G_DEFINE_TYPE (OlazDeinterlace, olaz_deinterlace, GST_TYPE_BASE_TRANSFORM)
+static void olaz_deinterlace_init (OlazDeinterlace *self) {
+  gst_base_transform_set_passthrough (GST_BASE_TRANSFORM (self), TRUE);
+}
+static void olaz_deinterlace_class_init (OlazDeinterlaceClass *klass) {
+  GstElementClass *ec = GST_ELEMENT_CLASS (klass);
+  gst_element_class_set_static_metadata (ec, "Olaz Deinterlace Passthrough",
+      "Filter/Effect/Video/Deinterlace", "Passthrough deinterlace fallback", "Olaz Contributors");
+  gst_element_class_add_static_pad_template (ec, &olaz_raw_video_sink_tmpl);
+  gst_element_class_add_static_pad_template (ec, &olaz_raw_video_src_tmpl);
+}
+
+/* ============================================================================
  * Plugin Entry Point
  * ============================================================================ */
 
@@ -2353,13 +2831,23 @@ static gboolean
 olazauto_plugin_init (GstPlugin *plugin)
 {
   gst_plugin_add_dependency_simple (plugin,
-      "WEBKIT_GST_ALLOWED_URI_PROTOCOLS:OLAZ_GST_FORCE_AUTO_SINKS",
+      "WEBKIT_GST_ALLOWED_URI_PROTOCOLS:OLAZ_GST_FORCE_AUTO_SINKS:OLAZ_GST_FORCE_SCALETEMPO",
       NULL, NULL, GST_PLUGIN_DEPENDENCY_FLAG_NONE);
 
   if (!olaz_system_has_autodetect_plugin ()) {
     if (!gst_element_register (plugin, "autoaudiosink", GST_RANK_NONE, OLAZ_TYPE_AUTO_AUDIO_SINK))
       return FALSE;
     if (!gst_element_register (plugin, "autovideosink", GST_RANK_NONE, OLAZ_TYPE_AUTO_VIDEO_SINK))
+      return FALSE;
+  }
+
+  if (!olaz_system_has_gst_plugin_so ("libgstscaletempoplugin.so", "OLAZ_GST_FORCE_SCALETEMPO")) {
+    if (!gst_element_register (plugin, "scaletempo", GST_RANK_PRIMARY, OLAZ_TYPE_SCALETEMPO))
+      return FALSE;
+  }
+
+  if (!olaz_system_has_gst_plugin_so ("libgstdeinterlace.so", NULL)) {
+    if (!gst_element_register (plugin, "deinterlace", GST_RANK_MARGINAL, olaz_deinterlace_get_type ()))
       return FALSE;
   }
 

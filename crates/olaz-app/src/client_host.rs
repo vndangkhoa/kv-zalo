@@ -18,7 +18,10 @@ use olaz_core::{
     direct_ui_user_scripts, mime_for_path, ordered_user_scripts, patch_asar_bundle,
     popup_user_scripts, wire, AsarArchive, ZaloPlatform,
 };
-use olaz_net::{serve_local_media_range, MediaRangeResponse, NetworkProxy, WsEvent, WsEventSink};
+use olaz_net::{
+    open_local_media_range, serve_local_media_range, LocalMediaStream, MediaRangeResponse,
+    NetworkProxy, WsEvent, WsEventSink,
+};
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
 use soup::{MessageHeaders, MessageHeadersType};
@@ -27,11 +30,12 @@ use url::Url;
 use webkit2gtk::{
     AutoplayPolicy, DownloadExt, FileChooserRequest, FileChooserRequestExt,
     HardwareAccelerationPolicy, LoadEvent, NavigationAction, NavigationPolicyDecision,
-    NavigationPolicyDecisionExt, PolicyDecisionExt, PolicyDecisionType, SecurityManagerExt,
-    Settings, SettingsExt, URIRequestExt, URISchemeRequest, URISchemeRequestExt,
-    URISchemeResponse, URISchemeResponseExt, UserContentInjectedFrames, UserContentManager,
-    UserContentManagerExt, UserScript, UserScriptInjectionTime, WebContext, WebContextExt, WebView,
-    WebViewExt, WebsiteDataManager, WebsitePolicies,
+    NavigationPolicyDecisionExt, PolicyDecisionExt, PolicyDecisionType, ResponsePolicyDecision,
+    ResponsePolicyDecisionExt, SecurityManagerExt, Settings, SettingsExt, URIRequestExt,
+    URISchemeRequest, URISchemeRequestExt, URISchemeResponse, URISchemeResponseExt,
+    UserContentInjectedFrames, UserContentManager, UserContentManagerExt, UserScript,
+    UserScriptInjectionTime, WebContext, WebContextExt, WebView, WebViewExt, WebsiteDataManager,
+    WebsitePolicies,
 };
 
 /// Custom URI scheme serving `pc-dist/` from `app.asar` and `/__olaz/bridge-sync`.
@@ -729,24 +733,36 @@ impl ZaloWebRuntime {
 
         let context = WebContext::with_website_data_manager(&data_manager);
 
-        // Expose staged GStreamer plugin, confined app directories, and read-only user/mount roots
-        // (`$HOME`, `/mnt`, `/media`, `/run/media`) to WebKit's bubblewrap sandbox so disk-backed
-        // `File` objects dropped or picked from file managers are readable inside `WebKitWebProcess`.
+        // Expose staged GStreamer plugin, confined app directories, and read-only XDG/mount roots
+        // to WebKit's bubblewrap sandbox without passing raw `$HOME` (which WebKitGTK rejects as a
+        // disallowed sandbox root).
         let gst_dir = olaz_linux::olaz_gst_plugin_dir();
         let home_dir = platform.electron_path("home");
+        let docs_dir = platform.electron_path("documents");
+        let pics_dir = platform.electron_path("pictures");
+        let vids_dir = platform.electron_path("videos");
+        let music_dir = platform.electron_path("music");
+        let desktop_dir = platform.electron_path("desktop");
         for sandbox_dir in [
             gst_dir.as_path(),
             platform.user_data(),
             platform.downloads_dir(),
             platform.temp_dir(),
             platform.cache_dir(),
+            docs_dir.as_path(),
+            pics_dir.as_path(),
+            vids_dir.as_path(),
+            music_dir.as_path(),
+            desktop_dir.as_path(),
             Path::new(olaz_linux::SCREENSHOT_STAGING_DIR),
-            home_dir.as_path(),
             Path::new("/mnt"),
             Path::new("/media"),
             Path::new("/run/media"),
         ] {
-            if sandbox_dir.exists() {
+            if sandbox_dir != home_dir.as_path()
+                && sandbox_dir != Path::new("/")
+                && sandbox_dir.exists()
+            {
                 context.add_path_to_sandbox(sandbox_dir, true);
             }
         }
@@ -781,6 +797,7 @@ impl ZaloWebRuntime {
                 let safe_name = sanitize_download_filename(suggested);
                 let dest = unique_destination_path(&dir, &safe_name);
                 platform_dl.grant_writable_path(&dest);
+                platform_dl.grant_readable_path(&dest);
                 if let Ok(uri) = Url::from_file_path(&dest) {
                     dl.set_destination(uri.as_str());
                     return true;
@@ -870,11 +887,15 @@ fn zfile_allowed_roots(platform: &ZaloPlatform) -> Vec<PathBuf> {
         platform.temp_dir().to_path_buf(),
         platform.downloads_dir().to_path_buf(),
         platform.electron_path("pictures"),
+        platform.electron_path("videos"),
+        platform.electron_path("music"),
         platform.electron_path("documents"),
+        platform.electron_path("documents").join("Zalo Received Files"),
         platform.electron_path("desktop"),
         PathBuf::from(olaz_linux::SCREENSHOT_STAGING_DIR),
     ];
     roots.extend(platform.approved_read_paths());
+    roots.extend(platform.approved_write_paths());
     roots
 }
 
@@ -1157,6 +1178,10 @@ async fn handle_gst_proxy_conn(
     let mut parts = req_line.split_whitespace();
     let method = parts.next().unwrap_or("GET");
     let raw_target = parts.next().unwrap_or("/");
+    if method.eq_ignore_ascii_case("OPTIONS") {
+        write_http_response(stream, 204, "No Content", "text/plain", None, b"", true).await?;
+        return Ok(());
+    }
     let is_head = method.eq_ignore_ascii_case("HEAD");
     if !is_head && !method.eq_ignore_ascii_case("GET") {
         write_http_response(
@@ -1236,18 +1261,9 @@ async fn handle_gst_proxy_conn(
                 PathBuf::from(format!("/{decoded}"))
             };
             let allowed = zfile_allowed_roots(platform);
-            match serve_local_media_range(&abs_path, range_header.as_deref(), &allowed) {
+            match open_local_media_range(&abs_path, range_header.as_deref(), &allowed, !is_head) {
                 Ok(media) => {
-                    write_http_response(
-                        stream,
-                        u32::from(media.status),
-                        media.status_text,
-                        media.mime_type,
-                        media.content_range.as_deref(),
-                        &media.body,
-                        is_head,
-                    )
-                    .await?;
+                    write_http_stream_response(stream, media, is_head).await?;
                 }
                 Err(_) => {
                     write_http_response(
@@ -1344,6 +1360,44 @@ async fn handle_gst_proxy_conn(
     Ok(())
 }
 
+async fn write_http_stream_response(
+    stream: &mut tokio::net::TcpStream,
+    mut media: LocalMediaStream,
+    is_head: bool,
+) -> std::io::Result<()> {
+    let mut hdr = format!(
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: {}\r\n\
+         Content-Length: {}\r\n\
+         Accept-Ranges: bytes\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Range, Content-Type, Origin, Accept\r\n\
+         Access-Control-Expose-Headers: Content-Range, Content-Length, Accept-Ranges\r\n\
+         Connection: close\r\n",
+        media.status, media.status_text, media.mime_type, media.content_length
+    );
+    if let Some(ref cr) = media.content_range {
+        hdr.push_str(&format!("Content-Range: {cr}\r\n"));
+    }
+    hdr.push_str("\r\n");
+    stream.write_all(hdr.as_bytes()).await?;
+    if !is_head {
+        if let Some(ref mut reader) = media.reader {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = std::io::Read::read(reader, &mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                stream.write_all(&buf[..n]).await?;
+            }
+        }
+    }
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
 async fn write_http_response(
     stream: &mut tokio::net::TcpStream,
     status: u32,
@@ -1359,6 +1413,9 @@ async fn write_http_response(
          Content-Length: {}\r\n\
          Accept-Ranges: bytes\r\n\
          Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Range, Content-Type, Origin, Accept\r\n\
+         Access-Control-Expose-Headers: Content-Range, Content-Length, Accept-Ranges\r\n\
          Connection: close\r\n",
         body.len()
     );
@@ -1650,6 +1707,15 @@ fn wire_ucm_znet_and_zbridge(
 
 fn configure_zalo_policy(webview: &WebView, allow_popups: bool) {
     webview.connect_decide_policy(move |_, decision, decision_type| {
+        if decision_type == PolicyDecisionType::Response {
+            if let Ok(resp_decision) = decision.clone().downcast::<ResponsePolicyDecision>() {
+                if !resp_decision.is_mime_type_supported() {
+                    decision.download();
+                    return true;
+                }
+            }
+            return false;
+        }
         if decision_type != PolicyDecisionType::NavigationAction
             && decision_type != PolicyDecisionType::NewWindowAction
         {
@@ -2301,6 +2367,15 @@ impl OfficialClientHost {
         reparent_webview_to(&self.webview, target.upcast_ref::<gtk::Container>());
     }
 
+    /// Updates the backing `gtk::OffscreenWindow` dimensions so a `--minimized` start-in-tray
+    /// launch renders `index.html` at full desktop viewport size before the primary window maps.
+    pub fn resize_offscreen(&self, width: i32, height: i32) {
+        let w = width.max(400);
+        let h = height.max(400);
+        self.offscreen_window.set_default_size(w, h);
+        self.offscreen_window.set_size_request(w, h);
+    }
+
     /// Opens or brings to front a developer window displaying the Zalo DOM (used by `--engine-probe`).
     pub fn show_debug_window(&self) {
         if self.direct_ui {
@@ -2532,10 +2607,19 @@ fn inject_common_preamble_and_meta(ucm: &UserContentManager, platform: &ZaloPlat
 
     let ver_json =
         serde_json::to_string(&platform.app_version()).unwrap_or_else(|_| "\"26.10.20\"".into());
+    let proxy_base_json = std::env::var("OLAZ_GST_MEDIA_PROXY_BASE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::to_string(&s).ok())
+        .unwrap_or_else(|| "null".into());
     let runtime_meta_script = format!(
         "(() => {{\n\
            'use strict';\n\
            const appVersion = {ver_json};\n\
+           const mediaProxyBase = {proxy_base_json};\n\
+           if (mediaProxyBase && (location.protocol === 'zalo-app:' || location.protocol === 'about:')) {{\n\
+             window.__olazMediaProxyBase = mediaProxyBase;\n\
+           }}\n\
            window.__zaloRuntime = Object.assign(window.__zaloRuntime || {{}}, {{ appVersion }});\n\
            if (window === window.top && appVersion && appVersion !== '0.1.0') {{\n\
              try {{\n\

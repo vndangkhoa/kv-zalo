@@ -117,25 +117,37 @@ impl FsBridge {
     pub fn write_file_sync(&self, path: &Path, data: &[u8]) -> Result<(), FsError> {
         self.require_writable(path)?;
         let parent = path.parent().ok_or_else(|| FsError::eacces(path))?;
-        self.require_writable(parent)?;
-        std::fs::create_dir_all(parent).map_err(|e| FsError::from_io(e, parent))?;
+        if !parent.is_dir() {
+            self.require_writable(parent)?;
+            std::fs::create_dir_all(parent).map_err(|e| FsError::from_io(e, parent))?;
+        }
 
-        let mut tmp =
-            NamedTempFile::new_in(parent).map_err(|e| FsError::from_io(e, parent))?;
-        tmp.write_all(data)
-            .and_then(|_| tmp.flush())
-            .map_err(|e| FsError::from_io(e, path))?;
-        tmp.persist(path)
-            .map_err(|e| FsError::from_io(e.error, path))?;
+        match NamedTempFile::new_in(parent) {
+            Ok(mut tmp) => {
+                tmp.write_all(data)
+                    .and_then(|_| tmp.flush())
+                    .map_err(|e| FsError::from_io(e, path))?;
+                tmp.persist(path)
+                    .map_err(|e| FsError::from_io(e.error, path))?;
+            }
+            Err(_) => {
+                // Fallback for XDG document-portal FUSE mounts (`/run/user/<uid>/doc/<id>/file`)
+                // that permit opening the granted target path directly while forbidding sibling `.tmp*` files.
+                let mut f = File::create(path).map_err(|e| FsError::from_io(e, path))?;
+                f.write_all(data)
+                    .and_then(|_| f.flush())
+                    .map_err(|e| FsError::from_io(e, path))?;
+            }
+        }
         Ok(())
     }
 
     pub fn mkdir_sync(&self, path: &Path, recursive: bool) -> Result<(), FsError> {
+        if recursive && path.is_dir() {
+            return Ok(());
+        }
         self.require_writable(path)?;
         if recursive {
-            if path.is_dir() {
-                return Ok(());
-            }
             std::fs::create_dir_all(path).map_err(|e| FsError::from_io(e, path))
         } else {
             std::fs::create_dir(path).map_err(|e| FsError::from_io(e, path))
@@ -183,8 +195,10 @@ impl FsBridge {
         self.require_writable(to)?;
         std::fs::symlink_metadata(from).map_err(|e| FsError::from_io(e, from))?;
         if let Some(parent) = to.parent() {
-            self.require_writable(parent)?;
-            std::fs::create_dir_all(parent).map_err(|e| FsError::from_io(e, parent))?;
+            if !parent.is_dir() {
+                self.require_writable(parent)?;
+                std::fs::create_dir_all(parent).map_err(|e| FsError::from_io(e, parent))?;
+            }
         }
         if to.exists() {
             if to.is_dir() {
@@ -207,8 +221,10 @@ impl FsBridge {
         self.require_exists(from)?;
         self.require_writable(to)?;
         if let Some(parent) = to.parent() {
-            self.require_writable(parent)?;
-            std::fs::create_dir_all(parent).map_err(|e| FsError::from_io(e, parent))?;
+            if !parent.is_dir() {
+                self.require_writable(parent)?;
+                std::fs::create_dir_all(parent).map_err(|e| FsError::from_io(e, parent))?;
+            }
         }
         if from.is_dir() {
             copy_dir_recursive(from, to)?;
@@ -240,8 +256,10 @@ impl FsBridge {
         self.require_exists(existing)?;
         self.require_writable(dst)?;
         if let Some(parent) = dst.parent() {
-            self.require_writable(parent)?;
-            std::fs::create_dir_all(parent).map_err(|e| FsError::from_io(e, parent))?;
+            if !parent.is_dir() {
+                self.require_writable(parent)?;
+                std::fs::create_dir_all(parent).map_err(|e| FsError::from_io(e, parent))?;
+            }
         }
         std::fs::hard_link(existing, dst).map_err(|e| FsError::from_io(e, dst))
     }
@@ -814,9 +832,11 @@ impl FsBridge {
                     .unwrap_or_default();
                 self.require_writable(&p).map_err(|e| e.to_string())?;
                 if let Some(parent) = p.parent() {
-                    self.require_writable(parent).map_err(|e| e.to_string())?;
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| FsError::from_io(e, parent).to_string())?;
+                    if !parent.is_dir() {
+                        self.require_writable(parent).map_err(|e| e.to_string())?;
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| FsError::from_io(e, parent).to_string())?;
+                    }
                 }
                 let mut f = OpenOptions::new()
                     .create(true)
@@ -874,8 +894,11 @@ impl FsBridge {
                 let checksum = arg_str(args, 2).unwrap_or("").trim();
                 self.require_writable(&dest).map_err(|e| e.to_string())?;
                 if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| FsError::from_io(e, parent).to_string())?;
+                    if !parent.is_dir() {
+                        self.require_writable(parent).map_err(|e| e.to_string())?;
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| FsError::from_io(e, parent).to_string())?;
+                    }
                 }
                 denoise_file_sync(&src, &dest, checksum).map_err(|e| e.to_string())?;
                 Ok(wire::undefined())
@@ -886,11 +909,47 @@ impl FsBridge {
                 let checksum = arg_str(args, 2).unwrap_or("").trim();
                 self.require_writable(&dest).map_err(|e| e.to_string())?;
                 if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| FsError::from_io(e, parent).to_string())?;
+                    if !parent.is_dir() {
+                        self.require_writable(parent).map_err(|e| e.to_string())?;
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| FsError::from_io(e, parent).to_string())?;
+                    }
                 }
                 noise_file_sync(&src, &dest, checksum).map_err(|e| e.to_string())?;
                 Ok(json!({ "savePath": dest.to_string_lossy() }))
+            }
+            "$zFileManager.generateVideoThumbnail" => {
+                let src = arg_path(args, 0);
+                let dest = arg_path(args, 1);
+                let max_w = args
+                    .get(2)
+                    .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+                    .unwrap_or(480)
+                    .clamp(16, 4096) as u32;
+                let max_h = args
+                    .get(3)
+                    .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+                    .unwrap_or(480)
+                    .clamp(16, 4096) as u32;
+                if src.as_os_str().is_empty() || dest.as_os_str().is_empty() || !src.is_file() {
+                    return Ok(Value::String(String::new()));
+                }
+                self.require_writable(&dest).map_err(|e| e.to_string())?;
+                if let Some(parent) = dest.parent() {
+                    self.require_writable(parent).map_err(|e| e.to_string())?;
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| FsError::from_io(e, parent).to_string())?;
+                }
+                match generate_video_thumbnail_sync(
+                    &src,
+                    &dest,
+                    max_w,
+                    max_h,
+                    self.platform.temp_dir(),
+                ) {
+                    Ok(true) => Ok(Value::String(dest.to_string_lossy().into_owned())),
+                    _ => Ok(Value::String(String::new())),
+                }
             }
             other => Err(format!("Unsupported filesystem bridge call: {other}")),
         }
@@ -1042,7 +1101,8 @@ fn compute_file_md5_sync(path: &Path, check_noise: bool) -> Result<String, FsErr
 }
 
 fn denoise_file_sync(src: &Path, dest: &Path, expected_checksum: &str) -> Result<(), FsError> {
-    let (logical_len, _) = inspect_file_noise(src, true)?;
+    let (logical_len, noise_sig) = inspect_file_noise(src, true)?;
+    let has_noise = noise_sig.is_some();
     let mut fin = File::open(src).map_err(|e| FsError::from_io(e, src))?;
     let mut fout = File::create(dest).map_err(|e| FsError::from_io(e, dest))?;
     let mut hasher = (!expected_checksum.is_empty()).then(Md5::new);
@@ -1057,7 +1117,9 @@ fn denoise_file_sync(src: &Path, dest: &Path, expected_checksum: &str) -> Result
         if n == 0 {
             break;
         }
-        apply_noise_xor_at_offset(offset, &mut chunk[..n]);
+        if has_noise {
+            apply_noise_xor_at_offset(offset, &mut chunk[..n]);
+        }
         if let Some(h) = hasher.as_mut() {
             h.update(&chunk[..n]);
         }
@@ -1081,15 +1143,24 @@ fn denoise_file_sync(src: &Path, dest: &Path, expected_checksum: &str) -> Result
 }
 
 fn noise_file_sync(src: &Path, dest: &Path, expected_checksum: &str) -> Result<(), FsError> {
+    let (logical_len, noise_sig) = inspect_file_noise(src, true)?;
+    let src_already_noised = noise_sig.is_some();
     let mut fin = File::open(src).map_err(|e| FsError::from_io(e, src))?;
     let mut fout = File::create(dest).map_err(|e| FsError::from_io(e, dest))?;
     let mut hasher = (!expected_checksum.is_empty()).then(Md5::new);
+    let mut remaining = logical_len;
     let mut offset = 0u64;
     let mut chunk = vec![0u8; 64 * 1024];
-    loop {
-        let n = fin.read(&mut chunk).map_err(|e| FsError::from_io(e, src))?;
+    while remaining > 0 {
+        let want = (remaining as usize).min(chunk.len());
+        let n = fin
+            .read(&mut chunk[..want])
+            .map_err(|e| FsError::from_io(e, src))?;
         if n == 0 {
             break;
+        }
+        if src_already_noised {
+            apply_noise_xor_at_offset(offset, &mut chunk[..n]);
         }
         if let Some(h) = hasher.as_mut() {
             h.update(&chunk[..n]);
@@ -1098,6 +1169,7 @@ fn noise_file_sync(src: &Path, dest: &Path, expected_checksum: &str) -> Result<(
         fout.write_all(&chunk[..n])
             .map_err(|e| FsError::from_io(e, dest))?;
         offset += n as u64;
+        remaining -= n as u64;
     }
     if let Some(h) = hasher {
         let actual = hex::encode(h.finalize());
@@ -1113,4 +1185,100 @@ fn noise_file_sync(src: &Path, dest: &Path, expected_checksum: &str) -> Result<(
         .map_err(|e| FsError::from_io(e, dest))?;
     fout.flush().map_err(|e| FsError::from_io(e, dest))?;
     Ok(())
+}
+
+/// Copies `src` to `dest`, ensuring the destination is either `fileNoise`-encoded
+/// (`want_noise_output == true`, idempotent if `src` is already noised) or clean
+/// plaintext (`want_noise_output == false`, stripping `fileNoise` if `src` has it).
+pub fn copy_with_noise_mode(
+    src: &Path,
+    dest: &Path,
+    want_noise_output: bool,
+    expected_checksum: &str,
+) -> Result<(), FsError> {
+    if want_noise_output {
+        noise_file_sync(src, dest, expected_checksum)
+    } else {
+        denoise_file_sync(src, dest, expected_checksum)
+    }
+}
+
+/// Generates a scaled JPEG thumbnail at `dest` from a local video file `src` (handling
+/// Zalo `fileNoise` inputs transparently) using `ffmpeg`. Returns `Ok(true)` if `dest`
+/// was written and is non-empty, or `Ok(false)` when `ffmpeg` is unavailable or fails.
+pub fn generate_video_thumbnail_sync(
+    src: &Path,
+    dest: &Path,
+    max_width: u32,
+    max_height: u32,
+    temp_dir: &Path,
+) -> Result<bool, FsError> {
+    let (_, noise_sig) = inspect_file_noise(src, true)?;
+    let _ = std::fs::create_dir_all(temp_dir);
+
+    let mut denoised_guard: Option<NamedTempFile> = None;
+    let effective_src: PathBuf = if noise_sig.is_some() {
+        let tmp_in =
+            NamedTempFile::new_in(temp_dir).map_err(|e| FsError::from_io(e, temp_dir))?;
+        denoise_file_sync(src, tmp_in.path(), "")?;
+        let p = tmp_in.path().to_path_buf();
+        denoised_guard = Some(tmp_in);
+        p
+    } else {
+        src.to_path_buf()
+    };
+
+    let parent = dest.parent().ok_or_else(|| FsError::eacces(dest))?;
+    std::fs::create_dir_all(parent).map_err(|e| FsError::from_io(e, parent))?;
+    let tmp_out = NamedTempFile::new_in(parent).map_err(|e| FsError::from_io(e, parent))?;
+    let tmp_out_path = tmp_out.path().to_path_buf();
+
+    let vf = format!(
+        "scale='min({max_width},iw)':'min({max_height},ih)':force_original_aspect_ratio=decrease"
+    );
+
+    let run_ffmpeg = |seek_arg: &str| -> bool {
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                seek_arg,
+            ])
+            .arg("-i")
+            .arg(&effective_src)
+            .args([
+                "-frames:v",
+                "1",
+                "-vf",
+                &vf,
+                "-q:v",
+                "4",
+                "-f",
+                "image2",
+                "-y",
+            ])
+            .arg(&tmp_out_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        matches!(status, Ok(s) if s.success())
+            && std::fs::metadata(&tmp_out_path)
+                .map(|m| m.is_file() && m.len() > 0)
+                .unwrap_or(false)
+    };
+
+    let ok = run_ffmpeg("0.1") || run_ffmpeg("0");
+    drop(denoised_guard);
+
+    if !ok {
+        return Ok(false);
+    }
+
+    tmp_out
+        .persist(dest)
+        .map_err(|e| FsError::from_io(e.error, dest))?;
+    Ok(true)
 }

@@ -1479,3 +1479,76 @@ fn login_qr_rejects_svg_spinner_handles_invalid_and_preserves_waiting_confirm() 
         }
     );
 }
+
+#[test]
+fn gst_video_sink_overrides_and_staged_scaletempo_deinterlace_and_zfile_plugin() {
+    use olaz_linux::{
+        compute_linux_gst_video_sink_overrides, ensure_olaz_gst_plugin_staged, olaz_gst_plugin_dir,
+    };
+
+    let overrides = compute_linux_gst_video_sink_overrides(
+        None,
+        Some(OsStr::new("1")),
+        None,
+        None,
+    );
+    assert_eq!(
+        overrides,
+        vec![
+            ("WEBKIT_GST_DMABUF_SINK_DISABLED", "1"),
+            ("WEBKIT_GST_DISABLE_GL_SINK", "1"),
+        ]
+    );
+
+    let hwaccel_overrides = compute_linux_gst_video_sink_overrides(
+        Some(OsStr::new("0")),
+        Some(OsStr::new("0")),
+        None,
+        None,
+    );
+    assert!(hwaccel_overrides.is_empty());
+
+    let preconfigured = compute_linux_gst_video_sink_overrides(
+        Some(OsStr::new("1")),
+        None,
+        Some(OsStr::new("0")),
+        None,
+    );
+    assert_eq!(preconfigured, vec![("WEBKIT_GST_DMABUF_SINK_DISABLED", "1")]);
+
+    let staged_dir =
+        ensure_olaz_gst_plugin_staged().expect("libgstolazauto.so must stage cleanly");
+    assert!(staged_dir.join("libgstolazauto.so").is_file());
+
+    if let Ok(inspect_status) = std::process::Command::new("gst-inspect-1.0")
+        .arg("--version")
+        .output()
+    {
+        if inspect_status.status.success() {
+            let gst_dir = olaz_gst_plugin_dir();
+            let tmp_reg = TempDir::new().unwrap();
+            let reg_file = tmp_reg.path().join("registry.bin");
+
+            for (elem, needle) in [
+                ("scaletempo", "Filter/Effect/Audio"),
+                ("olazmediasrc", "zfile"),
+                ("olazavdemux", "Codec/Demuxer"),
+            ] {
+                let out = std::process::Command::new("gst-inspect-1.0")
+                    .env("GST_PLUGIN_PATH_1_0", &gst_dir)
+                    .env("GST_REGISTRY_1_0", &reg_file)
+                    .env("OLAZ_GST_FORCE_SCALETEMPO", "1")
+                    .arg(elem)
+                    .output()
+                    .expect("run gst-inspect-1.0");
+                let text = String::from_utf8_lossy(&out.stdout);
+                assert!(
+                    out.status.success() && text.contains(needle),
+                    "gst-inspect-1.0 {elem} failed (status={:?}): stdout={text} stderr={}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+    }
+}

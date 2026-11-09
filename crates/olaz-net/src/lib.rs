@@ -16,11 +16,12 @@ pub use doh::{
     DOH_STICKY_TTL, SYSTEM_DNS_TIMEOUT, SYSTEM_OK_TTL, ZALO_CDN_SUFFIXES,
 };
 pub use media_loader::{
-    fnv1a_64_hex, sanitize_headers, serve_local_media_range, sniff_media_mime,
-    strip_sensitive_headers_for_redirect, trim_cache_dir, MediaLoadError, MediaLoader,
-    MediaRangeResponse, DEFAULT_CONCURRENCY_LIMIT, DEFAULT_FILES_CACHE_LIMIT,
-    DEFAULT_IMAGE_DEADLINE, FILE_IDLE_TIMEOUT, FORBIDDEN_HEADER_NAMES, MAX_MEDIA_FILE_BYTES,
-    MAX_PHOTO_BYTES, MAX_REDIRECT_HOPS, SENSITIVE_HEADER_NAMES, STALE_PART_AGE,
+    fnv1a_64_hex, open_local_media_range, sanitize_headers, serve_local_media_range,
+    sniff_media_mime, strip_sensitive_headers_for_redirect, trim_cache_dir, LocalMediaRangeReader,
+    LocalMediaStream, MediaLoadError, MediaLoader, MediaRangeResponse, DEFAULT_CONCURRENCY_LIMIT,
+    DEFAULT_FILES_CACHE_LIMIT, DEFAULT_IMAGE_DEADLINE, FILE_IDLE_TIMEOUT, FORBIDDEN_HEADER_NAMES,
+    MAX_MEDIA_FILE_BYTES, MAX_PHOTO_BYTES, MAX_REDIRECT_HOPS, SENSITIVE_HEADER_NAMES,
+    STALE_PART_AGE,
 };
 pub use proxy::{
     describe_zalo_frame, is_observed_zalo_endpoint, NetworkProxy, ResponseObserver, WsEvent,

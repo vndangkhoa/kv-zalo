@@ -19,8 +19,8 @@ use client_host::{HostPage, OfficialClientHost, PageEvent, ZaloWebRuntime};
 use main_process::ZaloMainProcess;
 use olaz_core::{ZaloPlatform, ZaloRuntimeManager};
 use olaz_linux::{
-    configure_linux_webview_env, prune_old_screenshots, SCREENSHOT_RETENTION,
-    SCREENSHOT_STAGING_DIR,
+    acquire_or_notify_primary, configure_linux_webview_env, prune_old_screenshots,
+    AcquireInstanceOutcome, SCREENSHOT_RETENTION, SCREENSHOT_STAGING_DIR,
 };
 use olaz_net::{MediaLoader, NetworkProxy, ZaloCookieJar, ZaloDnsResolver};
 use tracing_subscriber::EnvFilter;
@@ -31,7 +31,7 @@ use ui_window::OlazAppWindow;
 pub enum CliAction {
     Help,
     Version,
-    Gui,
+    Gui { start_minimized: bool },
     Demo,
     EngineProbe { page: ProbePage, seconds: u64 },
 }
@@ -101,15 +101,22 @@ impl CliAction {
             return Ok(Self::EngineProbe { page, seconds });
         }
 
+        let mut start_minimized = false;
         for arg in &collected {
-            if arg.starts_with("--") && !arg.starts_with("--gapplication-") {
-                bail!(
-                    "Unknown option `{arg}`.\nRun `olaz --help` to see supported options."
-                );
+            match arg.as_str() {
+                "--minimized" | "--tray" | "--hidden" => {
+                    start_minimized = true;
+                }
+                _ if arg.starts_with("--") && !arg.starts_with("--gapplication-") => {
+                    bail!(
+                        "Unknown option `{arg}`.\nRun `olaz --help` to see supported options."
+                    );
+                }
+                _ => {}
             }
         }
 
-        Ok(Self::Gui)
+        Ok(Self::Gui { start_minimized })
     }
 }
 
@@ -124,6 +131,7 @@ USAGE:
 OPTIONS:
     -h, --help                         Print this help information and exit
     -V, --version                      Print version and exit
+        --minimized, --tray, --hidden  Launch hidden in the system tray (used by XDG autostart)
         --demo                         Launch Olaz UI in offline mock/demo mode (`?demo=1`)
         --engine-probe [PAGE] [SECS]   Boot headless Zalo renderer + debug window (`login` or `main`, default: `main` 20s)
 
@@ -159,10 +167,37 @@ fn main() -> Result<()> {
             println!("olaz {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        CliAction::Gui | CliAction::Demo | CliAction::EngineProbe { .. } => {}
+        CliAction::Gui { .. } | CliAction::Demo | CliAction::EngineProbe { .. } => {}
     }
 
     init_tracing();
+
+    // Prepare platform directories and enforce single-instance re-activation BEFORE starting
+    // Tokio / GTK so a launcher click while hidden in tray immediately wakes the primary window.
+    let platform_raw = ZaloPlatform::new(env!("CARGO_PKG_VERSION"));
+    let mut _instance_guard = None;
+    let mut instance_rx = None;
+    if let CliAction::Gui { start_minimized } = action {
+        match acquire_or_notify_primary(platform_raw.base_dir(), !start_minimized) {
+            Ok(AcquireInstanceOutcome::Primary(guard, rx)) => {
+                _instance_guard = Some(guard);
+                instance_rx = Some(rx);
+            }
+            Ok(AcquireInstanceOutcome::ForwardedToPrimary) => {
+                tracing::info!(
+                    start_minimized,
+                    "olaz is already running; notified primary instance and exiting"
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "single-instance socket check failed; continuing startup without lock"
+                );
+            }
+        }
+    }
 
     // Configure `WEBKIT_DISABLE_DMABUF_RENDERER=1` (Wayland) & `GDK_BACKEND=wayland,x11` BEFORE `gtk::init()`.
     configure_linux_webview_env();
@@ -184,8 +219,7 @@ fn main() -> Result<()> {
 
     prune_old_screenshots(Path::new(SCREENSHOT_STAGING_DIR), SCREENSHOT_RETENTION);
 
-    // Prepare runtime directories and promote any staged `pending/` Zalo runtime upgrade.
-    let platform_raw = ZaloPlatform::new(env!("CARGO_PKG_VERSION"));
+    // Promote any staged `pending/` Zalo runtime upgrade.
     let runtime_mgr = ZaloRuntimeManager::from_platform(&platform_raw);
     runtime_mgr.prepare_for_launch();
     if let Some(zalo_ver) = ZaloRuntimeManager::installed_version(&runtime_mgr.current_dir()) {
@@ -215,7 +249,7 @@ fn main() -> Result<()> {
         tokio_handle.clone(),
     );
 
-    let direct_ui = matches!(action, CliAction::Gui);
+    let direct_ui = matches!(action, CliAction::Gui { .. });
     let mp_for_bridge = Rc::clone(&main_process);
     let host = OfficialClientHost::new_with_mode(
         &platform,
@@ -231,15 +265,27 @@ fn main() -> Result<()> {
     main_process.attach_host(&host);
 
     match action {
-        CliAction::Gui | CliAction::Demo => {
-            let demo_mode = matches!(action, CliAction::Demo);
+        CliAction::Gui { start_minimized } => {
+            let _window = OlazAppWindow::launch_with_options(
+                platform,
+                runtime_mgr,
+                host,
+                main_process,
+                tokio_handle,
+                false,
+                start_minimized,
+                instance_rx,
+            );
+            gtk::main();
+        }
+        CliAction::Demo => {
             let _window = OlazAppWindow::launch(
                 platform,
                 runtime_mgr,
                 host,
                 main_process,
                 tokio_handle,
-                demo_mode,
+                true,
             );
             gtk::main();
         }
@@ -403,23 +449,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_parser_handles_help_version_probe_and_default_gui() {
-        assert_eq!(
-            CliAction::parse(["--help"]).unwrap(),
-            CliAction::Help
-        );
-        assert_eq!(
-            CliAction::parse(["-V"]).unwrap(),
-            CliAction::Version
-        );
+    fn cli_parser_handles_help_version_minimized_probe_and_default_gui() {
+        assert_eq!(CliAction::parse(["--help"]).unwrap(), CliAction::Help);
+        assert_eq!(CliAction::parse(["-V"]).unwrap(), CliAction::Version);
         assert_eq!(
             CliAction::parse(std::iter::empty::<&str>()).unwrap(),
-            CliAction::Gui
+            CliAction::Gui {
+                start_minimized: false
+            }
         );
         assert_eq!(
-            CliAction::parse(["--demo"]).unwrap(),
-            CliAction::Demo
+            CliAction::parse(["--minimized"]).unwrap(),
+            CliAction::Gui {
+                start_minimized: true
+            }
         );
+        assert_eq!(
+            CliAction::parse(["--tray"]).unwrap(),
+            CliAction::Gui {
+                start_minimized: true
+            }
+        );
+        assert_eq!(
+            CliAction::parse(["--hidden"]).unwrap(),
+            CliAction::Gui {
+                start_minimized: true
+            }
+        );
+        assert_eq!(
+            CliAction::parse(["zalo://open"]).unwrap(),
+            CliAction::Gui {
+                start_minimized: false
+            }
+        );
+        assert_eq!(CliAction::parse(["--demo"]).unwrap(), CliAction::Demo);
         assert_eq!(
             CliAction::parse(["--engine-probe"]).unwrap(),
             CliAction::EngineProbe {

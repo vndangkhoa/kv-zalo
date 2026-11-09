@@ -19,9 +19,9 @@ use olaz_core::{
     wire, CryptoBridge, FsBridge, KeychainCipher, LinuxSecretBackend, SafeStorage, ZaloPlatform,
 };
 use olaz_linux::{
-    pick_open_dialog, pick_save_file_with_dir, FileCard, IncomingVoipCall, LinuxCallCoordinator,
-    LinuxNotifier, NotificationEvent, NotificationIcon, NotificationPolicy, NotificationRequest,
-    DEFAULT_KICKOUT_NOTICE,
+    pick_open_dialog, pick_save_file_with_dir, AutostartManager, FileCard, IncomingVoipCall,
+    LinuxCallCoordinator, LinuxNotifier, NotificationEvent, NotificationIcon, NotificationPolicy,
+    NotificationRequest, DEFAULT_KICKOUT_NOTICE,
 };
 use olaz_net::{
     is_observed_zalo_endpoint, DownloadManager, MediaLoader, NetworkProxy, ZaloCookieJar,
@@ -586,12 +586,24 @@ pub enum WindowCommand {
 }
 
 /// Thread-safe mirror of primary GTK window state + command queue for `$zwindow` sync/async IPCs.
-#[derive(Default)]
 pub struct MainWindowState {
     pub is_maximized: AtomicBool,
     pub is_fullscreen: AtomicBool,
+    pub is_visible: AtomicBool,
     pub child_maximized: RwLock<HashMap<String, bool>>,
     cmd_tx: RwLock<Option<tokio::sync::mpsc::UnboundedSender<WindowCommand>>>,
+}
+
+impl Default for MainWindowState {
+    fn default() -> Self {
+        Self {
+            is_maximized: AtomicBool::new(false),
+            is_fullscreen: AtomicBool::new(false),
+            is_visible: AtomicBool::new(true),
+            child_maximized: RwLock::new(HashMap::new()),
+            cmd_tx: RwLock::new(None),
+        }
+    }
 }
 
 impl MainWindowState {
@@ -625,6 +637,7 @@ pub struct ZaloMainProcess {
     safe_storage: SafeStorage,
     keychain: Arc<KeychainCipher<LinuxSecretBackend>>,
     notifier: LinuxNotifier,
+    autostart: Arc<AutostartManager>,
     call_coordinator: Rc<RefCell<LinuxCallCoordinator>>,
     shared_worker: Rc<SharedWorkerRouter>,
     window_state: Arc<MainWindowState>,
@@ -658,19 +671,37 @@ impl ZaloMainProcess {
             platform.user_data().to_path_buf(),
             platform.temp_dir().to_path_buf(),
             platform.electron_path("downloads"),
+            platform.electron_path("documents"),
             platform.electron_path("documents").join("Zalo Received Files"),
+            platform.electron_path("pictures"),
+            platform.electron_path("videos"),
+            platform.electron_path("music"),
+            platform.electron_path("desktop"),
             platform.cache_dir().to_path_buf(),
         ];
         let downloads = DownloadManager::new(
             media_loader.clone(),
             platform.temp_dir().join("downloads"),
             Some(allowed_dl_roots),
-        );
+        )
+        .with_save_authorizer({
+            let p = Arc::clone(&platform);
+            move |path| p.is_writable(path)
+        })
+        .with_read_authorizer({
+            let p = Arc::clone(&platform);
+            move |path| p.is_readable(path)
+        });
         let crypto = Arc::new(CryptoBridge::new());
         let fs_bridge = FsBridge::new(Arc::clone(&platform));
         let safe_storage = SafeStorage::new();
         let keychain = Arc::new(KeychainCipher::for_platform(&platform));
         let notifier = LinuxNotifier::new();
+        let autostart = Arc::new(AutostartManager::new(
+            platform.base_dir(),
+            platform.autostart_dir(),
+            !platform.is_isolated_root(),
+        ));
         let call_coordinator = Rc::new(RefCell::new(LinuxCallCoordinator::new()));
         let shared_worker = SharedWorkerRouter::new();
         let last_kickout_notice = Arc::new(Mutex::new(None));
@@ -763,6 +794,7 @@ impl ZaloMainProcess {
             safe_storage,
             keychain,
             notifier: notifier.clone(),
+            autostart,
             call_coordinator,
             shared_worker,
             window_state: Arc::new(MainWindowState::default()),
@@ -836,6 +868,11 @@ impl ZaloMainProcess {
         &self.notifier
     }
 
+    #[allow(dead_code)]
+    pub fn autostart(&self) -> &Arc<AutostartManager> {
+        &self.autostart
+    }
+
     pub fn call_coordinator(&self) -> &Rc<RefCell<LinuxCallCoordinator>> {
         &self.call_coordinator
     }
@@ -904,6 +941,14 @@ impl ZaloMainProcess {
         let Some(host) = self.host() else {
             return;
         };
+        let legacy_autolaunch = self
+            .platform
+            .read_store("config")
+            .get("autolaunch")
+            .and_then(Value::as_bool);
+        if let Err(err) = self.autostart.reconcile(legacy_autolaunch) {
+            tracing::warn!(%err, "failed to reconcile XDG autostart desktop entry on startup");
+        }
         self.platform.normalize_database_adapter_state();
         let logged_in = self.has_session();
         if logged_in {
@@ -1015,8 +1060,13 @@ impl ZaloMainProcess {
             return;
         };
         let bridge = host.bridge();
-        bridge.send("visibility-change", vec![json!("show")]);
-        bridge.send("visibility-change", vec![json!("focus"), json!("1")]);
+        if self.window_state.is_visible.load(Ordering::Relaxed) {
+            bridge.send("visibility-change", vec![json!("show")]);
+            bridge.send("visibility-change", vec![json!("focus"), json!("1")]);
+        } else {
+            bridge.send("visibility-change", vec![json!("hide")]);
+            bridge.send("visibility-change", vec![json!("blur"), json!("1")]);
+        }
         if page == HostPage::Main && *self.push_login_success_after_load.borrow() {
             *self.push_login_success_after_load.borrow_mut() = false;
             bridge.send("login-success", vec![]);
@@ -1952,6 +2002,143 @@ impl ZaloMainProcess {
         bridge.handle_channel_sync("trust_path_from_blob", |_| Ok(json!(true)));
         bridge.handle_channel_sync("verify_zalo_pc_hardlink_support", |_| Ok(json!(false)));
 
+        // ---- 12. `$zconfig` Linux XDG autostart (`~/.config/autostart/olaz.desktop`) ----
+        {
+            let autostart = Arc::clone(&self.autostart);
+            bridge.handle_channel_sync("check-auto-launch", move |_| {
+                Ok(json!(autostart.state().open_at_login))
+            });
+        }
+        {
+            let autostart = Arc::clone(&self.autostart);
+            let p = Arc::clone(&platform);
+            bridge.handle_channel_sync("toggle-auto-launch", move |args| {
+                let enabled = args.first().and_then(Value::as_bool).unwrap_or(false);
+                let state = autostart
+                    .set_open_at_login(enabled)
+                    .map_err(|e| format!("failed to update Linux autostart entry: {e:#}"))?;
+                let mut cfg = p.read_store("config");
+                cfg.insert("autolaunch".to_string(), Value::Bool(state.open_at_login));
+                let _ = p.write_store("config", &cfg);
+                serde_json::to_value(state).map_err(|e| e.to_string())
+            });
+        }
+
+        // `$zFeatures.genThumb.writeSavePathFilePhoto(userId, fallbackName, bytes, msgObj)`
+        {
+            let p = Arc::clone(&platform);
+            let fsb = self.fs_bridge.clone();
+            let rt_handle = self.tokio_handle.clone();
+            bridge.handle_channel("gen-thumb_write-savepath-file-photo", move |args| {
+                let p = Arc::clone(&p);
+                let fsb = fsb.clone();
+                let rt_handle = rt_handle.clone();
+                async move {
+                    let sanitize_seg = |raw: &str, default_val: &str| -> String {
+                        let cleaned: String = raw
+                            .trim()
+                            .chars()
+                            .map(|c| {
+                                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                                    c
+                                } else {
+                                    '_'
+                                }
+                            })
+                            .collect();
+                        let cleaned = cleaned.trim_matches('.').to_string();
+                        if cleaned.is_empty() {
+                            default_val.to_string()
+                        } else {
+                            cleaned
+                        }
+                    };
+
+                    let user_id = args
+                        .first()
+                        .and_then(|v| match v {
+                            Value::String(s) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("default");
+                    let fallback_name = args.get(1).and_then(Value::as_str).unwrap_or("");
+                    let msg_obj = args.get(3).and_then(Value::as_object);
+                    let to_uid = msg_obj
+                        .and_then(|m| m.get("toUid"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let msg_stem = msg_obj
+                        .and_then(|m| {
+                            m.get("msgId")
+                                .or_else(|| m.get("cliMsgId"))
+                                .or_else(|| m.get("globalMsgId"))
+                        })
+                        .and_then(|v| match v {
+                            Value::String(s) if !s.is_empty() => Some(s.clone()),
+                            Value::Number(n) => Some(n.to_string()),
+                            _ => None,
+                        });
+                    let stem_raw = msg_stem
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| {
+                            let trimmed = fallback_name.trim_end_matches(".jpg").trim_end_matches(".jpeg");
+                            (!trimmed.is_empty()).then_some(trimmed)
+                        })
+                        .unwrap_or("");
+                    let default_stem = format!("thumb-{}", uuid::Uuid::new_v4().simple());
+                    let stem = sanitize_seg(stem_raw, &default_stem);
+
+                    let bytes_opt = args.get(2).and_then(|val| {
+                        if let Some(b) = wire::decode_bytes(val) {
+                            return Some(b);
+                        }
+                        if let Some(s) = val.as_str() {
+                            let payload = s
+                                .split_once(";base64,")
+                                .map(|(_, b)| b)
+                                .unwrap_or(s);
+                            let payload_val = Value::String(payload.to_string());
+                            return CryptoBridge::decode_input(Some(&payload_val), Some("base64"))
+                                .ok();
+                        }
+                        if let Some(arr) = val.as_array() {
+                            let mut out = Vec::with_capacity(arr.len());
+                            for item in arr {
+                                out.push(item.as_u64()? as u8);
+                            }
+                            return Some(out);
+                        }
+                        None
+                    });
+                    let Some(bytes) = bytes_opt.filter(|b| !b.is_empty()) else {
+                        return Err("PIC_GEN_GET_WRITE_TO_SAVEPATH_ERROR: empty image bytes".into());
+                    };
+
+                    let mut dir = p
+                        .user_data()
+                        .join("ZaloDownloads")
+                        .join("filethumb")
+                        .join(sanitize_seg(user_id, "default"));
+                    if !to_uid.trim().is_empty() {
+                        dir = dir.join(sanitize_seg(to_uid, "chat"));
+                    }
+                    let dest = dir.join(format!("{stem}.jpg"));
+                    let dest_for_write = dest.clone();
+                    let (tx, rx) = oneshot::channel();
+                    rt_handle.spawn_blocking(move || {
+                        let res = fsb.write_file_sync(&dest_for_write, &bytes);
+                        let _ = tx.send(res);
+                    });
+                    rx.await
+                        .map_err(|e| format!("EIO: {e}"))?
+                        .map_err(|e| e.to_string())?;
+                    p.grant_readable_path(&dest);
+                    Ok(Value::String(dest.to_string_lossy().into_owned()))
+                }
+            });
+        }
+
         // Benign Electron updater / power / analytics / content-protection channels acknowledged cleanly
         bridge.acknowledge_channels(&[
             "set-content-protection",
@@ -1965,6 +2152,52 @@ impl ZaloMainProcess {
 
     fn install_preload_local_handlers(&self, bridge: &Rc<ZaloBridge>) {
         let platform = Arc::clone(&self.platform);
+
+        // 0. `$zconfig` start-in-tray & legacy `localStorage` migration (`olaz-autostart.json` + `olaz.desktop`)
+        {
+            let autostart = Arc::clone(&self.autostart);
+            bridge.register_async("$zconfig.getAutostartState", move |_| {
+                let state = autostart.state();
+                async move { serde_json::to_value(state).map_err(|e| e.to_string()) }
+            });
+        }
+        {
+            let autostart = Arc::clone(&self.autostart);
+            bridge.register_async("$zconfig.setStartInTray", move |args| {
+                let start_in_tray = args.first().and_then(Value::as_bool).unwrap_or(true);
+                let res = autostart
+                    .set_start_in_tray(start_in_tray)
+                    .map_err(|e| format!("failed to update start-in-tray setting: {e:#}"));
+                async move {
+                    let state = res?;
+                    serde_json::to_value(state).map_err(|e| e.to_string())
+                }
+            });
+        }
+        {
+            let autostart = Arc::clone(&self.autostart);
+            let p = Arc::clone(&platform);
+            bridge.register_async("$zconfig.migrateLegacyAutoLaunch", move |args| {
+                let legacy_on = args.first().and_then(Value::as_bool).unwrap_or(false);
+                let res = if legacy_on {
+                    let out = autostart
+                        .migrate_legacy_enabled()
+                        .map_err(|e| format!("failed to migrate legacy autostart state: {e:#}"));
+                    if let Ok(ref st) = out {
+                        let mut cfg = p.read_store("config");
+                        cfg.insert("autolaunch".to_string(), Value::Bool(st.open_at_login));
+                        let _ = p.write_store("config", &cfg);
+                    }
+                    out
+                } else {
+                    Ok(autostart.state())
+                };
+                async move {
+                    let state = res?;
+                    serde_json::to_value(state).map_err(|e| e.to_string())
+                }
+            });
+        }
 
         // 1. `electron-store` backing (`$zelectron.store*`)
         {
@@ -2105,24 +2338,20 @@ impl ZaloMainProcess {
         ] {
             let p = Arc::clone(&platform);
             let path_owned = path.to_string();
-            bridge.register_async(path, move |args| {
-                let p = Arc::clone(&p);
-                let path_owned = path_owned.clone();
-                async move {
-                    let Some(raw) = args.first().and_then(Value::as_str) else {
-                        return Ok(json!(false));
-                    };
-                    let target = Path::new(raw);
-                    let ok = if path_owned.ends_with("canRead") {
-                        target.exists()
-                    } else {
-                        p.is_writable(target)
-                            || target
-                                .parent()
-                                .is_some_and(|par| par.exists() && p.is_writable(par))
-                    };
-                    Ok(json!(ok))
-                }
+            bridge.register_sync(path, move |args| {
+                let Some(raw) = args.first().and_then(Value::as_str) else {
+                    return Ok(json!(false));
+                };
+                let target = Path::new(raw);
+                let ok = if path_owned.ends_with("canRead") {
+                    target.exists()
+                } else {
+                    p.is_writable(target)
+                        || target
+                            .parent()
+                            .is_some_and(|par| par.exists() && p.is_writable(par))
+                };
+                Ok(json!(ok))
             });
         }
         bridge.register_async("$znode.nativelibs.zfileAddon.getDiskInfo", |_| async move {
@@ -2309,6 +2538,7 @@ impl ZaloMainProcess {
             "$zFileManager.zcloudCloneAndMatchChecksum",
             "$zFileManager.zcloudDenoiseFile",
             "$zFileManager.zcloudNoiseFile",
+            "$zFileManager.generateVideoThumbnail",
         ] {
             let fsb = self.fs_bridge.clone();
             let rt_handle = self.tokio_handle.clone();
@@ -2644,21 +2874,24 @@ async fn run_open_dialog_portal(
         }
     }
 
+    let title_bg = title.clone();
+    let default_bg = default_path.clone();
+    let filters_bg = filters.clone();
     let (tx, rx) = oneshot::channel();
     tokio_handle.spawn(async move {
         let picked = pick_open_dialog(
-            &title,
+            &title_bg,
             multiple,
             directory,
-            default_path.as_deref(),
-            &filters,
+            default_bg.as_deref(),
+            &filters_bg,
         )
         .await;
         let _ = tx.send(picked);
     });
     let paths = match rx.await {
         Ok(Ok(list)) => list,
-        _ => Vec::new(),
+        _ => gtk_open_dialog_fallback(&title, multiple, directory, default_path.as_deref(), &filters),
     };
     for p in &paths {
         if directory {
@@ -2686,6 +2919,20 @@ async fn run_save_dialog_portal(
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty());
 
+    let mut filter_exts: Vec<String> = Vec::new();
+    if let Some(arr) = opts.get("filters").and_then(Value::as_array) {
+        for item in arr {
+            if let Some(exts) = item.get("extensions").and_then(Value::as_array) {
+                for ext in exts.iter().filter_map(Value::as_str) {
+                    let clean = ext.trim().trim_start_matches('.');
+                    if !clean.is_empty() && clean != "*" {
+                        filter_exts.push(clean.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     let (initial_dir, suggested_name) = match default_raw {
         Some(raw) => {
             let p = Path::new(raw);
@@ -2712,15 +2959,119 @@ async fn run_save_dialog_portal(
         ),
     };
 
+    if let Some(ext) = Path::new(&suggested_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        if !filter_exts.iter().any(|x| x.eq_ignore_ascii_case(ext)) {
+            filter_exts.push(ext.to_string());
+        }
+    }
+
+    let title_bg = title.clone();
+    let suggested_bg = suggested_name.clone();
+    let dir_bg = initial_dir.clone();
     let (tx, rx) = oneshot::channel();
     tokio_handle.spawn(async move {
-        let res = pick_save_file_with_dir(&title, &suggested_name, initial_dir.as_deref()).await;
+        let res = pick_save_file_with_dir(&title_bg, &suggested_bg, dir_bg.as_deref()).await;
         let _ = tx.send(res);
     });
 
-    let dest = rx.await.ok()?.ok().flatten()?;
+    let dest = match rx.await {
+        Ok(Ok(opt)) => opt?,
+        _ => gtk_save_dialog_fallback(&title, &suggested_name, initial_dir.as_deref())?,
+    };
     platform.grant_writable_path(&dest);
+    platform.grant_readable_path(&dest);
+    // On `DARWIN` (`process.platform === "darwin"`), Zalo's `_handlePhotoDialog` / `_handleVideoDialog`
+    // / `_handleFileDialog` / `_handleVoiceDialog` append `.<ext>` when the returned path omits it.
+    let dest_str = dest.to_string_lossy();
+    for ext in &filter_exts {
+        let suffix = format!(".{ext}");
+        if !dest_str.ends_with(&suffix) {
+            let with_ext = PathBuf::from(format!("{dest_str}{suffix}"));
+            platform.grant_writable_path(&with_ext);
+            platform.grant_readable_path(&with_ext);
+        }
+    }
     Some(dest)
+}
+
+fn gtk_open_dialog_fallback(
+    title: &str,
+    multiple: bool,
+    directory: bool,
+    default_path: Option<&Path>,
+    filters: &[(String, Vec<String>)],
+) -> Vec<PathBuf> {
+    if !glib::MainContext::default().is_owner() || !gtk::is_initialized() {
+        return Vec::new();
+    }
+    let action = if directory {
+        gtk::FileChooserAction::SelectFolder
+    } else {
+        gtk::FileChooserAction::Open
+    };
+    let dialog = gtk::FileChooserNative::new(
+        Some(title),
+        gtk::Window::NONE,
+        action,
+        Some("_Open"),
+        Some("_Cancel"),
+    );
+    dialog.set_select_multiple(multiple);
+    if let Some(p) = default_path {
+        let dir = if p.is_dir() { Some(p) } else { p.parent() };
+        if let Some(d) = dir.filter(|d| d.is_dir()) {
+            let _ = dialog.set_current_folder(d);
+        }
+    }
+    for (name, exts) in filters {
+        let f = gtk::FileFilter::new();
+        f.set_name(Some(name));
+        for ext in exts {
+            if ext == "*" {
+                f.add_pattern("*");
+            } else {
+                f.add_pattern(&format!("*.{}", ext.trim_start_matches('.')));
+            }
+        }
+        dialog.add_filter(f);
+    }
+    if dialog.run() == gtk::ResponseType::Accept {
+        dialog.filenames()
+    } else {
+        Vec::new()
+    }
+}
+
+fn gtk_save_dialog_fallback(
+    title: &str,
+    suggested_name: &str,
+    initial_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if !glib::MainContext::default().is_owner() || !gtk::is_initialized() {
+        return None;
+    }
+    let dialog = gtk::FileChooserNative::new(
+        Some(title),
+        gtk::Window::NONE,
+        gtk::FileChooserAction::Save,
+        Some("_Save"),
+        Some("_Cancel"),
+    );
+    dialog.set_do_overwrite_confirmation(true);
+    if let Some(dir) = initial_dir.filter(|d| d.is_dir()) {
+        let _ = dialog.set_current_folder(dir);
+    }
+    dialog.set_current_name(suggested_name);
+    if dialog.run() == gtk::ResponseType::Accept {
+        dialog.filename()
+    } else {
+        None
+    }
 }
 
 fn read_clipboard_paths_or_staged_png(platform: &ZaloPlatform) -> Value {
