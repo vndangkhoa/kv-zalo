@@ -142,7 +142,12 @@ download_asset() {
   local asset="$1"
   local out="$WORK_DIR/$asset"
   for base in "${MIRROR_BASES[@]}"; do
+    rm -f "$out"
     if fetch_to "${base}/${asset}" "$out" 2>/dev/null && [ -s "$out" ]; then
+      if head -c 96 "$out" | LC_ALL=C grep -qiE '<!doctype html|<html'; then
+        rm -f "$out"
+        continue
+      fi
       printf '%s\n' "$out"
       return 0
     fi

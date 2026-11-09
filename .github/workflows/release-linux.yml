@@ -17,7 +17,9 @@ permissions:
 jobs:
   release-linux:
     name: Build & Publish Omarchy + Ubuntu 1-Click Setup
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

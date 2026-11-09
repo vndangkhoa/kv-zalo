@@ -54,7 +54,10 @@ git push $( [ "$FORCE_TAG" -eq 1 ] && printf '%s' '--force' ) origin "$TAG"
 
 git push github main
 git push github main:feat/linux-rust-omarchy-ubuntu || true
-git push $( [ "$FORCE_TAG" -eq 1 ] && printf '%s' '--force' ) github "$TAG"
+if [ "$FORCE_TAG" -eq 1 ]; then
+  git push github ":refs/tags/${TAG}" 2>/dev/null || true
+fi
+git push github "$TAG"
 
 if git remote get-url gitlab >/dev/null 2>&1; then
   git push gitlab main || echo "Warning: GitLab git push failed (server may be unavailable)."
