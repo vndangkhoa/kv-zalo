@@ -42,11 +42,13 @@ use serde_json::{json, Map, Value};
 use tempfile::TempDir;
 use url::Url;
 
-/// Executes a JavaScript snippet with `node -e` and parses stdout as JSON.
+/// Executes a JavaScript snippet with `node` via a temporary `.cjs` file and parses stdout as JSON.
 fn run_node_json(script: &str) -> Value {
+    let dir = TempDir::new().expect("tempdir for node script");
+    let script_path = dir.path().join("snippet.cjs");
+    std::fs::write(&script_path, script).expect("write snippet.cjs");
     let out = Command::new("node")
-        .arg("-e")
-        .arg(script)
+        .arg(&script_path)
         .output()
         .expect("node binary must be available to run parity tests");
     assert!(
@@ -1934,7 +1936,7 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
         if s.contains("/*olaz-io-win*/") {
             hit_io_win = true;
         }
-        if s.contains(r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"async",loading:"eager""#) {
+        if s.contains(r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"sync",loading:"eager""#) {
             hit_zimg_eager = true;
         }
         if s.contains("/*olaz-autostart-ui*/") && s.contains("/*olaz-autostart-fx*/") {
@@ -2011,7 +2013,7 @@ fn transform_local_url_unwraps_whatwg_url_objects_and_platform_permits_cache_and
          const uObj = new URL('file:///home/khoavo/.local/share/olaz/ZaloData/sticker/ami%201.png');\n\
          const out = [\n\
            R.transformLocalUrl(uObj),\n\
-           R.transformLocalUrl('file:///tmp/photo.jpg'),\n\
+           R.transformLocalUrl('file:///tmp/photo #1?.jpg'),\n\
            R.transformLocalUrl('//stc-zalo.zadn.vn/sticker/ami.png'),\n\
          ];\n\
          console.log(JSON.stringify(out));"
@@ -2027,7 +2029,7 @@ fn transform_local_url_unwraps_whatwg_url_objects_and_platform_permits_cache_and
         parsed,
         json!([
             "zfile://local/home/khoavo/.local/share/olaz/ZaloData/sticker/ami%201.png",
-            "zfile://local/tmp/photo.jpg",
+            "zfile://local/tmp/photo%20%231%3F.jpg",
             "https://stc-zalo.zadn.vn/sticker/ami.png"
         ])
     );
@@ -2185,9 +2187,9 @@ async fn html_csp_patch_direct_ui_unused_filename_mp4thumb_media_stream_rewrite_
         .expect("HTML CSP meta tag must be rewritten");
     let html_str = std::str::from_utf8(&patched_html).unwrap();
     assert!(!html_str.contains("upgrade-insecure-requests"));
-    assert!(html_str.contains("media-src * blob: zfile: file: http://127.0.0.1:*"));
-    assert!(html_str.contains("img-src * data: blob: zfile: file: http://127.0.0.1:*"));
-    assert!(html_str.contains("connect-src 'self' https://*.zalo.me blob: http://127.0.0.1:* zfile:"));
+    assert!(html_str.contains("media-src * blob: zfile: file: 'self' zalo-app: http://127.0.0.1:*"));
+    assert!(html_str.contains("img-src * data: blob: zfile: file: 'self' zalo-app: http://127.0.0.1:*"));
+    assert!(html_str.contains("connect-src 'self' https://*.zalo.me blob: zalo-app: http://127.0.0.1:* zfile: data:"));
     assert!(
         patch_asar_bundle("pc-dist/popup-viewer.html", &patched_html).is_none(),
         "already-patched CSP must be idempotent"
@@ -2365,6 +2367,8 @@ async fn html_csp_patch_direct_ui_unused_filename_mp4thumb_media_stream_rewrite_
           vid.poster = 'file:///home/user/thumb 1.jpg';
           const img = new HTMLImageElement();
           img.src = 'file:///home/user/pic 1.jpg';
+          const portalImg = new HTMLImageElement();
+          portalImg.setAttribute('src', 'zfile://local/home/user/Cache/1794199743201_h');
           const fetched = await window.fetch('file:///home/user/local.jxl');
           console.log(JSON.stringify({{
             syncFresh,
@@ -2378,6 +2382,7 @@ async fn html_csp_patch_direct_ui_unused_filename_mp4thumb_media_stream_rewrite_
             vidCrossOrigin: vid.getAttribute('crossorigin'),
             vidPoster: vid.poster,
             imgSrc: img.src,
+            portalImgAttr: portalImg.getAttribute('src'),
             fetchedUrl: fetched.url,
           }}));
         }})();
@@ -2407,9 +2412,22 @@ async fn html_csp_patch_direct_ui_unused_filename_mp4thumb_media_stream_rewrite_
         "http://127.0.0.1:43210/secret-tok/zfile/local/home/user/Zalo%20Received%20Files/clip%201.mp4"
     );
     assert_eq!(res["vidCrossOrigin"], "anonymous");
-    assert_eq!(res["vidPoster"], "zfile://local/home/user/thumb%201.jpg");
-    assert_eq!(res["imgSrc"], "zfile://local/home/user/pic%201.jpg");
-    assert_eq!(res["fetchedUrl"], "zfile://local/home/user/local.jxl");
+    assert_eq!(
+        res["vidPoster"],
+        "zalo-app://local/__olaz/zfile/home/user/thumb%201.jpg"
+    );
+    assert_eq!(
+        res["imgSrc"],
+        "zalo-app://local/__olaz/zfile/home/user/pic%201.jpg"
+    );
+    assert_eq!(
+        res["portalImgAttr"],
+        "zalo-app://local/__olaz/zfile/home/user/Cache/1794199743201_h"
+    );
+    assert_eq!(
+        res["fetchedUrl"],
+        "zalo-app://local/__olaz/zfile/home/user/local.jxl"
+    );
 
     // 4. Native `ffmpeg` video thumbnail extraction works on BOTH plain `.mp4` and `fileNoise` `.mp4`!
     if Command::new("ffmpeg")
@@ -2736,4 +2754,221 @@ globalThis.webkit = {{
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("ALL_OK"));
+}
+
+#[test]
+fn popup_viewer_zimg_portal_sync_and_photofs_denoising_work_in_node() {
+    // 1. Verify Patch #13 (`Ze` `Z.d.Image`): `decoding:"sync"`, `loading:"eager"`, native DOM `load`
+    //    listener + cached `complete && naturalWidth > 0` across both mount and `src` updates.
+    let synthetic_ze = br#"class Ze extends o.a.Component{constructor(e){super(e),this.imageRef=o.a.createRef(),this._mounted=!1,this.state={loaded:!1},this.interceptOnLoad=e=>{this._mounted&&this.setState({loaded:!0})}}componentDidMount(){this._mounted=!0,this.props.src&&Xe.register(this.props.src)}componentWillUnmount(){this._mounted=!1,this.props.src&&Xe.unregister(this.props.src)}render(){const e={draggable:!1,style:Object.assign({width:"inherit",height:"inherit",cursor:"pointer"},this.props.style,{visibility:this.state.loaded?"visible":"hidden"}),loading:"lazy"};return o.a.createElement("img",Object.assign({ref:this.imageRef},e,{src:this.props.src,onLoad:this.interceptOnLoad,"data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"async",loading:"lazy"}))}}"#;
+    let patched_ze = patch_zalo_linux_renderer_bundle(synthetic_ze)
+        .expect("Ze patch #13 must match");
+    assert!(patch_zalo_linux_renderer_bundle(&patched_ze).is_none());
+    let patched_ze_str = std::str::from_utf8(&patched_ze).unwrap();
+    assert!(patched_ze_str.contains(r#"decoding:"sync",loading:"eager""#));
+
+    // 2. Verify `PHOTO_FS` (`READ_ARRAY_BUFFER` + `READ_PARTIAL`) strips Zalo `fileNoise` and
+    //    `wrappedWinOpen` installs `zalo-app://local/__olaz/zfile/` DOM URL rewriters onto child `popupWin`.
+    let tmp = TempDir::new().unwrap();
+    let platform = ZaloPlatform::with_root(tmp.path(), "26.10.20");
+    let scripts = olaz_core::popup_user_scripts(&platform);
+    let find_script = |label: &str| -> &str {
+        scripts
+            .iter()
+            .find(|(name, _)| name == label)
+            .map(|(_, s)| s.as_str())
+            .unwrap()
+    };
+
+    let script = format!(
+        r#"
+const registered = [];
+const unregistered = [];
+const Xe = {{
+  register: (u) => registered.push(u),
+  unregister: (u) => unregistered.push(u),
+}};
+const o = {{
+  a: {{
+    Component: class {{
+      constructor(p) {{ this.props = p; }}
+      setState(next) {{ this.state = typeof next === 'function' ? next(this.state) : Object.assign({{}}, this.state, next); }}
+    }},
+    createRef: () => ({{ current: null }}),
+    createElement: (tag, props) => ({{ tag, props }}),
+  }},
+}};
+{patched_ze_str}
+
+// Simulate cross-window portal `<img>` where React's synthetic `onLoad` does NOT fire,
+// testing both native DOM `load` event AND `componentDidUpdate` to an already-cached image!
+const makePortalImg = (complete, nw) => {{
+  const listeners = {{}};
+  return {{
+    complete,
+    naturalWidth: nw,
+    addEventListener(type, fn) {{ (listeners[type] = listeners[type] || []).push(fn); }},
+    emit(type) {{ for (const fn of (listeners[type] || [])) fn({{ target: this }}); }},
+  }};
+}};
+
+const plainJpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0xff, 0xd9]);
+const noisedJpeg = Buffer.alloc(plainJpeg.length + 6);
+plainJpeg.copy(noisedJpeg, 0);
+for (let i = 0; i < Math.min(100, plainJpeg.length); i++) noisedJpeg[i] ^= 0x93;
+Buffer.from([0x07, 0x7a, 0x41, 0x6c, 0x4f, 0x07]).copy(noisedJpeg, plainJpeg.length);
+
+// Child popup realm with its own Element.prototype!
+class ChildElement {{
+  constructor(tag) {{ this.tagName = tag; this._attrs = {{}}; }}
+  hasAttribute(k) {{ return Object.prototype.hasOwnProperty.call(this._attrs, k.toLowerCase()); }}
+  getAttribute(k) {{ return this._attrs[k.toLowerCase()] ?? null; }}
+  setAttribute(k, v) {{ this._attrs[k.toLowerCase()] = String(v); }}
+}}
+const childWin = {{
+  closed: false,
+  location: {{ href: 'about:blank' }},
+  document: {{ readyState: 'loading', body: null }},
+  Element: ChildElement,
+  addEventListener() {{}},
+  removeEventListener() {{}},
+}};
+
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.location = {{ protocol: 'zalo-app:', href: 'zalo-app://local/index.html', pathname: '/index.html', origin: 'zalo-app://local' }};
+globalThis.navigator = {{ userAgent: 'Mozilla/5.0', clipboard: {{}} }};
+globalThis.__olazMediaProxyBase = 'http://127.0.0.1:45555/tok';
+globalThis.open = () => childWin;
+globalThis.document = {{
+  readyState: 'complete',
+  documentElement: {{ style: {{ setProperty() {{}} }} }},
+  head: {{ appendChild() {{}} }},
+  createElement(tag) {{ return {{ tagName: tag, style: {{}}, setAttribute() {{}} }}; }},
+  addEventListener() {{}},
+}};
+globalThis.MutationObserver = class {{ observe() {{}} }};
+globalThis.addEventListener = () => {{}};
+
+let sliceCheckNoise = null;
+globalThis.webkit = {{
+  messageHandlers: {{
+    zlog: {{ postMessage() {{}} }},
+    zstate: {{ postMessage() {{}} }},
+    znet: {{ postMessage: async () => ({{ status: 200, headers: {{}}, body: '' }}) }},
+    zbridge: {{
+      postMessage: async (msg) => {{
+        if (msg.kind === 'call' && msg.path === '$zFileManager.getFileArrayBuffer') {{
+          return {{ __arraybuffer: true, __bytes: noisedJpeg.toString('base64') }};
+        }}
+        if (msg.kind === 'call' && msg.path === '$zFileManager.readFileSlice') {{
+          sliceCheckNoise = msg.args[3];
+          return {{ __arraybuffer: true, __bytes: plainJpeg.subarray(0, msg.args[2]).toString('base64') }};
+        }}
+        return null;
+      }},
+    }},
+  }},
+}};
+
+{bridge_spec}
+{local_modules}
+{direct_ui}
+{bridge_js}
+
+(async () => {{
+  // A. Ze native DOM `load` listener in portal
+  const z1 = new Ze({{ src: 'zalo-app://local/__olaz/zfile/tmp/a.jpg' }});
+  const el1 = makePortalImg(false, 0);
+  z1.imageRef.current = el1;
+  z1.componentDidMount();
+  const r1Before = z1.render();
+  el1.emit('load');
+  const r1After = z1.render();
+
+  // B. Ze `componentDidUpdate` to an already-cached image
+  const z2 = new Ze({{ src: '' }});
+  const el2 = makePortalImg(false, 0);
+  z2.imageRef.current = el2;
+  z2.componentDidMount();
+  el2.complete = true;
+  el2.naturalWidth = 640;
+  const prevProps = z2.props;
+  z2.props = {{ src: 'zalo-app://local/__olaz/zfile/tmp/cached_h.jpg' }};
+  z2.componentDidUpdate(prevProps);
+  await new Promise((r) => setTimeout(r, 15));
+  const r2After = z2.render();
+
+  // C. Child popup window `Element.prototype.setAttribute('src', 'zfile://local/...')`
+  const opened = window.open('/popup-viewer.html', 'windowId=photo-viewer', 'width=800,height=600');
+  let dclFired = false;
+  opened.addEventListener('DOMContentLoaded', () => {{ dclFired = true; }});
+  childWin.location.href = 'zalo-app://local/popup-viewer.html';
+  childWin.document.readyState = 'complete';
+  childWin.document.body = {{}};
+  await new Promise((r) => setTimeout(r, 40));
+  const popupImg = new ChildElement('IMG');
+  popupImg.setAttribute('src', 'zfile://local/home/khoavo/Cache/1794199743201_h');
+  const popupVid = new ChildElement('VIDEO');
+  popupVid.setAttribute('src', 'zfile://local/home/khoavo/Cache/clip.mp4');
+
+  // D. PHOTO_FS READ_ARRAY_BUFFER + READ_PARTIAL denoising
+  window.$zsub = {{}};
+  let port = null;
+  window.$zsub.$zMsgChannel.onReceiveTransferredPortV2((ev) => {{ port = ev.ports[0]; }});
+  await window.$zMsgChannel.requestOpenChannelTo('main-renderer', 'utility-process-media', 'ch-denoise');
+  await new Promise((r) => setTimeout(r, 15));
+  port.start();
+  const ask = (id, op, extra) => new Promise((res, rej) => {{
+    const h = (ev) => {{
+      const d = ev.data || ev;
+      if (d && d.id === id && d.messageType === 'response') {{
+        port.removeEventListener('message', h);
+        d.error ? rej(d.error) : res(d.result);
+      }}
+    }};
+    port.addEventListener('message', h);
+    port.postMessage({{ id, type: 'PHOTO_FS', messageType: 'request', params: {{ payload: Object.assign({{ operation: op, path: '/cache/noised_photo' }}, extra) }} }});
+  }});
+  const fullAb = await ask(10, 'READ_ARRAY_BUFFER', {{}});
+  const partAb = await ask(11, 'READ_PARTIAL', {{ start: 0, end: 4 }});
+  port.close();
+
+  console.log(JSON.stringify({{
+    r1VisBefore: r1Before.props.style.visibility,
+    r1VisAfter: r1After.props.style.visibility,
+    r2VisAfter: r2After.props.style.visibility,
+    dclFired,
+    popupImgSrc: popupImg.getAttribute('src'),
+    popupVidSrc: popupVid.getAttribute('src'),
+    fullHex: Buffer.from(fullAb).toString('hex'),
+    expectedFullHex: plainJpeg.toString('hex'),
+    partHex: Buffer.from(partAb).toString('hex'),
+    sliceCheckNoise,
+  }}));
+  process.exit(0);
+}})();
+"#,
+        bridge_spec = find_script("bridge-spec"),
+        local_modules = find_script("local-modules"),
+        direct_ui = find_script("linux-direct-ui"),
+        bridge_js = find_script("bridge"),
+    );
+
+    let res = run_node_json(&script);
+    assert_eq!(res["r1VisBefore"], "hidden");
+    assert_eq!(res["r1VisAfter"], "visible");
+    assert_eq!(res["r2VisAfter"], "visible");
+    assert_eq!(res["dclFired"], true);
+    assert_eq!(
+        res["popupImgSrc"],
+        "zalo-app://local/__olaz/zfile/home/khoavo/Cache/1794199743201_h"
+    );
+    assert_eq!(
+        res["popupVidSrc"],
+        "http://127.0.0.1:45555/tok/zfile/local/home/khoavo/Cache/clip.mp4"
+    );
+    assert_eq!(res["fullHex"], res["expectedFullHex"]);
+    assert_eq!(res["partHex"], "ffd8ffe0");
+    assert_eq!(res["sliceCheckNoise"], true);
 }

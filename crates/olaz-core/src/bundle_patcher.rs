@@ -621,7 +621,8 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
   };
   local['$zFileManager.getFileBlob'] = async (p) => {
     const ab = await window.$zFileManager.getFileArrayBuffer(p);
-    return new Blob([ab]);
+    const clean = typeof window.__olazDenoiseU8 === 'function' ? window.__olazDenoiseU8(ab) : ab;
+    return new Blob([clean]);
   };
   local['$zFileManager.getFileBlobURL'] = async (p) => {
     const blob = await local['$zFileManager.getFileBlob'](p);
@@ -1050,9 +1051,12 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
   unusedFilenameAsync.async = unusedFilenameAsync;
   local['$znode.unusedFilename'] = unusedFilenameAsync;
 
-  // 5. Rewrite raw `file:///...` media/image/CSS subresources to `zfile://local/...`,
+  // 5. Rewrite `file:///...` and `zfile://...` image/CSS/fetch subresources to same-origin
+  //    `zalo-app://local/__olaz/zfile/...` (so both primary `WebView`s and `related_view`
+  //    `popup-viewer.html` child `WebView`s load local media cleanly in WebKit2GTK),
   //    route `<video>`/`<audio>` local streams over the loopback HTTP 206 media proxy,
   //    and normalize protocol-relative `//...` CDN URLs to `https://...` on `zalo-app://` pages.
+  const ZAPP_ZFILE_PREFIX = 'zalo-app://local/__olaz/zfile/';
   const encodeLocalPathSegments = (rawPath) => {
     const stripped = String(rawPath || '').replace(/^\/+/, '');
     return stripped.split('/').map((seg) => {
@@ -1065,12 +1069,31 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     const idx = raw.search(/[?#]/);
     return idx >= 0 ? [raw.slice(0, idx), raw.slice(idx)] : [raw, ''];
   };
+  const extractLocalFilePath = (u) => {
+    const s = (u && typeof u === 'object' && typeof u.href === 'string') ? u.href : u;
+    if (typeof s !== 'string') return null;
+    if (s.startsWith(ZAPP_ZFILE_PREFIX)) {
+      const [pathPart, suffix] = splitQueryHash(s.slice(ZAPP_ZFILE_PREFIX.length));
+      return { encodedPath: encodeLocalPathSegments(pathPart), suffix };
+    }
+    if (/^file:/i.test(s)) {
+      const [pathPart, suffix] = splitQueryHash(s.replace(/^file:\/+/i, ''));
+      return { encodedPath: encodeLocalPathSegments(pathPart), suffix };
+    }
+    if (/^zfile:/i.test(s)) {
+      const after = s.replace(/^zfile:\/+/i, '');
+      const rel = after.startsWith('local/') ? after.slice(6) : after;
+      const [pathPart, suffix] = splitQueryHash(rel);
+      return { encodedPath: encodeLocalPathSegments(pathPart), suffix };
+    }
+    return null;
+  };
   const rewriteFileUrl = (u) => {
     const s = (u && typeof u === 'object' && typeof u.href === 'string') ? u.href : u;
     if (typeof s !== 'string') return u;
-    if (s.startsWith('file:')) {
-      const [pathPart, suffix] = splitQueryHash(s.replace(/^file:\/+/, ''));
-      return 'zfile://local/' + encodeLocalPathSegments(pathPart) + suffix;
+    const loc = extractLocalFilePath(s);
+    if (loc) {
+      return ZAPP_ZFILE_PREFIX + loc.encodedPath + loc.suffix;
     }
     if (s.startsWith('//')) return 'https:' + s;
     return u;
@@ -1081,23 +1104,26 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
       : ''
   );
   const rewriteMediaStreamUrl = (u) => {
-    const first = rewriteFileUrl(u);
-    if (typeof first !== 'string') return first;
+    const s = (u && typeof u === 'object' && typeof u.href === 'string') ? u.href : u;
+    if (typeof s !== 'string') return u;
     const base = getMediaProxyBase();
-    if (!base) return first;
-    if (first.startsWith('zfile:')) {
-      const after = first.replace(/^zfile:\/+/, '');
-      const rel = after.startsWith('local/') ? after.slice(6) : after;
-      const [pathPart, suffix] = splitQueryHash(rel);
-      return base + '/zfile/local/' + encodeLocalPathSegments(pathPart) + suffix;
+    const loc = extractLocalFilePath(s);
+    if (loc) {
+      return base
+        ? (base + '/zfile/local/' + loc.encodedPath + loc.suffix)
+        : (ZAPP_ZFILE_PREFIX + loc.encodedPath + loc.suffix);
     }
-    if (first.startsWith('zalo-app:')) {
-      const after = first.replace(/^zalo-app:\/+/, '');
-      const rel = after.startsWith('local/') ? after.slice(6) : after;
-      const [pathPart, suffix] = splitQueryHash(rel);
-      return base + '/zalo-app/local/' + encodeLocalPathSegments(pathPart) + suffix;
+    if (/^zalo-app:/i.test(s)) {
+      if (base) {
+        const after = s.replace(/^zalo-app:\/+/i, '');
+        const rel = after.startsWith('local/') ? after.slice(6) : after;
+        const [pathPart, suffix] = splitQueryHash(rel);
+        return base + '/zalo-app/local/' + encodeLocalPathSegments(pathPart) + suffix;
+      }
+      return s;
     }
-    return first;
+    if (s.startsWith('//')) return 'https:' + s;
+    return u;
   };
 
   // 5b. Video thumbnail generation (`$znode.nativelibs.mp4thumb` + `$zFeatures.genThumb`)
@@ -1184,28 +1210,126 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
 
   const rewriteCssUrls = (val) => {
     if (typeof val !== 'string' || (!val.includes('file:') && !val.includes('//'))) return val;
-    return val.replace(/url\(\s*(['"]?)(file:\/+[^'")\s]+|\/\/[^'")\s]+)\1\s*\)/gi, (_m, _q, raw) => {
+    return val.replace(/url\(\s*(['"]?)((?:z?file):\/+[^'")\s]+|\/\/[^'")\s]+)\1\s*\)/gi, (_m, _q, raw) => {
       return 'url("' + rewriteFileUrl(raw) + '")';
     });
   };
-  if (window.XMLHttpRequest && window.XMLHttpRequest.prototype && !window.XMLHttpRequest.prototype.open.__olazProtoRel) {
-    const origOpen = window.XMLHttpRequest.prototype.open;
-    const wrappedOpen = function (method, url, ...rest) {
-      const nextUrl = typeof url === 'string' ? rewriteFileUrl(url) : url;
-      return origOpen.call(this, method, nextUrl, ...rest);
-    };
-    wrappedOpen.__olazProtoRel = true;
-    window.XMLHttpRequest.prototype.open = wrappedOpen;
-  }
-  if (typeof window.fetch === 'function' && !window.fetch.__olazProtoRel) {
-    const origFetch = window.fetch;
-    const wrappedFetch = function (input, init) {
-      if (typeof input === 'string') input = rewriteFileUrl(input);
-      return origFetch.call(this, input, init);
-    };
-    wrappedFetch.__olazProtoRel = true;
-    window.fetch = wrappedFetch;
-  }
+  const installWindowUrlRewriters = (targetWin) => {
+    if (!targetWin) return;
+    try {
+      if (targetWin.XMLHttpRequest && targetWin.XMLHttpRequest.prototype && !targetWin.XMLHttpRequest.prototype.open.__olazProtoRel) {
+        const origOpen = targetWin.XMLHttpRequest.prototype.open;
+        const wrappedOpen = function (method, url, ...rest) {
+          const nextUrl = typeof url === 'string' ? rewriteFileUrl(url) : url;
+          return origOpen.call(this, method, nextUrl, ...rest);
+        };
+        wrappedOpen.__olazProtoRel = true;
+        targetWin.XMLHttpRequest.prototype.open = wrappedOpen;
+      }
+      if (typeof targetWin.fetch === 'function' && !targetWin.fetch.__olazProtoRel) {
+        const origFetch = targetWin.fetch;
+        const wrappedFetch = function (input, init) {
+          if (typeof input === 'string') input = rewriteFileUrl(input);
+          return origFetch.call(this, input, init);
+        };
+        wrappedFetch.__olazProtoRel = true;
+        targetWin.fetch = wrappedFetch;
+      }
+      const origSetAttr = (targetWin.Element && targetWin.Element.prototype && typeof targetWin.Element.prototype.setAttribute === 'function')
+        ? targetWin.Element.prototype.setAttribute
+        : null;
+      const patchUrlProp = (Ctor, prop, rewriter) => {
+        if (!Ctor || !Ctor.prototype) return;
+        const desc = Object.getOwnPropertyDescriptor(Ctor.prototype, prop);
+        if (!desc || !desc.set || desc.set.__olazZfile) return;
+        const origSet = desc.set;
+        const wrappedSet = function (val) { return origSet.call(this, rewriter(val)); };
+        wrappedSet.__olazZfile = true;
+        Object.defineProperty(Ctor.prototype, prop, Object.assign({}, desc, { set: wrappedSet }));
+      };
+      const patchMediaSrcProp = (Ctor) => {
+        if (!Ctor || !Ctor.prototype) return;
+        const desc = Object.getOwnPropertyDescriptor(Ctor.prototype, 'src');
+        if (!desc || !desc.set || desc.set.__olazZfile) return;
+        const origSet = desc.set;
+        const wrappedSet = function (val) {
+          const next = rewriteMediaStreamUrl(val);
+          const base = getMediaProxyBase();
+          if (base && typeof next === 'string' && next.startsWith(base + '/') && !this.hasAttribute('crossorigin')) {
+            try { if (origSetAttr) origSetAttr.call(this, 'crossorigin', 'anonymous'); } catch {}
+          }
+          return origSet.call(this, next);
+        };
+        wrappedSet.__olazZfile = true;
+        Object.defineProperty(Ctor.prototype, 'src', Object.assign({}, desc, { set: wrappedSet }));
+      };
+      patchUrlProp(targetWin.HTMLImageElement, 'src', rewriteFileUrl);
+      patchUrlProp(targetWin.HTMLVideoElement, 'poster', rewriteFileUrl);
+      patchMediaSrcProp(targetWin.HTMLMediaElement);
+      patchUrlProp(targetWin.HTMLSourceElement, 'src', rewriteMediaStreamUrl);
+      if (targetWin.CSSStyleDeclaration && targetWin.CSSStyleDeclaration.prototype) {
+        const cssProto = targetWin.CSSStyleDeclaration.prototype;
+        if (typeof cssProto.setProperty === 'function' && !cssProto.setProperty.__olazZfile) {
+          const origSetProp = cssProto.setProperty;
+          const wrappedSetProp = function (prop, val, priority) {
+            return origSetProp.call(this, prop, rewriteCssUrls(val), priority);
+          };
+          wrappedSetProp.__olazZfile = true;
+          cssProto.setProperty = wrappedSetProp;
+        }
+        for (const prop of ['backgroundImage', 'background', 'cssText']) {
+          const desc = Object.getOwnPropertyDescriptor(cssProto, prop);
+          if (desc && desc.set && !desc.set.__olazZfile) {
+            const origCssSet = desc.set;
+            const wrappedCssSet = function (val) { return origCssSet.call(this, rewriteCssUrls(val)); };
+            wrappedCssSet.__olazZfile = true;
+            Object.defineProperty(cssProto, prop, Object.assign({}, desc, { set: wrappedCssSet }));
+          }
+        }
+      }
+      if (origSetAttr && !origSetAttr.__olazZfile) {
+        const wrappedSetAttr = function (name, val) {
+          if (typeof name === 'string') {
+            const lower = name.toLowerCase();
+            if (lower === 'src') {
+              const tag = this.tagName;
+              if (tag === 'IMG') {
+                val = rewriteFileUrl(val);
+              } else if (tag === 'AUDIO' || tag === 'VIDEO') {
+                val = rewriteMediaStreamUrl(val);
+                const base = getMediaProxyBase();
+                if (base && typeof val === 'string' && val.startsWith(base + '/') && !this.hasAttribute('crossorigin')) {
+                  try { origSetAttr.call(this, 'crossorigin', 'anonymous'); } catch {}
+                }
+              } else if (tag === 'SOURCE') {
+                val = rewriteMediaStreamUrl(val);
+              }
+            } else if (lower === 'poster') {
+              if (this.tagName === 'VIDEO') {
+                val = rewriteFileUrl(val);
+              }
+            } else if (lower === 'style') {
+              val = rewriteCssUrls(val);
+            }
+          }
+          return origSetAttr.call(this, name, val);
+        };
+        wrappedSetAttr.__olazZfile = true;
+        targetWin.Element.prototype.setAttribute = wrappedSetAttr;
+      }
+      if (typeof targetWin.Audio === 'function' && !targetWin.Audio.__olazZfile) {
+        const NativeAudio = targetWin.Audio;
+        const WrappedAudio = function (src) {
+          return arguments.length ? new NativeAudio(rewriteMediaStreamUrl(src)) : new NativeAudio();
+        };
+        WrappedAudio.prototype = NativeAudio.prototype;
+        Object.setPrototypeOf(WrappedAudio, NativeAudio);
+        WrappedAudio.__olazZfile = true;
+        targetWin.Audio = WrappedAudio;
+      }
+    } catch {}
+  };
+  installWindowUrlRewriters(window);
   if (typeof window.open === 'function' && !window.open.__olazPopupReady) {
     const origWinOpen = window.open;
     const wrappedWinOpen = function (url, target, features) {
@@ -1225,6 +1349,14 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
             return false;
           }
         };
+        const ensurePopupPatched = () => {
+          try {
+            if (window.__olazMediaProxyBase && !win.__olazMediaProxyBase) {
+              win.__olazMediaProxyBase = window.__olazMediaProxyBase;
+            }
+            installWindowUrlRewriters(win);
+          } catch {}
+        };
         try {
           const origAdd = win.addEventListener.bind(win);
           const origRem = win.removeEventListener.bind(win);
@@ -1236,6 +1368,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
                 const guarded = function (ev) {
                   if (!isRealDocReady() || !set.has(cb)) return;
                   set.delete(cb);
+                  ensurePopupPatched();
                   if (type === 'DOMContentLoaded') dclFired = true;
                   else loadFired = true;
                   return cb.call(this, ev);
@@ -1254,6 +1387,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
           };
         } catch {}
         const fireSet = (set, evName) => {
+          ensurePopupPatched();
           const fns = Array.from(set);
           set.clear();
           for (const fn of fns) {
@@ -1270,6 +1404,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
           try {
             if (win.closed) { clearInterval(timer); return; }
             if (!isRealDocReady()) return;
+            ensurePopupPatched();
             const rs = win.document.readyState;
             if (!dclFired && (rs === 'interactive' || rs === 'complete')) {
               dclFired = true;
@@ -1288,96 +1423,6 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     wrappedWinOpen.__olazPopupReady = true;
     window.open = wrappedWinOpen;
   }
-  const origSetAttr = (typeof Element !== 'undefined' && Element.prototype && typeof Element.prototype.setAttribute === 'function')
-    ? Element.prototype.setAttribute
-    : null;
-  const patchUrlProp = (Ctor, prop, rewriter) => {
-    if (!Ctor || !Ctor.prototype) return;
-    const desc = Object.getOwnPropertyDescriptor(Ctor.prototype, prop);
-    if (!desc || !desc.set || desc.set.__olazZfile) return;
-    const origSet = desc.set;
-    const wrappedSet = function (val) { return origSet.call(this, rewriter(val)); };
-    wrappedSet.__olazZfile = true;
-    Object.defineProperty(Ctor.prototype, prop, Object.assign({}, desc, { set: wrappedSet }));
-  };
-  const patchMediaSrcProp = (Ctor) => {
-    if (!Ctor || !Ctor.prototype) return;
-    const desc = Object.getOwnPropertyDescriptor(Ctor.prototype, 'src');
-    if (!desc || !desc.set || desc.set.__olazZfile) return;
-    const origSet = desc.set;
-    const wrappedSet = function (val) {
-      const next = rewriteMediaStreamUrl(val);
-      const base = getMediaProxyBase();
-      if (base && typeof next === 'string' && next.startsWith(base + '/') && !this.hasAttribute('crossorigin')) {
-        try { if (origSetAttr) origSetAttr.call(this, 'crossorigin', 'anonymous'); } catch {}
-      }
-      return origSet.call(this, next);
-    };
-    wrappedSet.__olazZfile = true;
-    Object.defineProperty(Ctor.prototype, 'src', Object.assign({}, desc, { set: wrappedSet }));
-  };
-  patchUrlProp(window.HTMLImageElement, 'src', rewriteFileUrl);
-  patchUrlProp(window.HTMLVideoElement, 'poster', rewriteFileUrl);
-  patchMediaSrcProp(window.HTMLMediaElement);
-  patchUrlProp(window.HTMLSourceElement, 'src', rewriteMediaStreamUrl);
-  if (window.CSSStyleDeclaration && window.CSSStyleDeclaration.prototype) {
-    const cssProto = window.CSSStyleDeclaration.prototype;
-    if (typeof cssProto.setProperty === 'function' && !cssProto.setProperty.__olazZfile) {
-      const origSetProp = cssProto.setProperty;
-      const wrappedSetProp = function (prop, val, priority) {
-        return origSetProp.call(this, prop, rewriteCssUrls(val), priority);
-      };
-      wrappedSetProp.__olazZfile = true;
-      cssProto.setProperty = wrappedSetProp;
-    }
-    for (const prop of ['backgroundImage', 'background', 'cssText']) {
-      const desc = Object.getOwnPropertyDescriptor(cssProto, prop);
-      if (desc && desc.set && !desc.set.__olazZfile) {
-        const origCssSet = desc.set;
-        const wrappedCssSet = function (val) { return origCssSet.call(this, rewriteCssUrls(val)); };
-        wrappedCssSet.__olazZfile = true;
-        Object.defineProperty(cssProto, prop, Object.assign({}, desc, { set: wrappedCssSet }));
-      }
-    }
-  }
-  if (origSetAttr) {
-    Element.prototype.setAttribute = function (name, val) {
-      if (typeof name === 'string') {
-        const lower = name.toLowerCase();
-        if (lower === 'src') {
-          const tag = this.tagName;
-          if (tag === 'IMG') {
-            val = rewriteFileUrl(val);
-          } else if (tag === 'AUDIO' || tag === 'VIDEO') {
-            val = rewriteMediaStreamUrl(val);
-            const base = getMediaProxyBase();
-            if (base && typeof val === 'string' && val.startsWith(base + '/') && !this.hasAttribute('crossorigin')) {
-              try { origSetAttr.call(this, 'crossorigin', 'anonymous'); } catch {}
-            }
-          } else if (tag === 'SOURCE') {
-            val = rewriteMediaStreamUrl(val);
-          }
-        } else if (lower === 'poster') {
-          if (this.tagName === 'VIDEO') {
-            val = rewriteFileUrl(val);
-          }
-        } else if (lower === 'style') {
-          val = rewriteCssUrls(val);
-        }
-      }
-      return origSetAttr.call(this, name, val);
-    };
-  }
-  if (typeof window.Audio === 'function' && !window.Audio.__olazZfile) {
-    const NativeAudio = window.Audio;
-    const WrappedAudio = function (src) {
-      return arguments.length ? new NativeAudio(rewriteMediaStreamUrl(src)) : new NativeAudio();
-    };
-    WrappedAudio.prototype = NativeAudio.prototype;
-    Object.setPrototypeOf(WrappedAudio, NativeAudio);
-    WrappedAudio.__olazZfile = true;
-    window.Audio = WrappedAudio;
-  }
 
   // 5b. Intercept `<a download>` clicks (`blob:`, `data:`, `zfile:`, `file:`) in both
   //     `index.html` and `popup-viewer.html` (`MediaViewer`) before `URL.revokeObjectURL`
@@ -1388,7 +1433,8 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     const triggerAnchorDownload = (anchor) => {
       if (!anchor || typeof anchor.hasAttribute !== 'function' || !anchor.hasAttribute('download')) return false;
       const href = String(anchor.getAttribute('href') || anchor.href || '').trim();
-      if (!href || !/^(blob:|data:|zfile:|file:)/i.test(href)) return false;
+      const locInfo = extractLocalFilePath(href);
+      if (!href || (!locInfo && !/^(blob:|data:)/i.test(href))) return false;
       if (handledAnchors.has(anchor)) return true;
       handledAnchors.add(anchor);
       setTimeout(() => { try { handledAnchors.delete(anchor); } catch {} }, 1000);
@@ -1407,16 +1453,13 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
 
       // Start reading bytes synchronously before `w.a.markUsed` revokes a `blob:` URL.
       let bytesPromise;
-      if (/^(zfile:|file:)/i.test(href)) {
+      if (locInfo) {
         const localPath = (() => {
           try {
-            if (/^zfile:\/\//i.test(href)) {
-              const rest = href.replace(/^zfile:\/\/[^/]*/i, '');
-              return decodeURIComponent(rest.startsWith('/') ? rest : '/' + rest);
-            }
-            return decodeURIComponent(new URL(href).pathname);
+            const dec = decodeURIComponent(locInfo.encodedPath);
+            return dec.startsWith('/') ? dec : '/' + dec;
           } catch {
-            return href.replace(/^(zfile:\/\/local|file:\/\/\/?)/i, '/');
+            return '/' + locInfo.encodedPath;
           }
         })();
         bytesPromise = callAsync('$zFileManager.getFileArrayBuffer', [localPath]).then((ab) => (window.__olazDenoiseU8 || ((x) => x))(toU8(ab)));
@@ -1473,6 +1516,22 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
       await callAsync('$znode.fsExtra.ensureDir', [dir]);
     }
   };
+  const denoiseZaloU8 = (raw) => {
+    const u8 = toU8(raw);
+    const n = u8.byteLength;
+    if (
+      n > 6
+      && u8[n - 6] === 0x07 && u8[n - 5] === 0x7a && u8[n - 4] === 0x41
+      && u8[n - 3] === 0x6c && u8[n - 2] === 0x4f && u8[n - 1] === 0x07
+    ) {
+      const out = u8.slice(0, n - 6);
+      const xorEnd = Math.min(100, out.byteLength);
+      for (let i = 0; i < xorEnd; i++) out[i] ^= 0x93;
+      return out;
+    }
+    return u8;
+  };
+  window.__olazDenoiseU8 = denoiseZaloU8;
   const executePhotoFs = async (payload) => {
     const t = payload || {};
     switch (t.operation) {
@@ -1485,13 +1544,13 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
         const start = Math.max(0, Number(t.start) || 0);
         const len = Math.max(0, (Number(t.end) || 0) - start);
         if (!(len > 0)) return new ArrayBuffer(0);
-        const ab = await callAsync('$zFileManager.readFileSlice', [String(t.path), start, len, false]);
+        const ab = await callAsync('$zFileManager.readFileSlice', [String(t.path), start, len, true]);
         return toExactArrayBuffer(toU8(ab));
       }
       case 'READ_ARRAY_BUFFER':
       case 'READ_BLOB': {
         const ab = await callAsync('$zFileManager.getFileArrayBuffer', [String(t.path)]);
-        return toExactArrayBuffer(toU8(ab));
+        return toExactArrayBuffer(denoiseZaloU8(ab));
       }
       case 'WRITE_BUFFER':
       case 'WRITE_BLOB': {
@@ -1530,22 +1589,6 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
         throw new Error('Unsupported PHOTO_FS operation: ' + String(t.operation));
     }
   };
-  const denoiseZaloU8 = (raw) => {
-    const u8 = toU8(raw);
-    const n = u8.byteLength;
-    if (
-      n > 6
-      && u8[n - 6] === 0x07 && u8[n - 5] === 0x7a && u8[n - 4] === 0x41
-      && u8[n - 3] === 0x6c && u8[n - 2] === 0x4f && u8[n - 1] === 0x07
-    ) {
-      const out = u8.slice(0, n - 6);
-      const xorEnd = Math.min(100, out.byteLength);
-      for (let i = 0; i < xorEnd; i++) out[i] ^= 0x93;
-      return out;
-    }
-    return u8;
-  };
-  window.__olazDenoiseU8 = denoiseZaloU8;
   const executeResizeTask = async (payload) => {
     const p = payload || {};
     const ab = await callAsync('$zFileManager.getFileArrayBuffer', [String(p.src)]);
@@ -2320,6 +2363,12 @@ fn rewrite_csp_directives(raw_csp: &str) -> String {
             .unwrap_or("")
             .to_ascii_lowercase();
         if matches!(dir_name.as_str(), "media-src" | "img-src" | "connect-src") {
+            if !dir.contains("'self'") {
+                dir.push_str(" 'self'");
+            }
+            if !dir.contains("zalo-app:") {
+                dir.push_str(" zalo-app:");
+            }
             if !dir.contains("http://127.0.0.1:*") {
                 dir.push_str(" http://127.0.0.1:*");
             }
@@ -2746,10 +2795,11 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 
     // 8. Local file subresource URL transform (`file:///...` -> `zfile://local/...`, including
-    //    WHATWG `URL` instances returned by `url.pathToFileURL` for Stickers, plus `//` -> `https://`).
-    const ZFILE_TRANSFORM_REPL: &str = r#"static transformLocalUrl(e){const s=e&&typeof e==="object"&&typeof e.href==="string"?e.href:e;return typeof s==="string"?s.startsWith("file:")?"zfile://local/"+s.replace(/^file:\/+/,""):s.startsWith("//")?"https:"+s:e:e}"#;
+    //    WHATWG `URL` instances returned by `url.pathToFileURL` for Stickers, segment-wise
+    //    percent-encoding for `#`/`?`/spaces, plus `//` -> `https://`).
+    const ZFILE_TRANSFORM_REPL: &str = r#"static transformLocalUrl(e){const s=e&&typeof e==="object"&&typeof e.href==="string"?e.href:e;return typeof s==="string"?s.startsWith("file:")?"zfile://local/"+s.replace(/^file:\/+/,"").split("/").map((p=>{try{return encodeURIComponent(decodeURIComponent(p))}catch(_){return encodeURIComponent(p)}})).join("/"):s.startsWith("//")?"https:"+s:e:e}"#;
     const ZFILE_INLINE_FIND: &str = r#"Boolean(!1)?"zfile://"+e:e"#;
-    const ZFILE_INLINE_REPL: &str = r#"((()=>{const s=e&&typeof e==="object"&&typeof e.href==="string"?e.href:e;return typeof s==="string"?s.startsWith("file:")?"zfile://local/"+s.replace(/^file:\/+/,""):s.startsWith("//")?"https:"+s:e:e})())"#;
+    const ZFILE_INLINE_REPL: &str = r#"((()=>{const s=e&&typeof e==="object"&&typeof e.href==="string"?e.href:e;return typeof s==="string"?s.startsWith("file:")?"zfile://local/"+s.replace(/^file:\/+/,"").split("/").map((p=>{try{return encodeURIComponent(decodeURIComponent(p))}catch(_){return encodeURIComponent(p)}})).join("/"):s.startsWith("//")?"https:"+s:e:e})())"#;
 
     if s.contains("checkNeedTransformLocalUrl") && TRANSFORM_LOCAL_URL_RE.is_match(&s) {
         let next = TRANSFORM_LOCAL_URL_RE
@@ -2875,13 +2925,14 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         }
     }
 
-    // 13. Use `loading:"eager"` on `Z.d.Image` (`Ze`) and fire `interceptOnLoad` when a cached
-    //     `zfile://`/`blob:` `<img>` in `popup-viewer.html` completed before `componentDidMount`
-    //     set `this._mounted=!0` (preventing stuck `visibility:"hidden"` + `mvr-spinner`).
+    // 13. Use `loading:"eager"` + `decoding:"sync"` on `Z.d.Image` (`Ze`) and wire native DOM
+    //     `load` + cached `_el.complete && _el.naturalWidth > 0` detection across both initial
+    //     mount and `src` updates so `ReactDOM.createPortal` into `popup-viewer.html` never
+    //     stays stuck at `visibility:"hidden"`.
     const ZIMG_LAZY_1_FIND: &str = r#"visibility:this.state.loaded?"visible":"hidden"}),loading:"lazy"}"#;
     const ZIMG_LAZY_1_REPL: &str = r#"visibility:this.state.loaded?"visible":"hidden"}),loading:"eager"}"#;
     const ZIMG_LAZY_2_FIND: &str = r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"async",loading:"lazy""#;
-    const ZIMG_LAZY_2_REPL: &str = r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"async",loading:"eager""#;
+    const ZIMG_LAZY_2_REPL: &str = r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"sync",loading:"eager""#;
     if s.contains(ZIMG_LAZY_1_FIND) {
         s = s.replace(ZIMG_LAZY_1_FIND, ZIMG_LAZY_1_REPL);
         changed = true;
@@ -2897,7 +2948,7 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         let next = ZIMG_MOUNT_RE
             .replace_all(
                 &s,
-                r#"componentDidMount(){/*olaz-zimg-complete*/this._mounted=!0,this.props.src&&${1}.register(this.props.src);const _el=this.imageRef&&this.imageRef.current;_el&&_el.complete&&_el.naturalWidth>0&&!this.state.loaded&&setTimeout((()=>{this._mounted&&!this.state.loaded&&this.interceptOnLoad({target:_el,currentTarget:_el})}),0)}"#,
+                r#"_olazSyncImg(){const _el=this.imageRef&&this.imageRef.current;if(!_el)return;if(!_el.__olazLoadWired){_el.__olazLoadWired=!0,_el.addEventListener("load",(()=>{this._mounted&&!this.state.loaded&&this.interceptOnLoad({target:_el,currentTarget:_el})}))}_el.complete&&_el.naturalWidth>0&&!this.state.loaded&&setTimeout((()=>{this._mounted&&!this.state.loaded&&this.interceptOnLoad({target:_el,currentTarget:_el})}),0)}componentDidMount(){/*olaz-zimg-complete*/this._mounted=!0,this.props.src&&${1}.register(this.props.src),this._olazSyncImg()}componentDidUpdate(e){e.src!==this.props.src&&(e.src&&${1}.unregister(e.src),this.props.src&&${1}.register(this.props.src),this._olazSyncImg())}"#,
             )
             .into_owned();
         if next != s {

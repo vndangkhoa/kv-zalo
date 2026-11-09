@@ -48,6 +48,11 @@ pub const ZFILE_SCHEME: &str = "zfile";
 /// Path handled synchronously via `XMLHttpRequest(..., false)` by `HostScripts/bridge.js`.
 pub const BRIDGE_SYNC_PATH: &str = "/__olaz/bridge-sync";
 
+/// Same-origin `zalo-app://local/__olaz/zfile/<encoded_abs_path>` subpath serving sandbox-confined
+/// local files in both primary `WebView`s and `related_view` auxiliary popups (`popup-viewer.html`),
+/// where WebKit2GTK only dispatches custom URI scheme handlers matching the document's scheme.
+pub const ZFILE_SUBPATH_PREFIX: &str = "/__olaz/zfile/";
+
 /// Preamble injected BEFORE all `HostScripts/*.js` so `window.webkit.messageHandlers`
 /// exposes Promise-returning `.znet.postMessage(...)` and `.zbridge.postMessage(...)` plus
 /// fire-and-forget `.zlog.postMessage(...)` and `.zstate.postMessage(...)` on top of WebKit2GTK's
@@ -778,8 +783,14 @@ impl ZaloWebRuntime {
 
         let asar_for_scheme = Arc::clone(&asar_slot);
         let bridges_for_scheme = Rc::clone(&bridges);
+        let platform_for_zapp = Arc::clone(platform);
         context.register_uri_scheme(ZALO_APP_SCHEME, move |request| {
-            handle_zalo_app_scheme(request, &asar_for_scheme, &bridges_for_scheme);
+            handle_zalo_app_scheme(
+                request,
+                &asar_for_scheme,
+                &bridges_for_scheme,
+                &platform_for_zapp,
+            );
         });
 
         let platform_for_zfile = Arc::clone(platform);
@@ -899,6 +910,19 @@ fn zfile_allowed_roots(platform: &ZaloPlatform) -> Vec<PathBuf> {
     roots
 }
 
+fn decode_encoded_path_to_abs(encoded_rel: &str) -> Option<PathBuf> {
+    let trimmed = encoded_rel.strip_prefix("local/").unwrap_or(encoded_rel);
+    let decoded = percent_encoding::percent_decode_str(trimmed)
+        .decode_utf8()
+        .ok()?;
+    let normalized = if decoded.starts_with('/') {
+        decoded.into_owned()
+    } else {
+        format!("/{decoded}")
+    };
+    Some(PathBuf::from(normalized))
+}
+
 fn decode_zfile_uri_to_path(raw_uri: &str) -> Option<PathBuf> {
     let parsed = Url::parse(raw_uri).ok()?;
     let host = parsed.host_str().unwrap_or("");
@@ -908,15 +932,32 @@ fn decode_zfile_uri_to_path(raw_uri: &str) -> Option<PathBuf> {
     } else {
         raw_path.to_string()
     };
-    let decoded = percent_encoding::percent_decode_str(&combined)
-        .decode_utf8()
-        .ok()?;
-    let normalized = if decoded.starts_with('/') {
-        decoded.into_owned()
-    } else {
-        format!("/{decoded}")
-    };
-    Some(PathBuf::from(normalized))
+    decode_encoded_path_to_abs(&combined)
+}
+
+fn serve_zfile_path_response(
+    request: &URISchemeRequest,
+    file_path: &Path,
+    platform: &ZaloPlatform,
+) {
+    let range_header = request
+        .http_headers()
+        .and_then(|h| h.one("Range"))
+        .map(|g| g.to_string());
+    let allowed = zfile_allowed_roots(platform);
+    match serve_local_media_range(file_path, range_header.as_deref(), &allowed) {
+        Ok(media) => finish_scheme_media_range_response(request, media),
+        Err(err) => {
+            tracing::debug!(%err, path = %file_path.display(), "denied or missing local media path");
+            finish_scheme_response(
+                request,
+                404,
+                "Not Found",
+                "text/plain; charset=utf-8",
+                b"file unavailable".to_vec(),
+            );
+        }
+    }
 }
 
 fn handle_zfile_scheme(request: &URISchemeRequest, platform: &ZaloPlatform) {
@@ -931,30 +972,14 @@ fn handle_zfile_scheme(request: &URISchemeRequest, platform: &ZaloPlatform) {
         );
         return;
     };
-    let range_header = request
-        .http_headers()
-        .and_then(|h| h.one("Range"))
-        .map(|g| g.to_string());
-    let allowed = zfile_allowed_roots(platform);
-    match serve_local_media_range(&file_path, range_header.as_deref(), &allowed) {
-        Ok(media) => finish_scheme_media_range_response(request, media),
-        Err(err) => {
-            tracing::debug!(%err, path = %file_path.display(), "denied or missing zfile:// path");
-            finish_scheme_response(
-                request,
-                404,
-                "Not Found",
-                "text/plain; charset=utf-8",
-                b"file unavailable".to_vec(),
-            );
-        }
-    }
+    serve_zfile_path_response(request, &file_path, platform);
 }
 
 fn handle_zalo_app_scheme(
     request: &URISchemeRequest,
     asar_slot: &Arc<RwLock<Option<Arc<AsarArchive>>>>,
     bridges: &Rc<RefCell<BridgeRegistry>>,
+    platform: &ZaloPlatform,
 ) {
     let raw_uri = request.uri().map(|s| s.to_string()).unwrap_or_default();
     let parsed_path = Url::parse(&raw_uri)
@@ -980,6 +1005,23 @@ fn handle_zalo_app_scheme(
             None => br#"{"error":"bridge not ready"}"#.to_vec(),
         };
         finish_scheme_response(request, 200, "OK", "application/json", resp_bytes);
+        return;
+    }
+
+    // 1b. Same-origin sandbox-confined local media (`zalo-app://local/__olaz/zfile/<encoded_path>`)
+    //     used across both primary `WebView`s and `related_view` child popups (`popup-viewer.html`).
+    if let Some(encoded_rel) = parsed_path.strip_prefix(ZFILE_SUBPATH_PREFIX) {
+        let Some(file_path) = decode_encoded_path_to_abs(encoded_rel) else {
+            finish_scheme_response(
+                request,
+                400,
+                "Bad Request",
+                "text/plain; charset=utf-8",
+                b"invalid zfile path".to_vec(),
+            );
+            return;
+        };
+        serve_zfile_path_response(request, &file_path, platform);
         return;
     }
 
@@ -1281,6 +1323,41 @@ async fn handle_gst_proxy_conn(
         }
         ZALO_APP_SCHEME => {
             let rel_raw = rest.strip_prefix("local/").unwrap_or(rest);
+            if let Some(encoded_path) = rel_raw.strip_prefix("__olaz/zfile/") {
+                let Some(abs_path) = decode_encoded_path_to_abs(encoded_path) else {
+                    write_http_response(
+                        stream,
+                        400,
+                        "Bad Request",
+                        "text/plain",
+                        None,
+                        b"bad path",
+                        is_head,
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                let allowed = zfile_allowed_roots(platform);
+                match open_local_media_range(&abs_path, range_header.as_deref(), &allowed, !is_head)
+                {
+                    Ok(media) => {
+                        write_http_stream_response(stream, media, is_head).await?;
+                    }
+                    Err(_) => {
+                        write_http_response(
+                            stream,
+                            404,
+                            "Not Found",
+                            "text/plain",
+                            None,
+                            b"not found",
+                            is_head,
+                        )
+                        .await?;
+                    }
+                }
+                return Ok(());
+            }
             let rel = rel_raw.strip_prefix("pc-dist/").unwrap_or(rel_raw);
             if rel.is_empty()
                 || rel
