@@ -3,6 +3,7 @@
 //! and host script / ASAR bundle patchers for Olaz.
 
 pub mod asar;
+pub mod bla_shield;
 pub mod bundle_patcher;
 pub mod crypto;
 pub mod db_cross;

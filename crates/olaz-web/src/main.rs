@@ -183,6 +183,7 @@ async fn run_fetch_asar(dest_dir: &Path) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    std::hint::black_box(olaz_core::bla_shield::enclave_tarpit_0(0, 0));
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

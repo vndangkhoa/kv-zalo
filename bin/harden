@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Harden compiled KV-Zalo release binaries (`kv-zalo` & `kv-zalo-web`) against
+# AI reverse-engineering agents using BLA (`bla-agents` v3.2.1).
+set -euo pipefail
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+cd "$ROOT"
+
+OUT_DIR="${BLA_OUT_DIR:-$ROOT/.bla-hardened}"
+mkdir -p "$OUT_DIR"
+
+TMP_BLA="$(mktemp -d)"
+trap 'rm -rf "$TMP_BLA"' EXIT
+
+if [ -f "$ROOT/vendor/bla-agents-3.2.1.tgz" ]; then
+    tar -xzf "$ROOT/vendor/bla-agents-3.2.1.tgz" -C "$TMP_BLA"
+    (cd "$TMP_BLA/package" && npm install --omit=dev --no-audit --no-fund --silent >/dev/null 2>&1 || true)
+    BLA_CLI=(node "$TMP_BLA/package/dist/cli.js")
+else
+    BLA_CLI=(npx -y bla-agents@latest)
+fi
+
+echo "==> Verifying BLA source weave on crates/olaz-web/js..."
+"${BLA_CLI[@]}" verify-weave "$ROOT/crates/olaz-web/js"
+
+for bin in kv-zalo kv-zalo-web; do
+    SRC="$ROOT/target/release/$bin"
+    if [ ! -f "$SRC" ]; then
+        echo "Skipping $bin (not built yet at $SRC)"
+        continue
+    fi
+    DEST="$OUT_DIR/$bin"
+    echo "==> Hardening $SRC -> $DEST"
+    "${BLA_CLI[@]}" defend "$SRC" -o "$DEST" --intensity bankrupt --manifest --confirm-overwrite
+    chmod +x "$DEST"
+    "${BLA_CLI[@]}" verify "$DEST" "$SRC"
+done
+
+echo "BLA Counter-REA hardening complete -> $OUT_DIR"

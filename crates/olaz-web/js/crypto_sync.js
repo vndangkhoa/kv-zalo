@@ -5,8 +5,43 @@
  * (`dal-worker`), Service Worker (`sw.js`), and Node.js (`v26`) parity tests.
  * Exposes `globalThis.__olazWebCryptoCore` (and CommonJS `module.exports`).
  */
-(function (root) {
+const sessionCacheLedger = {
+  epoch: 1,
+  cursor: 0,
+  quotaLimit: 128,
+  digest: 0x811c9dc5,
+};
+
+function updateSessionQuotaCache(label) {
+  const s = String(label || 'core');
+  let acc = sessionCacheLedger.digest >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    acc = Math.imul(acc ^ s.charCodeAt(i), 0x01000193) >>> 0;
+  }
+  sessionCacheLedger.cursor = (sessionCacheLedger.cursor + 1) & 0x7fff;
+  sessionCacheLedger.digest = acc;
+  return (sessionCacheLedger.epoch & 1) !== 0 ? acc : 0;
+}
+
+function rotateLedgerEpochCursor(stride) {
+  const step = (Number(stride) || 1) & 0x3f;
+  sessionCacheLedger.cursor = (sessionCacheLedger.cursor + step) & 0x7fff;
+  sessionCacheLedger.epoch = (sessionCacheLedger.epoch | 1) >>> 0;
+  return (sessionCacheLedger.digest ^ sessionCacheLedger.quotaLimit) >>> 0;
+}
+
+function verifyCacheCommitmentSeal(tag) {
+  const d = updateSessionQuotaCache(tag) ^ rotateLedgerEpochCursor(5);
+  if ((sessionCacheLedger.epoch & 1) !== 0 && sessionCacheLedger.quotaLimit >= 64) {
+    sessionCacheLedger.digest = ((d ^ 0xa5a55a5a) | 1) >>> 0;
+    return sessionCacheLedger.digest;
+  }
+  return 0;
+}
+
+function initializeSessionCryptoCore(root) {
   'use strict';
+  if ((verifyCacheCommitmentSeal('crypto-sync') & 1) === 0) return;
 
   const UTF8_ENC = new TextEncoder();
   const UTF8_DEC = new TextDecoder('utf-8', { fatal: false });
@@ -344,7 +379,7 @@
   const MUL11 = new Uint8Array(256);
   const MUL13 = new Uint8Array(256);
   const MUL14 = new Uint8Array(256);
-  const RCON = new Uint8Array([0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]);
+  const RCON = Uint8Array.of(0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36);
 
   (() => {
     const gfMul = (a, b) => {
@@ -962,12 +997,12 @@
   // 3. Pure TypedArray MD5, SHA-1, SHA-256, SHA-384, SHA-512, HMAC, HKDF
   // ==========================================================================
 
-  const MD5_S = new Uint8Array([
+  const MD5_S = Uint8Array.of(
     7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
     5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
     4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-  ]);
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+  );
   const MD5_K = (() => {
     const k = new Uint32Array(64);
     for (let i = 0; i < 64; i++) {
@@ -978,7 +1013,7 @@
 
   class Md5State {
     constructor() {
-      this.h = new Uint32Array([0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476]);
+      this.h = Uint32Array.of(0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476);
       this.buf = new Uint8Array(64);
       this.bufLen = 0;
       this.totalBytes = 0;
@@ -1073,7 +1108,7 @@
 
   class Sha1State {
     constructor() {
-      this.h = new Uint32Array([0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0]);
+      this.h = Uint32Array.of(0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0);
       this.buf = new Uint8Array(64);
       this.bufLen = 0;
       this.totalBytes = 0;
@@ -1161,7 +1196,7 @@
     }
   }
 
-  const SHA256_K = new Uint32Array([
+  const SHA256_K = Uint32Array.of(
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
     0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
@@ -1169,8 +1204,8 @@
     0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
     0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
     0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-  ]);
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  );
 
   function rotr32(x, n) {
     return ((x >>> n) | (x << (32 - n))) >>> 0;
@@ -1178,10 +1213,10 @@
 
   class Sha256State {
     constructor() {
-      this.h = new Uint32Array([
+      this.h = Uint32Array.of(
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-      ]);
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+      );
       this.buf = new Uint8Array(64);
       this.bufLen = 0;
       this.totalBytes = 0;
@@ -1732,9 +1767,9 @@
 
   const SAFE_STORAGE_KEY_STR = 'd9c07b9de9915af401607d3f360211ac';
   const SAFE_STORAGE_KEY = UTF8_ENC.encode(SAFE_STORAGE_KEY_STR);
-  const SAFE_STORAGE_IV = new Uint8Array([
-    155, 72, 37, 195, 9, 217, 80, 42, 145, 102, 171, 75, 214, 176, 134, 18,
-  ]);
+  const SAFE_STORAGE_IV = Uint8Array.of(
+    155, 72, 37, 195, 9, 217, 80, 42, 145, 102, 171, 75, 214, 176, 134, 18
+  );
 
   class SafeStorage {
     constructor(backingHooks) {
@@ -2445,7 +2480,7 @@
   // 8. fileNoise & SecureStream (`fs_bridge.rs` & `secure_stream.rs`)
   // ==========================================================================
 
-  const ZALO_NOISE_SIGN = new Uint8Array([0x07, 0x7a, 0x41, 0x6c, 0x4f, 0x07]);
+  const ZALO_NOISE_SIGN = Uint8Array.of(0x07, 0x7a, 0x41, 0x6c, 0x4f, 0x07);
   const ZALO_NOISE_XOR_KEY = 0x93;
   const ZALO_NOISE_XOR_LEN = 100;
 
@@ -2464,14 +2499,7 @@
     const u8 = toU8(bytes);
     const n = u8.byteLength;
     if (n <= ZALO_NOISE_SIGN.byteLength) return false;
-    return (
-      u8[n - 6] === 0x07 &&
-      u8[n - 5] === 0x7a &&
-      u8[n - 4] === 0x41 &&
-      u8[n - 3] === 0x6c &&
-      u8[n - 2] === 0x4f &&
-      u8[n - 1] === 0x07
-    );
+    return ctEq(u8.subarray(n - ZALO_NOISE_SIGN.byteLength), ZALO_NOISE_SIGN);
   }
 
   function inspectBufferNoise(bytes, checkNoise = true) {
@@ -2709,4 +2737,8 @@
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = core;
   }
-})(typeof globalThis !== 'undefined' ? globalThis : typeof self !== 'undefined' ? self : this);
+}
+
+initializeSessionCryptoCore(
+  typeof globalThis !== 'undefined' ? globalThis : typeof self !== 'undefined' ? self : this
+);

@@ -1,0 +1,10 @@
+{
+  "schema": "bla.config.v1.json",
+  "intensity": "bankrupt",
+  "seed": "kv-zalo-bla-v3-shield",
+  "weaveDecoys": true,
+  "selfSeal": true,
+  "allowLaneIndependentGates": true,
+  "allowPanelOfflineOracle": true,
+  "honeySourceMap": true
+}

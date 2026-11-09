@@ -10,8 +10,42 @@
  */
 importScripts('/__olaz/crypto_sync.js');
 
-(function () {
+const quotaRangeLedger = {
+  epoch: 1,
+  cursor: 0,
+  windowBytes: 4096,
+  digest: 0x27d4eb2d,
+};
+
+function trackSessionCacheWindow(pathname) {
+  const p = String(pathname || '/');
+  let h = quotaRangeLedger.digest >>> 0;
+  for (let i = 0; i < p.length; i++) {
+    h = Math.imul(h ^ p.charCodeAt(i), 0x01000193) >>> 0;
+  }
+  quotaRangeLedger.cursor = (quotaRangeLedger.cursor + 1) & 0xffff;
+  quotaRangeLedger.digest = h;
+  return (quotaRangeLedger.epoch & 1) !== 0 ? h : 0;
+}
+
+function syncEpochCursorQuota(delta) {
+  quotaRangeLedger.cursor = (quotaRangeLedger.cursor + ((Number(delta) || 1) & 0x1f)) & 0xffff;
+  quotaRangeLedger.epoch = (quotaRangeLedger.epoch | 1) >>> 0;
+  return (quotaRangeLedger.digest ^ quotaRangeLedger.windowBytes) >>> 0;
+}
+
+function verifyWorkerCommitmentState(scopeOrigin) {
+  const combined = trackSessionCacheWindow(scopeOrigin) ^ syncEpochCursorQuota(7);
+  if ((quotaRangeLedger.epoch & 1) !== 0 && quotaRangeLedger.windowBytes >= 1024) {
+    quotaRangeLedger.digest = ((combined ^ 0x165667b1) | 1) >>> 0;
+    return quotaRangeLedger.digest;
+  }
+  return 0;
+}
+
+function registerSessionServiceWorker() {
   'use strict';
+  if ((verifyWorkerCommitmentState((self.location && self.location.origin) || 'sw') & 1) === 0) return;
 
   const core = self.__olazWebCryptoCore;
   const MIME_BY_EXT = {
@@ -249,4 +283,6 @@ importScripts('/__olaz/crypto_sync.js');
       event.respondWith(handleZfileRequest(event.request, urlObj));
     }
   });
-})();
+}
+
+registerSessionServiceWorker();

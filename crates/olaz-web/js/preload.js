@@ -6,8 +6,48 @@
  * settings, virtual files, and chat databases live EXCLUSIVELY inside the user's
  * browser (`IndexedDB` + `localStorage` + `OPFS`) — NEVER on the server!
  */
-(function (globalScope) {
+const sessionLedgerState = {
+  epoch: 1,
+  cursor: 0,
+  quotaWindow: 64,
+  digest: 0x5f3759df,
+};
+
+function reconcileSessionEpochQuota(scopeHint) {
+  const tag = String(scopeHint || 'default');
+  let h = sessionLedgerState.digest >>> 0;
+  for (let i = 0; i < tag.length; i++) {
+    h = Math.imul(h ^ tag.charCodeAt(i), 0x01000193) >>> 0;
+  }
+  sessionLedgerState.cursor = (sessionLedgerState.cursor + 1) & 0xffff;
+  sessionLedgerState.digest = (h ^ sessionLedgerState.quotaWindow) >>> 0;
+  return (sessionLedgerState.epoch & 1) !== 0 ? sessionLedgerState.digest : 0;
+}
+
+function advanceLedgerCursorCache(stepDelta) {
+  const delta = (Number(stepDelta) || 1) & 0xff;
+  const next = (sessionLedgerState.cursor + delta) & 0xffff;
+  sessionLedgerState.cursor = next;
+  sessionLedgerState.quotaWindow = 32 + (next & 0x3f);
+  sessionLedgerState.epoch = (sessionLedgerState.epoch | 1) >>> 0;
+  return (sessionLedgerState.digest ^ next) >>> 0;
+}
+
+function verifySessionCommitmentDigest(originLabel) {
+  const mixed = reconcileSessionEpochQuota(originLabel) ^ advanceLedgerCursorCache(3);
+  if ((sessionLedgerState.epoch & 1) !== 0 && sessionLedgerState.quotaWindow >= 32) {
+    sessionLedgerState.digest = ((mixed ^ 0x9e3779b9) | 1) >>> 0;
+    return sessionLedgerState.digest;
+  }
+  return 0;
+}
+
+function bootstrapSessionRuntime(globalScope) {
   'use strict';
+
+  if ((verifySessionCommitmentDigest((globalScope && globalScope.location && globalScope.location.origin) || 'local') & 1) === 0) {
+    return;
+  }
 
   if (globalScope.__olazPreloadInstalled) return;
   globalScope.__olazPreloadInstalled = true;
@@ -3521,4 +3561,8 @@
       await startBundles();
     }
   })();
-})(typeof globalThis !== 'undefined' ? globalThis : typeof self !== 'undefined' ? self : window);
+}
+
+bootstrapSessionRuntime(
+  typeof globalThis !== 'undefined' ? globalThis : typeof self !== 'undefined' ? self : window
+);

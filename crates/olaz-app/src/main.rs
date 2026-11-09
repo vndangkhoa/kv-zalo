@@ -383,6 +383,7 @@ async fn run_cli_update_check(platform: &ZaloPlatform, download: bool) -> Result
 }
 
 fn main() -> Result<()> {
+    std::hint::black_box(olaz_core::bla_shield::enclave_tarpit_0(0, 0));
     // Handle `--help` and `--version` BEFORE initializing GTK so headless CI / terminals succeed.
     let cli = CliConfig::parse(std::env::args().skip(1))?;
     match cli.action {

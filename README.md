@@ -15,6 +15,7 @@
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Core-Rust_2021-DEA584?style=for-the-badge&logo=rust&logoColor=black" alt="Rust"></a>
   <a href="#-quick-start-30-seconds"><img src="https://img.shields.io/badge/Linux-Omarchy_%7C_Ubuntu-2563eb?style=for-the-badge&logo=linux&logoColor=white" alt="Linux Desktop"></a>
   <a href="#-docker--nas-deployment"><img src="https://img.shields.io/badge/Self--Host-Zero--Storage_Docker-06b6d4?style=for-the-badge&logo=docker&logoColor=white" alt="Zero-Storage Docker"></a>
+  <a href="https://git.khoavo.myds.me/vndangkhoa/bla"><img src="https://img.shields.io/badge/Counter--REA-BLA_v3.2_Protected-7c3aed?style=for-the-badge&logo=shield&logoColor=white" alt="BLA Counter-REA Protected"></a>
   <a href="https://git.khoavo.myds.me/vndangkhoa/kv-zalo"><img src="https://img.shields.io/badge/Forgejo-Mirror-FF5722?style=for-the-badge&logo=git" alt="Forgejo Mirror"></a>
   <a href="#-license"><img src="https://img.shields.io/badge/License-GPL--3.0-gray?style=for-the-badge" alt="License GPL-3.0"></a>
 </p>
@@ -23,7 +24,6 @@
   <a href="#-quick-start-30-seconds"><b>Quick Start</b></a> •
   <a href="#-why-kv-zalo"><b>Why KV-Zalo?</b></a> •
   <a href="#-competitive-comparison"><b>Comparison</b></a> •
-  <a href="#-interface-preview"><b>Preview</b></a> •
   <a href="#-killer-features"><b>Features</b></a> •
   <a href="#-docker--nas-deployment"><b>Docker & NAS</b></a> •
   <a href="#-architecture"><b>Architecture</b></a> •
@@ -58,29 +58,8 @@ Zalo has no official Linux desktop client. Running Zalo PC under Wine/Bottles br
 | **Anti-Recall ("Giữ thu hồi")** | **✅ Default ON (`...` bubble menu)** | ❌ Messages wiped | ❌ Messages wiped | ❌ Messages wiped |
 | **Multi-Account in One Window** | **✅ Native `#main-tab` sidebar (`0 ms`)** | ❌ 1 account per browser | ❌ 1 account only | ❌ Separate windows |
 | **Zero-Storage Self-Hosted Docker** | **✅ `--read-only` stateless relay** | N/A | ❌ Impossible | ❌ Stores profile on server |
+| **Counter-REA Binary Shield ([BLA](https://git.khoavo.myds.me/vndangkhoa/bla))** | **✅ Built-in (`bla-agents` v3.2)** | ❌ No | ❌ No | ❌ No |
 | **REST API & AI Agent MCP** | **✅ Built-in (`--api` & `--mcp`)** | ❌ No | ❌ No | ❌ No |
-
----
-
-## 📸 Interface Preview
-
-```
-┌──────────────────────────────────────────────────────────────────────────────────────────┐
-│ Zalo - Khv                                                             🔒   ─   ▢   ✕    │
-├──────┬──────────────────────────┬────────────────────────────────────────────────────────┤
-│ [👤] │ 🔍 Tìm kiếm       👤+ 👥+ │ Bikyn Trâm Anh                              📞 📹 🔍 ◫ │
-│ [💼] ├──────────────────────────┼────────────────────────────────────────────────────────┤
-│ [➕] │ Tất cả   Chưa đọc        │                                                        │
-│ ──── │ ──────────────────────── │  ┌──────────────────────────────────┐                  │
-│ [💬] │ 🟢 kvos.vndns.net        │  │ hi                               │  (•••)           │
-│ [📒] │ 🟢 Kv-OS - feedback      │  │ 21:04  [ Đã thu hồi ]            │   ├─ Chọn nhiều  │
-│      │ 🟢 syno.vndns.net        │  └──────────────────────────────────┘   ├─ Xóa phía tôi│
-│      │ 🔴 Bikyn Trâm Anh        │                                         └─ ✓ Giữ thu hồi│
-│ [☁️] │    Tin nhắn đã thu hồi   │  ┌───────────────────────────────────────────────────┐ │
-│ [📁] │ 🟣 LABS MUSE AI          │  │ 📞 Active VoIP Call • 02:14   [ ● REC 02:14 ] [✕] │ │
-│ [⚙️] │ 🔵 retrohub.info         │  └───────────────────────────────────────────────────┘ │
-└──────┴──────────────────────────┴────────────────────────────────────────────────────────┘
-```
 
 ---
 
@@ -222,6 +201,7 @@ docker run -d --name kv-zalo-web \
 | [`crates/olaz-app/`](crates/olaz-app) | Native GTK3 + `webkit2gtk-4.1` multi-account Linux desktop client (`kv-zalo`) |
 | [`crates/olaz-web/`](crates/olaz-web) | Zero-server-persistence self-hosted web relay (`kv-zalo-web`) & browser-only preload runtime |
 | [`packaging/`](packaging) · [`pkgbuild/`](pkgbuild) | 1-click `install.sh`, `.deb`/`.pkg.tar.zst`/`.run` builder, `PKGBUILD`, `kv-zalo.desktop`, `kv-zalo-web.service` |
+| [`.blarc`](.blarc) · [`bin/harden`](bin/harden) · [`vendor/`](vendor) | [BLA (`bla-agents` v3.2)](https://git.khoavo.myds.me/vndangkhoa/bla) Counter-REA native Rust & JS source weave + post-build ELF64 shield |
 | [`macos/`](macos) | Self-contained macOS Swift 6 / SwiftUI reference client (`WKWebView` + Liquid Glass) |
 | [`docs/`](docs) | [`REVERSE-ENGINEERING-NOTES.md`](docs/REVERSE-ENGINEERING-NOTES.md) and [`reanalysis/`](docs/reanalysis) 450-channel IPC specification |
 
