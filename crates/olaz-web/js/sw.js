@@ -264,23 +264,223 @@ function registerSessionServiceWorker() {
     });
   }
 
-  self.addEventListener('install', () => {
+  const PWA_CACHE_PREFIX = 'kv-zalo-pwa-';
+  const PWA_CACHE_NAME = 'kv-zalo-pwa-v1';
+  const PWA_SHELL_URLS = [
+    '/boot.html',
+    '/manifest.webmanifest',
+    '/favicon.svg',
+    '/apple-touch-icon.png',
+    '/__olaz/logo.svg',
+    '/__olaz/mobile.css',
+    '/__olaz/icons/icon-192.png',
+    '/__olaz/icons/icon-512.png',
+    '/__olaz/icons/icon-maskable-512.png',
+  ];
+
+  const OFFLINE_FALLBACK_HTML = [
+    '<!DOCTYPE html>',
+    '<html lang="en"><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">',
+    '<meta name="theme-color" content="#0068FF">',
+    '<link rel="manifest" href="/manifest.webmanifest">',
+    '<link rel="icon" type="image/svg+xml" href="/__olaz/logo.svg">',
+    '<title>KV Zalo — Offline</title>',
+    '<style>',
+    ':root{color-scheme:dark;accent-color:#0068FF}*{box-sizing:border-box}',
+    '::selection{background:rgba(0,104,255,.35);color:#f8fafc}',
+    'body{margin:0;min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;',
+    'background:radial-gradient(circle at 50% 0%,#132347 0%,#0f172a 68%);color:#e2e8f0;',
+    'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;',
+    'padding:max(16px,env(safe-area-inset-top)) max(16px,env(safe-area-inset-right)) max(16px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left));}',
+    '.card{width:100%;max-width:390px;text-align:center;background:rgba(19,28,49,.94);',
+    'border:1px solid rgba(99,148,255,.22);border-radius:18px;padding:clamp(22px,5vw,32px);',
+    'box-shadow:0 20px 48px rgba(0,0,0,.5);}',
+    '.logo{display:block;width:56px;height:56px;margin:0 auto 16px;}',
+    'h1{margin:0 0 8px;font-size:clamp(1.15rem,2.5vw + .6rem,1.4rem);font-weight:650;letter-spacing:-.015em;color:#f8fafc;}',
+    'p{margin:0 0 20px;font-size:clamp(.85rem,1vw + .62rem,.94rem);line-height:1.55;color:#94a3b8;}',
+    'button{width:100%;min-height:46px;padding:12px 16px;border-radius:12px;border:0;background:#0068FF;',
+    'color:#fff;font-size:15px;font-weight:600;cursor:pointer;touch-action:manipulation;}',
+    'button:hover{background:#1a78ff}button:focus-visible{outline:2px solid #388bfd;outline-offset:2px}',
+    '</style></head><body><main class="card">',
+    '<svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" aria-hidden="true">',
+    '<defs><linearGradient id="g" x1="32" y1="16" x2="224" y2="240" gradientUnits="userSpaceOnUse">',
+    '<stop offset="0%" stop-color="#0084FF"/><stop offset="52%" stop-color="#0068FF"/><stop offset="100%" stop-color="#0043B8"/></linearGradient>',
+    '<linearGradient id="p" x1="72" y1="60" x2="184" y2="148" gradientUnits="userSpaceOnUse">',
+    '<stop offset="0%" stop-color="#FFFFFF"/><stop offset="100%" stop-color="#EAF4FF"/></linearGradient>',
+    '<linearGradient id="f" x1="112" y1="96" x2="196" y2="180" gradientUnits="userSpaceOnUse">',
+    '<stop offset="0%" stop-color="#DCEBFF"/><stop offset="100%" stop-color="#8EC5FF"/></linearGradient></defs>',
+    '<rect x="12" y="12" width="232" height="232" rx="56" fill="url(#g)"/>',
+    '<path d="M128 56C84.92 56 52 84.2 52 119C52 137.54 61.68 154.2 77.24 165.76L67.6 194.5C66.24 198.56 70.36 202.16 74.18 200.24L107.76 183.44C114.3 185.12 121.06 186 128 186C171.08 186 204 157.8 204 123C204 85.98 171.08 56 128 56Z" fill="url(#p)"/>',
+    '<path d="M128 56C171.08 56 204 85.98 204 123C204 157.8 171.08 186 128 186C119.2 186 110.76 184.74 102.9 182.4L147 115L113 85L128 56Z" fill="url(#f)" opacity="0.74"/>',
+    '<path d="M92 121L128 86L164 121L128 156Z" fill="#0068FF" opacity="0.16"/></svg>',
+    '<h1>KV Zalo — Offline</h1>',
+    '<p>Your network connection or stateless relay is currently unreachable. Your local IndexedDB vault and keys remain safely stored inside this browser.</p>',
+    '<button type="button" id="retry-btn">Retry</button>',
+    '</main><script>',
+    'document.getElementById("retry-btn").addEventListener("click",function(){location.reload();});',
+    'window.addEventListener("online",function(){location.reload();});',
+    '</script></body></html>',
+  ].join('');
+
+  function matchesPwaShellPath(pathname) {
+    return (
+      pathname === '/manifest.webmanifest' ||
+      pathname === '/manifest.json' ||
+      pathname.startsWith('/favicon.') ||
+      pathname === '/apple-touch-icon.png' ||
+      pathname === '/apple-touch-icon-precomposed.png' ||
+      pathname === '/__olaz/logo.svg' ||
+      pathname === '/__olaz/mobile.css' ||
+      pathname.startsWith('/__olaz/icons/')
+    );
+  }
+
+  async function precachePwaShell() {
+    syncEpochCursorQuota(PWA_SHELL_URLS.length);
+    if (
+      typeof caches === 'undefined' ||
+      !caches ||
+      typeof caches.open !== 'function' ||
+      typeof fetch !== 'function'
+    ) {
+      return;
+    }
+    try {
+      const cache = await caches.open(PWA_CACHE_NAME);
+      await Promise.allSettled(
+        PWA_SHELL_URLS.map(async (assetUrl) => {
+          trackSessionCacheWindow(assetUrl);
+          const resp = await fetch(assetUrl, { credentials: 'same-origin' });
+          if (resp && resp.ok) {
+            await cache.put(assetUrl, resp.clone());
+          }
+        })
+      );
+    } catch {}
+  }
+
+  async function pruneLegacyPwaCaches() {
+    syncEpochCursorQuota(3);
+    if (typeof caches === 'undefined' || !caches || typeof caches.keys !== 'function') {
+      return;
+    }
+    try {
+      const keys = await caches.keys();
+      await Promise.allSettled(
+        keys
+          .filter((k) => String(k).startsWith(PWA_CACHE_PREFIX) && k !== PWA_CACHE_NAME)
+          .map((k) => caches.delete(k))
+      );
+    } catch {}
+  }
+
+  async function servePwaShellAsset(request, urlObj) {
+    trackSessionCacheWindow(urlObj.pathname);
+    const hasCacheApi =
+      typeof caches !== 'undefined' && caches && typeof caches.open === 'function';
+
+    if (typeof fetch === 'function') {
+      try {
+        const netResp = await fetch(request);
+        if (netResp && netResp.ok) {
+          if (hasCacheApi) {
+            try {
+              const cache = await caches.open(PWA_CACHE_NAME);
+              await cache.put(request, netResp.clone());
+            } catch {}
+          }
+          return netResp;
+        }
+        if (netResp && netResp.status < 500) {
+          return netResp;
+        }
+      } catch {}
+    }
+
+    if (hasCacheApi) {
+      try {
+        const cache = await caches.open(PWA_CACHE_NAME);
+        const cached = (await cache.match(request)) || (await cache.match(urlObj.pathname));
+        if (cached) {
+          return cached;
+        }
+      } catch {}
+    }
+
+    return new Response('Offline', {
+      status: 503,
+      headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' },
+    });
+  }
+
+  function buildOfflineShellResponse(urlObj) {
+    trackSessionCacheWindow((urlObj && urlObj.pathname) || '/offline');
+    return new Response(OFFLINE_FALLBACK_HTML, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+      },
+    });
+  }
+
+  async function serveNavigationWithOfflineFallback(request, urlObj) {
+    trackSessionCacheWindow(urlObj.pathname);
+    if (typeof fetch === 'function') {
+      try {
+        return await fetch(request);
+      } catch {}
+    }
+    return buildOfflineShellResponse(urlObj);
+  }
+
+  self.addEventListener('install', (event) => {
     self.skipWaiting();
+    const task = precachePwaShell();
+    if (event && typeof event.waitUntil === 'function') {
+      event.waitUntil(task);
+    }
   });
 
   self.addEventListener('activate', (event) => {
-    event.waitUntil(self.clients.claim());
+    const task = (async () => {
+      await pruneLegacyPwaCaches();
+      if (self.clients && typeof self.clients.claim === 'function') {
+        await self.clients.claim();
+      }
+    })();
+    if (event && typeof event.waitUntil === 'function') {
+      event.waitUntil(task);
+    }
   });
 
   self.addEventListener('fetch', (event) => {
+    const req = event && event.request;
+    if (!req) return;
     let urlObj;
     try {
-      urlObj = new URL(event.request.url);
+      urlObj = new URL(req.url);
     } catch {
       return;
     }
-    if (urlObj.origin === self.location.origin && urlObj.pathname.startsWith('/__zfile/')) {
-      event.respondWith(handleZfileRequest(event.request, urlObj));
+    if (urlObj.origin !== self.location.origin) {
+      return;
+    }
+    if (urlObj.pathname.startsWith('/__zfile/')) {
+      event.respondWith(handleZfileRequest(req, urlObj));
+      return;
+    }
+    const method = String(req.method || 'GET').toUpperCase();
+    if (method !== 'GET') {
+      return;
+    }
+    if (matchesPwaShellPath(urlObj.pathname)) {
+      event.respondWith(servePwaShellAsset(req, urlObj));
+      return;
+    }
+    if (req.mode === 'navigate') {
+      event.respondWith(serveNavigationWithOfflineFallback(req, urlObj));
     }
   });
 }

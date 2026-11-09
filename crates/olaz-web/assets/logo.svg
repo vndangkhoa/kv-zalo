@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="kv-bg" x1="32" y1="16" x2="224" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0084FF"/>
+      <stop offset="52%" stop-color="#0068FF"/>
+      <stop offset="100%" stop-color="#0043B8"/>
+    </linearGradient>
+    <linearGradient id="kv-prism-top" x1="72" y1="60" x2="184" y2="148" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#EAF4FF"/>
+    </linearGradient>
+    <linearGradient id="kv-ice-fold" x1="112" y1="96" x2="196" y2="180" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#DCEBFF"/>
+      <stop offset="100%" stop-color="#8EC5FF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Squircle app tile (#0084FF -> #0068FF -> #0043B8 brand gradient) -->
+  <rect x="12" y="12" width="232" height="232" rx="56" fill="url(#kv-bg)"/>
+  <rect x="14" y="14" width="228" height="228" rx="54" fill="none" stroke="#FFFFFF" stroke-opacity="0.2" stroke-width="3"/>
+
+  <!-- White geometric speech-bubble prism -->
+  <path
+    d="M128 56C84.92 56 52 84.2 52 119C52 137.54 61.68 154.2 77.24 165.76L67.6 194.5C66.24 198.56 70.36 202.16 74.18 200.24L107.76 183.44C114.3 185.12 121.06 186 128 186C171.08 186 204 157.8 204 123C204 85.98 171.08 56 128 56Z"
+    fill="url(#kv-prism-top)"
+  />
+
+  <!-- Ice fold facet (#8EC5FF) -->
+  <path
+    d="M128 56C171.08 56 204 85.98 204 123C204 157.8 171.08 186 128 186C119.2 186 110.76 184.74 102.9 182.4L147 115L113 85L128 56Z"
+    fill="url(#kv-ice-fold)"
+    opacity="0.74"
+  />
+
+  <!-- Inner geometric diamond facet -->
+  <path
+    d="M92 121L128 86L164 121L128 156Z"
+    fill="#0068FF"
+    opacity="0.16"
+  />
+</svg>

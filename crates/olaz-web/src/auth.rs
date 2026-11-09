@@ -172,56 +172,132 @@ fn unix_now_secs() -> u64 {
 
 /// Clean, self-contained HTML unlock page served with `401 Unauthorized` on unauthenticated
 /// browser navigation when `--token` / `OLAZ_WEB_TOKEN` is enabled.
-pub const UNLOCK_PAGE_HTML: &str = r#"<!DOCTYPE html>
+pub const UNLOCK_PAGE_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>KV Zalo Web — Unlock Edge Relay</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0068FF">
+  <meta name="application-name" content="KV Zalo">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="KV Zalo">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="icon" type="image/png" sizes="192x192" href="/__olaz/icons/icon-192.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <title>KV Zalo — Unlock Web Relay</title>
   <style>
-    :root { color-scheme: dark; }
+    :root { color-scheme: dark; accent-color: #0068FF; }
     * { box-sizing: border-box; }
+    ::selection { background: rgba(0, 104, 255, 0.35); color: #f8fafc; }
     body {
-      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-      background: radial-gradient(circle at 50% 0%, #162447 0%, #0b1020 65%);
-      color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      padding: 20px;
+      margin: 0;
+      min-height: 100vh;
+      min-height: 100dvh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: radial-gradient(circle at 50% 0%, #132347 0%, #0b1120 68%);
+      color: #e6edf3;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+      -webkit-font-smoothing: antialiased;
     }
     .card {
-      width: 100%; max-width: 400px; background: rgba(19, 27, 46, 0.92);
-      border: 1px solid rgba(99, 140, 255, 0.25); border-radius: 16px;
-      padding: 28px; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.55);
+      width: 100%;
+      max-width: 400px;
+      background: rgba(19, 28, 49, 0.94);
+      border: 1px solid rgba(99, 148, 255, 0.22);
+      border-radius: 18px;
+      padding: clamp(20px, 5vw, 30px);
+      box-shadow: 0 20px 48px rgba(0, 0, 0, 0.5);
     }
-    .badge {
-      display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
-      text-transform: uppercase; color: #58a6ff; background: rgba(56, 139, 253, 0.15);
-      padding: 4px 10px; border-radius: 999px; margin-bottom: 12px;
+    .brand-logo {
+      display: block;
+      width: 56px;
+      height: 56px;
+      border-radius: 14px;
+      margin-bottom: 16px;
     }
-    h1 { margin: 0 0 8px; font-size: 20px; font-weight: 600; }
-    p { margin: 0 0 20px; font-size: 13px; line-height: 1.5; color: #9da7b3; }
-    input {
-      width: 100%; padding: 11px 14px; border-radius: 10px;
-      border: 1px solid rgba(255, 255, 255, 0.16); background: #0d1324;
-      color: #fff; font-size: 14px; outline: none; margin-bottom: 12px;
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(1.15rem, 2.5vw + 0.6rem, 1.4rem);
+      font-weight: 650;
+      letter-spacing: -0.015em;
+      line-height: 1.25;
+      color: #f8fafc;
     }
-    input:focus { border-color: #388bfd; }
+    p {
+      margin: 0 0 20px;
+      font-size: clamp(0.85rem, 1vw + 0.62rem, 0.94rem);
+      line-height: 1.55;
+      color: #94a3b8;
+    }
+    input[type="password"] {
+      width: 100%;
+      min-height: 46px;
+      padding: 11px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      background: #0b1222;
+      color: #f8fafc;
+      font-size: 16px;
+      line-height: 1.35;
+      margin-bottom: 12px;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    input[type="password"]::placeholder { color: #64748b; }
+    input[type="password"]:focus {
+      outline: none;
+      border-color: #0068FF;
+      box-shadow: 0 0 0 3px rgba(0, 104, 255, 0.25);
+    }
+    input[type="password"]:focus-visible,
+    button:focus-visible {
+      outline: 2px solid #388bfd;
+      outline-offset: 2px;
+    }
     button {
-      width: 100%; padding: 11px 14px; border-radius: 10px; border: 0;
-      background: #1f6feb; color: #fff; font-size: 14px; font-weight: 600;
-      cursor: pointer; transition: background 0.15s ease;
+      width: 100%;
+      min-height: 46px;
+      padding: 12px 16px;
+      border-radius: 12px;
+      border: 0;
+      background: #0068FF;
+      color: #ffffff;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      touch-action: manipulation;
+      transition: background 0.15s ease, transform 0.1s ease;
     }
-    button:hover { background: #388bfd; }
-    .err { margin-top: 12px; font-size: 13px; color: #ff7b72; min-height: 18px; }
+    button:hover { background: #1a78ff; }
+    button:active { transform: translateY(1px); }
+    .err {
+      margin-top: 12px;
+      font-size: 13px;
+      line-height: 1.4;
+      color: #ff7b72;
+      min-height: 18px;
+    }
+    @media (max-height: 480px) and (orientation: landscape) {
+      .card { padding: 16px 20px; }
+      .brand-logo { width: 44px; height: 44px; margin-bottom: 10px; }
+      p { margin-bottom: 12px; }
+      .err { margin-top: 8px; }
+    }
   </style>
 </head>
 <body>
   <form class="card" id="gate-form">
-    <span class="badge">Zero Server Persistence</span>
+    <img src="/__olaz/logo.svg" width="56" height="56" alt="KV Zalo" class="brand-logo">
     <h1>Unlock KV Zalo Web Relay</h1>
     <p>Enter your server access token to issue a memory-only gate cookie. Your Zalo session, keys, and messages remain 100% inside your browser.</p>
     <input id="token-input" type="password" name="token" placeholder="Server access token" autocomplete="current-password" required autofocus>
     <button type="submit">Unlock Relay</button>
-    <div class="err" id="err-box"></div>
+    <div class="err" id="err-box" role="alert" aria-live="polite"></div>
   </form>
   <script>
     document.getElementById('gate-form').addEventListener('submit', async (ev) => {
@@ -248,4 +324,4 @@ pub const UNLOCK_PAGE_HTML: &str = r#"<!DOCTYPE html>
   </script>
 </body>
 </html>
-"#;
+"##;

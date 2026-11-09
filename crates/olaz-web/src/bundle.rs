@@ -33,6 +33,27 @@ pub const SW_JS: &str = include_str!("../js/sw.js");
 /// Embedded client-side session boot router (`js/boot.html`).
 pub const BOOT_HTML: &str = include_str!("../js/boot.html");
 
+/// Crisp KV Zalo SVG brand mark (`assets/logo.svg`).
+pub const LOGO_SVG: &str = include_str!("../assets/logo.svg");
+
+/// Responsive mobile & standalone PWA stylesheet (`assets/mobile.css`).
+pub const MOBILE_CSS: &str = include_str!("../assets/mobile.css");
+
+/// 192x192 RGBA PNG app icon (`assets/icon-192.png`).
+pub const ICON_192_PNG: &[u8] = include_bytes!("../assets/icon-192.png");
+
+/// 512x512 RGBA PNG app icon (`assets/icon-512.png`).
+pub const ICON_512_PNG: &[u8] = include_bytes!("../assets/icon-512.png");
+
+/// 512x512 full-bleed opaque maskable PNG app icon (`assets/icon-maskable-512.png`).
+pub const ICON_MASKABLE_512_PNG: &[u8] = include_bytes!("../assets/icon-maskable-512.png");
+
+/// 180x180 full-bleed opaque iOS/iPadOS Home Screen icon (`assets/apple-touch-icon.png`).
+pub const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../assets/apple-touch-icon.png");
+
+/// Multi-resolution (`16x16`, `32x32`, `48x48`) favicon (`assets/favicon.ico`).
+pub const FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
+
 const BROWSER_CSP_META: &str = concat!(
     r#"<meta http-equiv="Content-Security-Policy" content=""#,
     "default-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data: ws: wss: https:; ",
@@ -42,9 +63,27 @@ const BROWSER_CSP_META: &str = concat!(
     "media-src 'self' blob: data: https: http:; ",
     "font-src 'self' blob: data: https:; ",
     "connect-src 'self' blob: data: ws: wss: https:; ",
+    "manifest-src 'self'; ",
     "worker-src 'self' blob:; ",
     "frame-src 'self' blob:;",
     r#"">"#,
+);
+
+const VIEWPORT_META_TAG: &str =
+    r#"<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, viewport-fit=cover">"#;
+
+const HEAD_PWA_TAGS: &str = concat!(
+    r##"<meta name="theme-color" content="#0068FF">"##,
+    r#"<meta name="application-name" content="KV Zalo">"#,
+    r#"<meta name="mobile-web-app-capable" content="yes">"#,
+    r#"<meta name="apple-mobile-web-app-capable" content="yes">"#,
+    r#"<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">"#,
+    r#"<meta name="apple-mobile-web-app-title" content="KV Zalo">"#,
+    r#"<link rel="manifest" href="/manifest.webmanifest">"#,
+    r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#,
+    r#"<link rel="icon" type="image/png" sizes="192x192" href="/__olaz/icons/icon-192.png">"#,
+    r#"<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">"#,
+    r#"<link rel="stylesheet" href="/__olaz/mobile.css">"#,
 );
 
 const HEAD_BOOT_SCRIPTS: &str = concat!(
@@ -59,6 +98,11 @@ const WORKER_IMPORT_PREAMBLE: &str =
 static CSP_META_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?is)<meta\b[^>]*http-equiv\s*=\s*["']?Content-Security-Policy["']?[^>]*>"#)
         .expect("valid CSP meta regex")
+});
+
+static VIEWPORT_META_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<meta\b[^>]*\bname\s*=\s*["']?viewport["']?[^>]*>"#)
+        .expect("valid viewport meta regex")
 });
 
 static SCRIPT_SRC_TAG_RE: Lazy<Regex> = Lazy::new(|| {
@@ -468,12 +512,114 @@ pub fn transform_bundle_asset(rel_path: &str, raw_bytes: &[u8]) -> Vec<u8> {
     maybe_patched.unwrap_or_else(|| raw_bytes.to_vec())
 }
 
+fn sanitize_profile_slot(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() || trimmed == "default" || trimmed.len() > 64 {
+        return None;
+    }
+    if trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// Builds a W3C Web App Manifest JSON document (`application/manifest+json`), optionally scoped
+/// to an isolated multi-account profile slot (`?profile=<slot>`).
+pub fn build_web_manifest_json(profile_slot: Option<&str>) -> String {
+    let (name, short_name, id_and_start_url) = match sanitize_profile_slot(profile_slot) {
+        Some(slot) => (
+            format!("KV Zalo ({slot})"),
+            format!("Zalo·{slot}"),
+            format!("/?profile={slot}&source=pwa"),
+        ),
+        None => (
+            "KV Zalo".to_string(),
+            "KV Zalo".to_string(),
+            "/?source=pwa".to_string(),
+        ),
+    };
+
+    let manifest = json!({
+        "name": name,
+        "short_name": short_name,
+        "id": id_and_start_url,
+        "start_url": id_and_start_url,
+        "scope": "/",
+        "display": "standalone",
+        "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
+        "orientation": "any",
+        "background_color": "#0f172a",
+        "theme_color": "#0068FF",
+        "description": "Zero-persistence self-hosted Zalo Web & PWA with browser-local E2EE vault, multi-account isolation, and media controls.",
+        "categories": ["social", "communication", "productivity"],
+        "icons": [
+            {
+                "src": "/__olaz/logo.svg",
+                "sizes": "any",
+                "type": "image/svg+xml",
+                "purpose": "any"
+            },
+            {
+                "src": "/__olaz/icons/icon-192.png",
+                "sizes": "192x192",
+                "type": "image/png",
+                "purpose": "any"
+            },
+            {
+                "src": "/__olaz/icons/icon-512.png",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any"
+            },
+            {
+                "src": "/__olaz/icons/icon-maskable-512.png",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "maskable"
+            }
+        ],
+        "shortcuts": [
+            {
+                "name": "Open Default Vault",
+                "short_name": "Default Vault",
+                "url": "/?source=pwa",
+                "icons": [
+                    {
+                        "src": "/__olaz/icons/icon-192.png",
+                        "sizes": "192x192",
+                        "type": "image/png"
+                    }
+                ]
+            },
+            {
+                "name": "Boot Session Router",
+                "short_name": "Session Router",
+                "url": "/boot.html",
+                "icons": [
+                    {
+                        "src": "/__olaz/icons/icon-192.png",
+                        "sizes": "192x192",
+                        "type": "image/png"
+                    }
+                ]
+            }
+        ]
+    });
+
+    serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Transforms a Zalo HTML entrypoint (`login.html`, `index.html`, `shared-worker.html`, etc.):
 /// 1. Rewrites `zfile://local/` -> `/__zfile/`.
-/// 2. Rewrites `<meta http-equiv="Content-Security-Policy">` to permit `'self' blob: data: ws: wss: https:`.
-/// 3. Defers Zalo `<script src="...">` tags (`data-olaz-defer-src="..."`) until `window.__olazBootReady`
+/// 2. Rewrites `<meta http-equiv="Content-Security-Policy">` to permit `'self' blob: data: ws: wss: https:` + `manifest-src 'self'`.
+/// 3. Normalizes `<meta name="viewport">` to include `viewport-fit=cover`.
+/// 4. Defers Zalo `<script src="...">` tags (`data-olaz-defer-src="..."`) until `window.__olazBootReady`
 ///    hydrates `IndexedDB` (and unlocks any optional SubtleCrypto PIN Vault).
-/// 4. Injects `<script src="/__olaz/crypto_sync.js"></script><script src="/__olaz/bridge_table.js"></script><script src="/__olaz/preload.js"></script>` into `<head>`.
+/// 5. Injects PWA metadata, icons, `/__olaz/mobile.css`, and `/__olaz/{crypto_sync,bridge_table,preload}.js` into `<head>`.
 pub fn transform_zalo_html(html: &str) -> String {
     let step1 = html.replace("zfile://local/", "/__zfile/");
 
@@ -483,8 +629,17 @@ pub fn transform_zalo_html(html: &str) -> String {
         step1
     };
 
+    let had_viewport = VIEWPORT_META_RE.is_match(&step2);
+    let step2_vp = if had_viewport {
+        VIEWPORT_META_RE
+            .replace_all(&step2, VIEWPORT_META_TAG)
+            .into_owned()
+    } else {
+        step2
+    };
+
     let step3 = SCRIPT_SRC_TAG_RE
-        .replace_all(&step2, |caps: &Captures<'_>| {
+        .replace_all(&step2_vp, |caps: &Captures<'_>| {
             let before = &caps[1];
             let quote_open = &caps[2];
             let src_val = &caps[3];
@@ -504,13 +659,19 @@ pub fn transform_zalo_html(html: &str) -> String {
         return step3;
     }
 
+    let head_injection = if had_viewport {
+        format!("{HEAD_PWA_TAGS}{HEAD_BOOT_SCRIPTS}")
+    } else {
+        format!("{VIEWPORT_META_TAG}{HEAD_PWA_TAGS}{HEAD_BOOT_SCRIPTS}")
+    };
+
     if let Some(m) = HEAD_OPEN_RE.find(&step3) {
-        let mut out = String::with_capacity(step3.len() + HEAD_BOOT_SCRIPTS.len());
+        let mut out = String::with_capacity(step3.len() + head_injection.len());
         out.push_str(&step3[..m.end()]);
-        out.push_str(HEAD_BOOT_SCRIPTS);
+        out.push_str(&head_injection);
         out.push_str(&step3[m.end()..]);
         out
     } else {
-        format!("{HEAD_BOOT_SCRIPTS}{step3}")
+        format!("{head_injection}{step3}")
     }
 }

@@ -980,9 +980,21 @@ async fn stateless_http_media_and_ws_relay_e2e_on_readonly_filesystem() {
     assert!(login_html.contains(r#"<script src="/__olaz/crypto_sync.js"></script>"#));
     assert!(login_html.contains(r#"<script src="/__olaz/bridge_table.js"></script>"#));
     assert!(login_html.contains(r#"<script src="/__olaz/preload.js"></script>"#));
+    assert!(login_html.contains(r#"rel="manifest" href="/manifest.webmanifest""#));
+    assert!(login_html.contains(r#"rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png""#));
+    assert!(login_html.contains("viewport-fit=cover"));
+    assert!(login_html.contains(r#"href="/__olaz/mobile.css""#));
+    assert!(login_html.contains("manifest-src 'self'"));
     assert!(login_html.contains(r#"data-olaz-defer-src="renderer.js""#));
     assert!(login_html.contains(r#"/__zfile/cached/avatar.jpg"#));
     assert!(login_html.contains("ws: wss: https:"));
+
+    // Verify existing `<meta name="viewport">` is normalized in-place without duplicating viewport tags
+    let normalized_vp = olaz_web::transform_zalo_html(
+        r#"<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"></head><body></body></html>"#,
+    );
+    assert_eq!(normalized_vp.matches(r#"name="viewport""#).count(), 1);
+    assert!(normalized_vp.contains("viewport-fit=cover"));
 
     let worker_js = client
         .get(format!("{base_url}/dal-worker.test123.js"))
@@ -1249,6 +1261,107 @@ async fn security_auth_gate_and_ssrf_allowlist_rejections() {
     assert_eq!(unauth_html.status().as_u16(), 401);
     let unlock_body = unauth_html.text().await.unwrap();
     assert!(unlock_body.contains("Unlock KV Zalo Web"));
+    assert!(unlock_body.contains("viewport-fit=cover"));
+    assert!(unlock_body.contains(r#"rel="manifest""#));
+    assert!(unlock_body.contains(r#"rel="apple-touch-icon""#));
+    assert!(unlock_body.contains(r#"src="/__olaz/logo.svg""#));
+
+    // 1b. Public PWA manifest, icons, favicon & mobile CSS MUST return 200 OK even before `--token` auth!
+    let png_magic: &[u8] = b"\x89PNG\r\n\x1a\n";
+    let ico_magic: &[u8] = &[0x00, 0x00, 0x01, 0x00];
+
+    let manifest_default_resp = client
+        .get(format!("{base_url}/manifest.webmanifest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(manifest_default_resp.status().as_u16(), 200);
+    assert!(manifest_default_resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("application/manifest+json"));
+    let manifest_default: Value = manifest_default_resp.json().await.unwrap();
+    assert_eq!(manifest_default["name"], "KV Zalo");
+    assert_eq!(manifest_default["short_name"], "KV Zalo");
+    assert_eq!(manifest_default["start_url"], "/?source=pwa");
+    assert_eq!(manifest_default["display"], "standalone");
+    assert_eq!(manifest_default["theme_color"], "#0068FF");
+    let icons_arr = manifest_default["icons"].as_array().expect("manifest icons array");
+    assert!(icons_arr
+        .iter()
+        .any(|i| i["sizes"] == "192x192" && i["purpose"] == "any"));
+    assert!(icons_arr
+        .iter()
+        .any(|i| i["sizes"] == "512x512" && i["purpose"] == "any"));
+    assert!(icons_arr
+        .iter()
+        .any(|i| i["sizes"] == "512x512" && i["purpose"] == "maskable"));
+
+    let manifest_slot_resp = client
+        .get(format!("{base_url}/manifest.webmanifest?profile=acc-2"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(manifest_slot_resp.status().as_u16(), 200);
+    let manifest_slot: Value = manifest_slot_resp.json().await.unwrap();
+    assert_eq!(manifest_slot["name"], "KV Zalo (acc-2)");
+    assert_eq!(manifest_slot["short_name"], "Zalo·acc-2");
+    assert_eq!(manifest_slot["id"], "/?profile=acc-2&source=pwa");
+    assert_eq!(manifest_slot["start_url"], "/?profile=acc-2&source=pwa");
+
+    for svg_route in ["/__olaz/logo.svg", "/favicon.svg"] {
+        let r = client.get(format!("{base_url}{svg_route}")).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 200, "SVG route {svg_route} must return 200");
+        let txt = r.text().await.unwrap();
+        assert!(txt.contains("<svg") && txt.contains("#0068FF"));
+    }
+
+    for png_route in [
+        "/__olaz/icons/icon-192.png",
+        "/__olaz/icons/icon-512.png",
+        "/__olaz/icons/icon-maskable-512.png",
+        "/apple-touch-icon.png",
+        "/apple-touch-icon-precomposed.png",
+    ] {
+        let r = client.get(format!("{base_url}{png_route}")).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 200, "PNG route {png_route} must return 200");
+        assert_eq!(
+            r.headers().get("content-type").unwrap().to_str().unwrap(),
+            "image/png"
+        );
+        let bytes = r.bytes().await.unwrap();
+        assert!(bytes.len() > 256, "PNG {png_route} must be non-trivial");
+        assert_eq!(&bytes[..8], png_magic, "invalid PNG magic on {png_route}");
+    }
+
+    let fav_resp = client
+        .get(format!("{base_url}/favicon.ico"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fav_resp.status().as_u16(), 200);
+    let fav_bytes = fav_resp.bytes().await.unwrap();
+    assert!(fav_bytes.len() > 64);
+    assert_eq!(&fav_bytes[..4], ico_magic, "invalid ICO magic on /favicon.ico");
+
+    let css_resp = client
+        .get(format!("{base_url}/__olaz/mobile.css"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(css_resp.status().as_u16(), 200);
+    assert!(css_resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("text/css"));
+    let css_body = css_resp.bytes().await.unwrap();
+    assert!(!css_body.is_empty(), "/__olaz/mobile.css must be non-empty");
 
     let unauth_relay = client
         .post(format!("{base_url}/__olaz/http"))
@@ -1767,6 +1880,24 @@ async fn browser_preload_multi_account_pin_vault_sw_and_cli_smoke() {
         assert.equal(swResponse.headers.get('content-range'), 'bytes 10-49/200');
         const denoisedSlice = new Uint8Array(await swResponse.arrayBuffer());
         assert.deepEqual(Array.from(denoisedSlice), Array.from(rawVideo.subarray(10, 50)));
+
+        // Verify `sw.js` offline navigation fallback returns 200 OK branded "KV Zalo — Offline" page
+        swScope.fetch = () => Promise.reject(new TypeError('Failed to fetch'));
+        const swOfflineNavResp = await new Promise((resolve) => {
+          swFetchListener({
+            request: {
+              url: 'http://127.0.0.1:8080/index.html?source=pwa',
+              method: 'GET',
+              mode: 'navigate',
+              headers: new Headers(),
+            },
+            respondWith(p) { resolve(p); },
+          });
+        });
+        assert.equal(swOfflineNavResp.status, 200);
+        const offlineHtml = await swOfflineNavResp.text();
+        assert.ok(offlineHtml.includes('KV Zalo — Offline'));
+        assert.ok(offlineHtml.includes('Retry'));
 
         // 6b. Verify plain-LAN-HTTP fallback (`http://192.168.x.x:<port>/` with no ServiceWorker controller)
         const lanHit = win.__olazResolveVfsZfile('/__zfile/@slot/acc_2/olaz-vfs/userData/ZaloDownloads/noised.mp4');

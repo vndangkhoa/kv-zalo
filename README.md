@@ -42,7 +42,7 @@ Zalo has no official Linux desktop client. Running Zalo PC under Wine/Bottles br
 - 📞 **Pure-Rust VoIP & Call Recorder**: Native 1:1 & group audio/video/screen-share calls (`Opus 16 kHz`, `H.264`, `Zavi/SRTP`) with built-in stereo `WAV` / `Ogg-Opus` call recording and customizable save path.
 - 🛡️ **Default Anti-Recall ("Giữ thu hồi")**: Automatically preserves recalled text, quotes, and cached attachments in-place with a `Đã thu hồi` badge—toggleable anytime from any chat bubble's `...` menu.
 - 👥 **Native Multi-Account Sidebar**: Switch between unlimited personal & work Zalo accounts in `0 ms` directly inside Zalo's blue `#main-tab` sidebar (`+` button or <kbd>Ctrl</kbd>+<kbd>1..9</kbd>) with isolated cookies, IndexedDB, and keyring secrets.
-- 🌐 **Zero-Server-Persistence Self-Hosted Web (`kv-zalo-web`)**: Runs in Docker with `read_only: true` and zero writable server volumes—`100%` of cookies (`zpw_sek`), E2EE keys, OPFS files, and chat history stay strictly inside your browser.
+- 🌐 **Zero-Server-Persistence Web & Mobile PWA (`kv-zalo-web`)**: Installable Progressive Web App with responsive mobile master-detail chat layout, OS/lock-screen Media Session + in-app Now-Playing Media Card, and `read_only: true` Docker execution—`100%` of cookies (`zpw_sek`), E2EE keys, OPFS files, and chat history stay strictly inside your browser.
 - 🤖 **Privacy, Proxy & AI MCP Ready**: Outbound typing/seen/delivered receipt blockers, `SOCKS5`/`HTTP` proxy + DoH routing, scheduled messages, auto-reply, loopback REST API, and `stdio` MCP server.
 
 ---
@@ -74,9 +74,11 @@ Intercepts recall events before Zalo wipes message payloads, keeping original te
 ### 3. 👥 Native `#main-tab` Multi-Account Workspace
 Integrates account avatars and an aligned **`+` (Thêm tài khoản Zalo)** button directly into Zalo's native blue left navigation bar. Each profile runs in an isolated `WebDataManager` + cookie jar + Secret Service vault with instant `0 ms` switching (<kbd>Ctrl</kbd>+<kbd>1..9</kbd> / <kbd>Ctrl</kbd>+<kbd>Tab</kbd>) and live unread badges.
 
-### 4. 🌐 Zero-Server-Persistence Self-Hosted Web (`kv-zalo-web`)
+### 4. 🌐 Zero-Server-Persistence Self-Hosted Web & Mobile PWA (`kv-zalo-web`)
 Host Zalo on any home server, VPS, or Synology NAS with **zero server-side user data**:
 - `$znode.crypto`, `SafeStorage`, `KeychainCipher`, `BrowserCookieJar` (`zpw_sek`), IndexedDB, and virtual OPFS files execute **100% inside the client browser**.
+- **Installable PWA & Mobile Responsive UI**: Serves `/manifest.webmanifest` (with per-profile `?profile=<slot>` PWA manifests), crisp SVG + maskable icons, offline Service Worker shell fallback, fluid `clamp()` typography, and a single-pane master-detail mobile chat layout (`320px–767px`) with bottom tab navigation and `← Chats` back button.
+- **OS Media Session & In-App Media Controls**: Integrates `navigator.mediaSession` lock-screen/headset controls (`play`, `pause`, `stop`, `seekbackward`, `seekforward`, `seekto`, `previoustrack`, `nexttrack`, live position state) alongside a floating Now-Playing Media Card with scrubber, `-10s`/`+10s` skip, `1×–2×` playback speed, mute, and `<video>` Picture-in-Picture.
 - The Rust container runs with `read_only: true`, `cap_drop: [ALL]`, and `core: 0`—acting strictly as an allowlisted HTTP/Range/WebSocket pass-through to `*.zalo.me` and `*.zadn.vn`.
 - Supports multi-account browser tabs (`?profile=work`, `?profile=personal`) and optional `SubtleCrypto` `PBKDF2-SHA256` (600,000 iterations) → `AES-256-GCM` local PIN lock.
 

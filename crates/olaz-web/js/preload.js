@@ -1950,6 +1950,7 @@ function bootstrapSessionRuntime(globalScope) {
   const swHandlers = new Set();
   const swPending = new Map(); // reqId -> true
   let lastSessionAnnouncement = null;
+  let cachedViewerKey = '';
 
   function ensureSharedWorkerFrame() {
     if (IS_SHARED_WORKER_FRAME || sharedWorkerIframe) return;
@@ -2411,6 +2412,55 @@ function bootstrapSessionRuntime(globalScope) {
         }
         return false;
       }
+      case 'migratedb:signal_restart': {
+        writeNamedStoreSync('database-config', readNamedStoreSync('database-config'));
+        const q = new URLSearchParams();
+        q.set('fail_sqlite3', 'true');
+        if (ACTIVE_SLOT !== 'default') q.set('profile', ACTIVE_SLOT);
+        if (cookieJar.hasZpwSek()) {
+          q.set('is_main', 'true');
+          window.location.assign('/index.html?' + q.toString());
+        } else {
+          window.location.assign('/login.html?' + q.toString());
+        }
+        return undefined;
+      }
+      case 'receive-viewerkey': {
+        if (args[0] !== undefined && args[0] !== null) {
+          cachedViewerKey = String(args[0]);
+          if (ipcBus) {
+            ipcBus.postMessage({
+              __olazType: 'ipc-broadcast',
+              sender: CONTEXT_ID,
+              channel: 'receive-viewerkey',
+              args: [args[0]],
+            });
+          }
+        }
+        return undefined;
+      }
+      case 'db-start-close-dbs':
+      case 'db-finish-close-dbs':
+        return undefined;
+      case 'get-clipboard': {
+        const a0 = args[0];
+        const reqId =
+          (a0 && typeof a0 === 'object' && (a0.idReq || a0.requestId)) ||
+          (typeof a0 === 'string' ? a0 : '');
+        return { requestId: reqId, content: [] };
+      }
+      case 'call-request': {
+        if (args[0] === 'listDevice') {
+          return { audioInput: [], audioOutput: [], videoInput: [] };
+        }
+        return null;
+      }
+      case 'zwalker-collect-dir-stats':
+      case 'zwalker-update-file-stats':
+      case 'zwalker-del-unmarked-files':
+      case 'zwalker-stat-unmarked-files':
+      case 'zwalker-delete-empty-folders':
+        return { totalSize: 0, fileCount: 0, files: [], deletedCount: 0 };
       default:
         return handleSyncIpc(channel, args);
     }
@@ -2432,6 +2482,7 @@ function bootstrapSessionRuntime(globalScope) {
     if (!filePath) return Promise.resolve('');
     return new Promise((resolve) => {
       const video = document.createElement('video');
+      video.__olazInternalThumb = true;
       let doneFlag = false;
       const finish = (v) => {
         if (doneFlag) return;
@@ -2593,18 +2644,33 @@ function bootstrapSessionRuntime(globalScope) {
         return i <= 0 ? '' : b.slice(i);
       },
       isAbsolute: (p) => String(p || '').startsWith('/'),
+      relative: (from, to) => {
+        const f = posixPath.resolve(from).split('/').filter(Boolean);
+        const t = posixPath.resolve(to).split('/').filter(Boolean);
+        let i = 0;
+        while (i < f.length && i < t.length && f[i] === t[i]) i++;
+        return [...Array(f.length - i).fill('..'), ...t.slice(i)].join('/');
+      },
       parse: (p) => {
         const dir = posixPath.dirname(p);
         const base = posixPath.basename(p);
         const ext = posixPath.extname(p);
         return { root: '/', dir, base, ext, name: ext ? base.slice(0, -ext.length) : base };
       },
+      format: (o) => {
+        const obj = o && typeof o === 'object' ? o : {};
+        const dir = obj.dir || obj.root || '';
+        const base = obj.base || (obj.name || '') + (obj.ext || '');
+        return dir ? (dir === obj.root ? dir + base : dir + '/' + base) : base;
+      },
+      toNamespacedPath: (p) => p,
     };
     posixPath.posix = posixPath;
     znode.path = posixPath;
 
     const osInfo = (znode.os && znode.os.__info) || {
       release: '22.6.0',
+      version: 'Darwin Kernel Version 22.6.0',
       arch: 'x64',
       hostname: 'OlazWeb',
       homedir: '/Users/olaz',
@@ -2619,13 +2685,17 @@ function bootstrapSessionRuntime(globalScope) {
       platform: () => 'darwin',
       type: () => 'Darwin',
       release: () => osInfo.release || '22.6.0',
+      version: () => osInfo.version || 'Darwin Kernel Version 22.6.0',
       arch: () => 'x64',
       hostname: () => osInfo.hostname || 'OlazWeb',
       homedir: () => '/Users/olaz',
       tmpdir: () => VFS_TEMP,
+      endianness: () => 'LE',
       EOL: '\n',
       totalmem: () => osInfo.totalmem,
       freemem: () => osInfo.freemem,
+      uptime: () => osInfo.uptime || 3600,
+      loadavg: () => [0, 0, 0],
       cpus: () =>
         Array.from({ length: osInfo.cpus || 4 }, () => ({
           model: 'BrowserVCPU',
@@ -2896,6 +2966,26 @@ function bootstrapSessionRuntime(globalScope) {
       showItemInFolder: async () => undefined,
     };
 
+    const buildDiskMapProxy = () => {
+      const rootEntry = {
+        label: '/',
+        mountpoint: '/',
+        totalSpace: 100e9,
+        freeSpace: 50e9,
+        total: 100e9,
+        free: 50e9,
+      };
+      const disks = { '/': rootEntry };
+      return new Proxy(disks, {
+        get(target, key) {
+          if (typeof key === 'symbol') return target[key];
+          if (Object.prototype.hasOwnProperty.call(target, key)) return target[key];
+          if (typeof key === 'string' && key.startsWith('/')) return rootEntry;
+          return target[key];
+        },
+      });
+    };
+
     znode.nativelibs = {
       zfileAddon: {
         canRead: (p) => fsSync.existsSync(p),
@@ -2906,9 +2996,23 @@ function bootstrapSessionRuntime(globalScope) {
         copyFolder: async () => true,
         cancelCopy: () => {},
       },
+      zfile: () => ({
+        canRead: (p) => fsSync.existsSync(p),
+        canWrite: () => true,
+        canReadAndWrite: () => true,
+        getInfo: async (p) => (fsSync.existsSync(p) ? fsSync.statSync(p) : null),
+        getDiskInfo: async () => buildDiskMapProxy(),
+        diskInfo: async () => buildDiskMapProxy(),
+        copyFolder: async (_src, _dst, cb) => {
+          if (typeof cb === 'function') cb(null, true);
+          return true;
+        },
+        cancelCopy: async () => undefined,
+      }),
       fileUtilsAddon: {
         getDiskUsage: () => ({ available: 50e9, free: 50e9, total: 100e9 }),
       },
+      fileUtils: () => znode.nativelibs.fileUtilsAddon,
       fileUtilitiesAddon: {
         getDirectorySizeSync: () => ({ totalSize: 0, fileCount: 0 }),
         getDirectorySizeAsync: async () => ({ totalSize: 0, fileCount: 0 }),
@@ -2922,11 +3026,15 @@ function bootstrapSessionRuntime(globalScope) {
         detectFilesystemAsync: async () => ({ filesystemType: 'ext4' }),
         cancelJob: () => {},
       },
+      fileUtilities: () => znode.nativelibs.fileUtilitiesAddon,
       dbUtilsAddon: {
         decompressAndDecryptDb_V2: () => null,
         decompressAndDecryptDb: () => null,
         parseBinNet: () => ({}),
       },
+      dbUtils: () => znode.nativelibs.dbUtilsAddon,
+      zcallAddon: {},
+      zcall: () => znode.nativelibs.zcallAddon,
       mp4thumb: () => ({
         generateThumbnail: async (inp, out, mw, mh) => {
           const dataUrl = await generateVideoThumbnailBrowser(inp, mw, mh);
@@ -2939,59 +3047,135 @@ function bootstrapSessionRuntime(globalScope) {
       }),
     };
 
-    // `$zelectron` (`Store` class + sync/async helpers)
+    // `$zelectron` (`getElectronStore` factory + `Store` class + sync/async helpers)
+    const getDotPath = (obj, key) =>
+      String(key)
+        .split('.')
+        .reduce((o, k) => (o == null || typeof o !== 'object' ? undefined : o[k]), obj);
+    const setDotPath = (obj, key, val) => {
+      const parts = String(key).split('.');
+      let cur = obj;
+      for (let i = 0; i < parts.length - 1; i++) {
+        if (cur[parts[i]] == null || typeof cur[parts[i]] !== 'object') cur[parts[i]] = {};
+        cur = cur[parts[i]];
+      }
+      cur[parts[parts.length - 1]] = val;
+    };
+    const deleteDotPath = (obj, key) => {
+      const parts = String(key).split('.');
+      let cur = obj;
+      for (let i = 0; i < parts.length - 1; i++) {
+        if (cur == null || typeof cur !== 'object') return;
+        cur = cur[parts[i]];
+      }
+      if (cur && typeof cur === 'object') delete cur[parts[parts.length - 1]];
+    };
+    const cloneStoreVal = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
+
     class BrowserElectronStore {
       constructor(opts = {}) {
-        this._name = String(opts.name || 'config');
-        this.path = VFS_USER_DATA + '/' + this._name + '.json';
+        const cleanOpts = opts && typeof opts === 'object' ? opts : {};
+        this._name = String(cleanOpts.name || 'config');
+        this._defaults =
+          cleanOpts.defaults && typeof cleanOpts.defaults === 'object'
+            ? cloneStoreVal(cleanOpts.defaults)
+            : {};
+        this._listeners = new Set();
+      }
+      get path() {
+        return VFS_USER_DATA + '/' + this._name + '.json';
+      }
+      _readMerged() {
+        return Object.assign({}, this._defaults, readNamedStoreSync(this._name));
+      }
+      _persist(nextObj, prevObj) {
+        writeNamedStoreSync(this._name, nextObj);
+        for (const fn of Array.from(this._listeners)) {
+          try {
+            fn(nextObj, prevObj);
+          } catch {}
+        }
       }
       get store() {
-        return readNamedStoreSync(this._name);
+        return cloneStoreVal(this._readMerged());
       }
       set store(val) {
-        writeNamedStoreSync(this._name, val);
+        const old = cloneStoreVal(this._readMerged());
+        const next = Object.assign({}, val && typeof val === 'object' ? val : {});
+        this._persist(next, old);
+      }
+      get size() {
+        return Object.keys(this._readMerged()).length;
       }
       get(key, defaultValue) {
-        const obj = this.store;
-        if (!key) return obj;
-        const parts = String(key).split('.');
-        let cur = obj;
-        for (const p of parts) {
-          if (!cur || typeof cur !== 'object' || !(p in cur)) return defaultValue;
-          cur = cur[p];
-        }
-        return cur === undefined ? defaultValue : cur;
+        const obj = this._readMerged();
+        if (key === undefined) return cloneStoreVal(obj);
+        const v = getDotPath(obj, key);
+        return v === undefined ? defaultValue : cloneStoreVal(v);
       }
       set(key, val) {
+        const obj = this._readMerged();
+        const old = cloneStoreVal(obj);
         if (key && typeof key === 'object') {
-          this.store = Object.assign({}, this.store, key);
-          return;
+          for (const [k, v] of Object.entries(key)) setDotPath(obj, k, v);
+        } else {
+          setDotPath(obj, key, val);
         }
-        const obj = this.store;
-        const parts = String(key).split('.');
-        let cur = obj;
-        for (let i = 0; i < parts.length - 1; i++) {
-          if (!cur[parts[i]] || typeof cur[parts[i]] !== 'object') cur[parts[i]] = {};
-          cur = cur[parts[i]];
-        }
-        cur[parts[parts.length - 1]] = val;
-        this.store = obj;
+        this._persist(obj, old);
       }
       has(key) {
-        return this.get(key, undefined) !== undefined;
+        return getDotPath(this._readMerged(), key) !== undefined;
       }
       delete(key) {
-        const obj = this.store;
-        delete obj[key];
-        this.store = obj;
+        const obj = this._readMerged();
+        const old = cloneStoreVal(obj);
+        deleteDotPath(obj, key);
+        this._persist(obj, old);
       }
       clear() {
-        this.store = {};
+        const old = cloneStoreVal(this._readMerged());
+        this._persist({}, old);
       }
+      reset(...keys) {
+        const obj = this._readMerged();
+        const old = cloneStoreVal(obj);
+        for (const k of keys) {
+          const defVal = getDotPath(this._defaults, k);
+          if (defVal === undefined) deleteDotPath(obj, k);
+          else setDotPath(obj, k, cloneStoreVal(defVal));
+        }
+        this._persist(obj, old);
+      }
+      onDidChange(key, cb) {
+        if (typeof cb !== 'function') return () => {};
+        const listener = (n, o) => {
+          const a = getDotPath(n, key);
+          const b = getDotPath(o, key);
+          if (JSON.stringify(a) !== JSON.stringify(b)) cb(a, b);
+        };
+        this._listeners.add(listener);
+        return () => this._listeners.delete(listener);
+      }
+      onDidAnyChange(cb) {
+        if (typeof cb !== 'function') return () => {};
+        this._listeners.add(cb);
+        return () => this._listeners.delete(cb);
+      }
+      openInEditor() {}
     }
+
+    const electronStoresByKey = new Map();
+    const getElectronStore = (opts) => {
+      const cacheKey = (opts && opts.name) || 'default';
+      if (!electronStoresByKey.has(cacheKey)) {
+        electronStoresByKey.set(cacheKey, new BrowserElectronStore(opts));
+      }
+      return electronStoresByKey.get(cacheKey);
+    };
 
     window.$zelectron = Object.assign(window.$zelectron || {}, {
       Store: BrowserElectronStore,
+      getElectronStore,
       storePath: (n) => VFS_USER_DATA + '/' + (n || 'config') + '.json',
       storeRead: (n) => readNamedStoreSync(n),
       storeWrite: (n, o) => writeNamedStoreSync(n, o),
@@ -3000,25 +3184,47 @@ function bootstrapSessionRuntime(globalScope) {
     });
 
     let lastClipText = '';
+    const writeClipText = (t) => {
+      lastClipText = String(t == null ? '' : t);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(lastClipText).catch(() => {});
+      }
+    };
+    const emptyUsageBucket = { count: 0, size: 0, liveSize: 0 };
     window.$zelectronNative = Object.assign(window.$zelectronNative || {}, {
+      lockWebframeZoom: () => undefined,
+      setZoomFactor: () => undefined,
       clipboardText: () => lastClipText,
-      clipboardWriteText: (t) => {
-        lastClipText = String(t || '');
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(lastClipText).catch(() => {});
-        }
-      },
+      getClipboardText: () => lastClipText,
+      readClipboard: () => lastClipText,
+      clipboardWriteText: writeClipText,
+      writeTextToClipboard: writeClipText,
       clipboardFormats: () => (lastClipText ? ['text/plain'] : []),
+      availableClipboardFormats: () => (lastClipText ? ['text/plain'] : []),
       clipboardImagePng: () => null,
       clipboardWriteImagePng: () => {},
-      getClipboardImage: () => ({ isEmpty: () => true, toPNG: () => new Uint8Array(0) }),
+      getClipboardImage: () => ({
+        isEmpty: () => true,
+        toJPEG: () => new Uint8Array(0),
+        toPNG: () => new Uint8Array(0),
+      }),
+      getResourceUsage: () => ({
+        images: emptyUsageBucket,
+        scripts: emptyUsageBucket,
+        cssStyleSheets: emptyUsageBucket,
+        xslStyleSheets: emptyUsageBucket,
+        fonts: emptyUsageBucket,
+        other: emptyUsageBucket,
+      }),
+      clearCache: () => {},
+      getAvailableHeapSize: () => 4 * 1024 * 1024 * 1024,
     });
 
     // `$zFileManager`
     window.$zFileManager = Object.assign(window.$zFileManager || {}, {
       getSentryConfig: () => null,
       saveSentryConfig: async () => {},
-      getViewerkey: async () => '',
+      getViewerkey: async () => cachedViewerKey,
       writeRecentId: async () => {},
       writeZLog: async () => {},
       writeZLogBetween: async () => {},
@@ -3106,11 +3312,197 @@ function bootstrapSessionRuntime(globalScope) {
       },
     });
 
+    const unsupportedFeature = (featureName) => () =>
+      Promise.reject(
+        Object.assign(new Error(featureName + ' is not available in Olaz Web'), { code: 'ENOTSUP' })
+      );
+
+    let keepDelState = null;
+    const createKeepDelDb = (initialConfig) => {
+      if (!keepDelState) {
+        keepDelState = {
+          config: initialConfig || {},
+          data: null,
+          pending: [],
+          trans: 0,
+          get storeName() {
+            return (
+              'keepdel-' +
+              String(this.config.db_name || 'db')
+                .replace('$0$', this.config.userId || '')
+                .replace(/[^\w.-]/g, '_')
+            );
+          },
+          load() {
+            if (!this.data) {
+              const s = readNamedStoreSync(this.storeName) || {};
+              this.data = Array.isArray(s.items) ? s.items.slice() : [];
+            }
+          },
+          save(force) {
+            if (!this.data) return;
+            const limit = this.config.keep_limit || 5000;
+            const batch = this.config.trans_batch || 1;
+            if (!force && this.trans < batch) return;
+            this.trans = 0;
+            if (this.data.length > limit) this.data.splice(0, this.data.length - limit);
+            writeNamedStoreSync(this.storeName, { items: this.data });
+          },
+          add(item, front) {
+            if (!item) return;
+            this.trans++;
+            if (!this.data) {
+              this.pending.push(item);
+              return;
+            }
+            for (const it of [...this.pending.splice(0), item]) {
+              const json = JSON.stringify(it);
+              if (front) this.data.unshift(json);
+              else this.data.push(json);
+            }
+            this.save(false);
+          },
+        };
+      }
+      keepDelState.config = Object.assign({}, keepDelState.config, initialConfig || {});
+      return {
+        loadConfig: (c) => {
+          keepDelState.config = Object.assign({}, keepDelState.config, c || {});
+        },
+        setup: () => {
+          keepDelState.load();
+        },
+        destroy: () => {
+          keepDelState.save(true);
+          keepDelState.data = null;
+          keepDelState.trans = 0;
+        },
+        uninstall: async () => {
+          keepDelState.data = [];
+          writeNamedStoreSync(keepDelState.storeName, { items: [] });
+        },
+        connect: async () => {
+          keepDelState.load();
+        },
+        unshift: (item) => keepDelState.add(item, true),
+        push: (item) => keepDelState.add(item, false),
+        pop: () => {
+          if (!keepDelState.data) return undefined;
+          keepDelState.trans++;
+          const v = keepDelState.data.pop();
+          keepDelState.save(false);
+          try {
+            return v ? JSON.parse(v) : undefined;
+          } catch {
+            return undefined;
+          }
+        },
+      };
+    };
+
+    const createDetachCleaner = (target) => ({
+      start: () => fsPromise.rm(String(target)).then(() => 0, () => 0),
+      stop: () => Promise.resolve(),
+    });
+
     const genThumbFn = (p) => generateVideoThumbnailBrowser(p, 480, 480);
     genThumbFn.writeSavePathFilePhoto = (...a) =>
       handleAsyncIpc('gen-thumb_write-savepath-file-photo', a);
-    window.$zFeatures = window.$zFeatures || {};
-    window.$zFeatures.genThumb = genThumbFn;
+    window.$zFeatures = Object.assign(window.$zFeatures || {}, {
+      genThumb: genThumbFn,
+      libvips: {
+        resizeImage: unsupportedFeature('libvips'),
+      },
+      libjxl: {
+        decodeToJpeg: unsupportedFeature('libjxl'),
+        encodeJxl: unsupportedFeature('libjxl'),
+        getJxlInfo: unsupportedFeature('libjxl'),
+        jxlDecompressMulti: unsupportedFeature('libjxl'),
+        moduleReady: () => Promise.resolve(false),
+      },
+      fileRes: {
+        createKeepDelDb,
+        createDetachCleaner,
+      },
+    });
+
+    window.$zconfig = Object.assign(window.$zconfig || {}, {
+      getAutostartState: async () => ({ openAtLogin: false, startInTray: false }),
+      setStartInTray: async () => ({ openAtLogin: false, startInTray: false }),
+      migrateLegacyAutoLaunch: async () => ({ openAtLogin: false, startInTray: false }),
+    });
+
+    window.$zpreload = Object.assign(window.$zpreload || {}, {
+      triggerWindowLoadedEvent: () => undefined,
+    });
+
+    window.$zcommon = Object.assign(window.$zcommon || {}, {
+      send: () => undefined,
+      receive: () => undefined,
+      remove: () => undefined,
+    });
+
+    // `$zsqlite` & `MetriczGlobal` parity with `local-modules.js`
+    const noSqlite = (what) =>
+      Promise.reject(
+        Object.assign(new Error('SQLite is not available in Olaz Web (' + what + ')'), {
+          code: 'ENOTSUP',
+        })
+      );
+    const sqliteMethods = [
+      'openDb',
+      'query',
+      'queryV2',
+      'queryGlobalMessage',
+      'queryGlobalMessageV2',
+      'queryGlobalMessageV3',
+      'queryGlobalMessageV4',
+      'deleteRow',
+      'deleteRows',
+      'write',
+      'writev2',
+      'pureQuery',
+      'prepareInsertSearch',
+      'prepareDeleteSearch',
+      'getConversationMatch',
+      'flushDb',
+      'flushDbBatchv2',
+      'flushDbBatch',
+      'closeDb',
+      'finalizeInsertStatement',
+      'finalizeDeleteStatement',
+      'doListSqls',
+      'createKey',
+      'initDebug',
+      'countTotal',
+    ];
+    const sqliteStub = {
+      isLoadedLib: () => false,
+      isDbTransactionStepError: () => false,
+      createConnection: () =>
+        new Proxy(
+          {},
+          {
+            get: (_c, m) =>
+              typeof m === 'string' && /^(open|close|run|get|each|all|exec|prepare)/.test(m)
+                ? () => noSqlite(m)
+                : undefined,
+          }
+        ),
+    };
+    for (const m of sqliteMethods) sqliteStub[m] = () => noSqlite(m);
+    window.$zsqlite = sqliteStub;
+
+    window.MetriczGlobal = {
+      getProcessStats: () => ({ heapUsed: 0, heapTotal: 0, rss: 0, cpu: 0 }),
+      getProcessMemory: () => 0,
+      startCPUMonitor: () => {},
+      stopCPUMonitor: () => {},
+      getCPUUsage: () => 0,
+      onCPUChange: () => {},
+      removeCPUChangeListener: () => {},
+      getArch: () => 'x64',
+    };
 
     // `$zMsgChannel` in-renderer utility-process-media port
     const portV2Subs = new Set();
@@ -3177,6 +3569,112 @@ function bootstrapSessionRuntime(globalScope) {
     });
     window.__olazDenoiseU8 = (raw) => core.denoiseBuffer(raw);
 
+    // Ensure `navigator.connection` exists (Firefox/Safari lack Chromium's Network Information API)
+    try {
+      if (window.navigator && !('connection' in window.navigator) && typeof EventTarget !== 'undefined') {
+        const conn = new EventTarget();
+        Object.assign(conn, {
+          effectiveType: '4g',
+          type: 'wifi',
+          downlink: 10,
+          downlinkMax: Infinity,
+          rtt: 50,
+          saveData: false,
+          onchange: null,
+        });
+        conn.addEventListener('change', (e) => {
+          if (typeof conn.onchange === 'function') conn.onchange(e);
+        });
+        Object.defineProperty(Object.getPrototypeOf(window.navigator), 'connection', {
+          configurable: true,
+          get: () => conn,
+        });
+      }
+    } catch {}
+
+    // Wrap `$z*` bridge namespaces in a recursive fallback hybrid Proxy (`bridge.js` parity)
+    // so any unmapped preload member degrades cleanly to a callable/indexable stub rather than throwing.
+    const fallbackHybridCache = new Map();
+    const wrappedRealObjects = new WeakMap();
+    const NON_STUB_PROPS = new Set([
+      'then',
+      'toJSON',
+      'prototype',
+      'constructor',
+      'valueOf',
+      'toString',
+      '$$typeof',
+      'nodeType',
+      '__esModule',
+    ]);
+    const createFallbackHybrid = (dotPath) => {
+      if (fallbackHybridCache.has(dotPath)) return fallbackHybridCache.get(dotPath);
+      const leaf = dotPath.slice(dotPath.lastIndexOf('.') + 1);
+      const stubFn = (...args) => {
+        if (/^(on|once)[A-Z]/.test(leaf)) {
+          const cb = args.find((a) => typeof a === 'function');
+          if (!cb) return () => {};
+          addIpcSub(dotPath, cb);
+          return () => removeIpcSub(dotPath, cb);
+        }
+        if (/^remove(Listen|Listener)/.test(leaf)) {
+          const targetPath = dotPath.replace(
+            /\.(removeListen|removeListener|off)([A-Z])/,
+            (_m, _p, c) => '.on' + c
+          );
+          const cb = args.find((a) => typeof a === 'function');
+          removeIpcSub(targetPath, cb);
+          return undefined;
+        }
+        if (/Sync$/.test(leaf)) return undefined;
+        const cb = args.find((a) => typeof a === 'function');
+        if (cb) setTimeout(() => cb(null), 0);
+        return Promise.resolve(undefined);
+      };
+      const proxy = new Proxy(stubFn, {
+        get(target, prop) {
+          if (typeof prop === 'symbol') return target[prop];
+          if (NON_STUB_PROPS.has(prop)) return undefined;
+          if (prop === 'bind' || prop === 'call' || prop === 'apply') {
+            return Function.prototype[prop].bind(target);
+          }
+          return createFallbackHybrid(dotPath + '.' + prop);
+        },
+      });
+      fallbackHybridCache.set(dotPath, proxy);
+      return proxy;
+    };
+    const wrapBridgeObject = (obj, dotPath) => {
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+      if (wrappedRealObjects.has(obj)) return wrappedRealObjects.get(obj);
+      const proxy = new Proxy(obj, {
+        get(target, prop, receiver) {
+          if (typeof prop === 'symbol') return Reflect.get(target, prop, receiver);
+          if (Reflect.has(target, prop)) {
+            const val = Reflect.get(target, prop, receiver);
+            if (
+              val &&
+              typeof val === 'object' &&
+              Object.getPrototypeOf(val) === Object.prototype
+            ) {
+              return wrapBridgeObject(val, dotPath + '.' + prop);
+            }
+            return val;
+          }
+          if (NON_STUB_PROPS.has(prop)) return undefined;
+          return createFallbackHybrid(dotPath + '.' + prop);
+        },
+      });
+      wrappedRealObjects.set(obj, proxy);
+      return proxy;
+    };
+    for (const g of spec.globals || []) {
+      if (g === '$zsqlite' || g === 'MetriczGlobal' || g === '$zenv') continue;
+      if (window[g] && typeof window[g] === 'object') {
+        window[g] = wrapBridgeObject(window[g], g);
+      }
+    }
+
     // Rewrite DOM `<img>` / `<video>` / `<audio>` `zfile://` & cross-origin media URLs
     const rewriteMediaUrl = (u) => {
       if (typeof u !== 'string') return u;
@@ -3211,8 +3709,95 @@ function bootstrapSessionRuntime(globalScope) {
   }
 
   // ==========================================================================
-  // 8. Sleek Collapsible Floating Account Switcher & Privacy Pill (Shadow DOM)
+  // 8. KV Zalo Branding, Multi-Account PWA, Media Session & Mobile Controller
   // ==========================================================================
+
+  function renderKvZaloLogoSvg(uid) {
+    const s = String(uid || 'd').replace(/[^A-Za-z0-9_-]/g, '');
+    return (
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" aria-hidden="true" focusable="false">' +
+      '<defs>' +
+      '<linearGradient id="kvz-bg-' + s + '" x1="16" y1="8" x2="112" y2="120" gradientUnits="userSpaceOnUse">' +
+      '<stop offset="0%" stop-color="#1A7CFF"/>' +
+      '<stop offset="52%" stop-color="#0068FF"/>' +
+      '<stop offset="100%" stop-color="#0050CC"/>' +
+      '</linearGradient>' +
+      '<linearGradient id="kvz-pt-' + s + '" x1="36" y1="30" x2="92" y2="74" gradientUnits="userSpaceOnUse">' +
+      '<stop offset="0%" stop-color="#FFFFFF"/>' +
+      '<stop offset="100%" stop-color="#EBF3FF"/>' +
+      '</linearGradient>' +
+      '<linearGradient id="kvz-pf-' + s + '" x1="56" y1="48" x2="98" y2="90" gradientUnits="userSpaceOnUse">' +
+      '<stop offset="0%" stop-color="#DCEBFF"/>' +
+      '<stop offset="100%" stop-color="#B9D7FF"/>' +
+      '</linearGradient>' +
+      '</defs>' +
+      '<rect x="6" y="6" width="116" height="116" rx="28" fill="url(#kvz-bg-' + s + ')"/>' +
+      '<rect x="7" y="7" width="114" height="114" rx="27" fill="none" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="2"/>' +
+      '<path d="M64 28C42.46 28 26 42.1 26 59.5C26 68.77 30.84 77.1 38.62 82.88L33.8 97.25C33.12 99.28 35.18 101.08 37.09 100.12L53.88 91.72C57.15 92.56 60.53 93 64 93C85.54 93 102 78.9 102 61.5C102 42.99 85.54 28 64 28Z" fill="url(#kvz-pt-' + s + ')"/>' +
+      '<path d="M64 28C85.54 28 102 42.99 102 61.5C102 78.9 85.54 93 64 93C59.6 93 55.38 92.37 51.45 91.2L73.5 57.5L56.5 42.5L64 28Z" fill="url(#kvz-pf-' + s + ')" opacity="0.68"/>' +
+      '<path d="M46 60.5L64 43L82 60.5L64 78Z" fill="#0068FF" opacity="0.16"/>' +
+      '</svg>'
+    );
+  }
+  const KV_ZALO_LOGO_SVG = renderKvZaloLogoSvg('art');
+
+  const isAuxiliaryFrame =
+    IS_SHARED_WORKER_FRAME ||
+    /\/(child|popup-viewer|znotification|sqlite)\.html$/i.test(window.location.pathname);
+
+  let deferredPwaPrompt = null;
+  let refreshDeckUiFn = null;
+  let renderMediaCardUiFn = null;
+
+  function syncSlotWebManifest() {
+    if (!document.head || typeof document.head.querySelector !== 'function') return;
+    const vp = document.head.querySelector('meta[name="viewport"]');
+    if (vp) {
+      const vc = String(vp.getAttribute('content') || '');
+      if (!/minimum-scale\s*=/i.test(vc)) {
+        vp.setAttribute(
+          'content',
+          'width=device-width, initial-scale=1, minimum-scale=1, viewport-fit=cover'
+        );
+      }
+    }
+    const mobileCss = document.head.querySelector('link[rel="stylesheet"][href*="mobile.css"]');
+    if (mobileCss && document.head.lastElementChild !== mobileCss) {
+      document.head.appendChild(mobileCss);
+    }
+    const expectedHref =
+      ACTIVE_SLOT !== 'default'
+        ? '/manifest.webmanifest?profile=' + encodeURIComponent(ACTIVE_SLOT)
+        : '/manifest.webmanifest';
+    let link = document.head.querySelector('link[rel="manifest"]');
+    if (!link) {
+      if (ACTIVE_SLOT === 'default') return;
+      link = document.createElement('link');
+      link.rel = 'manifest';
+      link.crossOrigin = 'use-credentials';
+      link.href = expectedHref;
+      document.head.appendChild(link);
+      return;
+    }
+    if (ACTIVE_SLOT !== 'default' && link.getAttribute('href') !== expectedHref) {
+      link.setAttribute('href', expectedHref);
+    }
+  }
+
+  try {
+    syncSlotWebManifest();
+    window.addEventListener('beforeinstallprompt', (ev) => {
+      try {
+        ev.preventDefault();
+      } catch {}
+      deferredPwaPrompt = ev;
+      if (refreshDeckUiFn) refreshDeckUiFn();
+    });
+    window.addEventListener('appinstalled', () => {
+      deferredPwaPrompt = null;
+      if (refreshDeckUiFn) refreshDeckUiFn();
+    });
+  } catch {}
 
   async function wipeLocalSlotSession() {
     cookieJar.clearAll();
@@ -3264,95 +3849,1367 @@ function bootstrapSessionRuntime(globalScope) {
     window.location.replace('/login.html?' + q.toString());
   }
 
+  // --------------------------------------------------------------------------
+  // 8A. Web Media Session (`navigator.mediaSession`) + Media Controller
+  // --------------------------------------------------------------------------
+
+  const PLAYBACK_RATES = [1, 1.25, 1.5, 2];
+  const boundMediaSet = typeof WeakSet === 'function' ? new WeakSet() : new Set();
+  const mediaRegistry = []; // Array<{ deref: () => HTMLMediaElement | undefined, seq: number }>
+  let mediaSeqCounter = 0;
+  let activeMediaEl = null;
+  let activeMediaMeta = null;
+  let mediaCardDismissed = true;
+
+  function formatMediaClock(sec) {
+    if (!Number.isFinite(sec) || sec < 0) return '0:00';
+    const whole = Math.floor(sec);
+    const hrs = Math.floor(whole / 3600);
+    const mins = Math.floor((whole % 3600) / 60);
+    const secs = whole % 60;
+    const ss = secs < 10 ? '0' + secs : String(secs);
+    if (hrs > 0) {
+      const mm = mins < 10 ? '0' + mins : String(mins);
+      return hrs + ':' + mm + ':' + ss;
+    }
+    return mins + ':' + ss;
+  }
+
+  function shouldIgnoreMediaPlayback(el) {
+    if (!el || typeof el.play !== 'function') return true;
+    if (el.__olazInternalThumb === true || el.dataset?.olazIgnoreMedia === 'true') return true;
+    const rawSrc = String(el.currentSrc || el.getAttribute?.('src') || el.src || '');
+    const dur = Number(el.duration);
+    if (el.muted && el.loop && (!Number.isFinite(dur) || dur < 1.5)) {
+      return true;
+    }
+    if (/\/sound\/(noti|notification|ring|beep|click)/i.test(rawSrc) && (!Number.isFinite(dur) || dur < 4)) {
+      return true;
+    }
+    return false;
+  }
+
+  function cleanExtractedMediaTitle(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string') return '';
+    try {
+      let target = rawUrl;
+      const parsed = new URL(rawUrl, window.location.href);
+      if (parsed.pathname === '/__olaz/media' && parsed.searchParams.get('u')) {
+        target = parsed.searchParams.get('u');
+      }
+      const inner = new URL(target, window.location.href);
+      const base = decodeURIComponent(inner.pathname.split('/').pop() || '').trim();
+      if (
+        base &&
+        /\.(mp3|m4a|aac|wav|ogg|opus|flac|mp4|webm|mov|mkv)$/i.test(base) &&
+        !/^[0-9a-f-]{20,}\.[a-z0-9]+$/i.test(base)
+      ) {
+        return base;
+      }
+    } catch {}
+    return '';
+  }
+
+  function extractMediaContext(mediaEl) {
+    const isVideo = mediaEl && String(mediaEl.tagName || '').toUpperCase() === 'VIDEO';
+    const isVi =
+      String(document.documentElement.lang || '').toLowerCase().startsWith('vi') ||
+      Boolean(document.querySelector('[suggestion*="gợi ý"]'));
+    const defaultTitle = isVideo ? 'Chat Video' : isVi ? 'Tin nhắn thoại' : 'Voice Message';
+    const album = ACTIVE_SLOT === 'default' ? 'KV Zalo' : 'KV Zalo · ' + ACTIVE_SLOT;
+
+    let title = '';
+    let artist = '';
+    let artworkUrl = '';
+
+    if (mediaEl) {
+      title =
+        String(
+          mediaEl.dataset?.olazTitle ||
+            mediaEl.getAttribute?.('title') ||
+            mediaEl.getAttribute?.('aria-label') ||
+            ''
+        ).trim();
+
+      const container =
+        typeof mediaEl.closest === 'function'
+          ? mediaEl.closest(
+              '.chat-item, .chat-message, [data-id], .card, .zl-modal__dialog, .media-viewer'
+            )
+          : null;
+
+      if (container) {
+        if (!title) {
+          const titleNode = container.querySelector(
+            '.file-title, .voice-message-normal__title-content-wrapper, .card--sound__title, .preview-title, .caption, [data-component="text-container"]'
+          );
+          if (titleNode && titleNode.textContent) {
+            const candidate = titleNode.textContent.trim().replace(/\s+/g, ' ');
+            if (candidate && candidate.length <= 120) title = candidate;
+          }
+        }
+        if (
+          !title &&
+          container.matches(
+            '.card--sound, .audio-message, .voice-message-normal, .voice-message-old'
+          )
+        ) {
+          title = isVi ? 'Tin nhắn thoại' : 'Voice Message';
+        }
+        const senderNode = container.querySelector(
+          '.card-sender-name, .chat-item__sender-name, .image-show__bottom__sender__info'
+        );
+        if (senderNode && senderNode.textContent) {
+          artist = senderNode.textContent.trim().replace(/\s+/g, ' ');
+        }
+        const avaImg = container.querySelector('.avatar-img, .avatar img, img.avatar');
+        if (avaImg && avaImg.src) {
+          artworkUrl = avaImg.src;
+        }
+      }
+
+      if (!title) {
+        title = cleanExtractedMediaTitle(mediaEl.currentSrc || mediaEl.src || '');
+      }
+      if (!artworkUrl && isVideo && mediaEl.poster) {
+        artworkUrl = mediaEl.poster;
+      }
+    }
+
+    const headerTitleNode = document.querySelector(
+      '#header .header-title, #header .threadChat__title .title, .header-title-v2, .header-title'
+    );
+    if (!artist && headerTitleNode && headerTitleNode.textContent) {
+      artist = headerTitleNode.textContent.trim().replace(/\s+/g, ' ');
+    }
+    if (!artworkUrl) {
+      const headerAva = document.querySelector('#header .avatar-img, #header .avatar img, #header img');
+      if (headerAva && headerAva.src) {
+        artworkUrl = headerAva.src;
+      }
+    }
+
+    if (
+      artworkUrl &&
+      !/^(https?:|blob:|data:|\/__zfile\/|\/__olaz\/)/i.test(artworkUrl)
+    ) {
+      artworkUrl = '';
+    }
+
+    const finalTitle = title || defaultTitle;
+    const finalArtist = artist || 'KV Zalo';
+    const artwork = [];
+    if (artworkUrl) {
+      artwork.push({ src: artworkUrl, sizes: '96x96' });
+    }
+    artwork.push(
+      { src: '/__olaz/icons/icon-192.png', sizes: '192x192', type: 'image/png' },
+      { src: '/__olaz/icons/icon-512.png', sizes: '512x512', type: 'image/png' }
+    );
+
+    return {
+      title: finalTitle,
+      artist: finalArtist,
+      album,
+      artworkUrl: artworkUrl || '/__olaz/logo.svg',
+      artwork,
+    };
+  }
+
+  function pruneAndOrderMediaList() {
+    const alive = [];
+    const seen = new Set();
+    for (let i = mediaRegistry.length - 1; i >= 0; i--) {
+      const el = mediaRegistry[i].deref();
+      if (!el || shouldIgnoreMediaPlayback(el)) {
+        mediaRegistry.splice(i, 1);
+        continue;
+      }
+      if (seen.has(el)) {
+        mediaRegistry.splice(i, 1);
+        continue;
+      }
+      seen.add(el);
+      alive.push({ el, seq: mediaRegistry[i].seq });
+    }
+    alive.sort((a, b) => {
+      const aConn = Boolean(a.el.isConnected);
+      const bConn = Boolean(b.el.isConnected);
+      if (aConn && bConn && a.el !== b.el && typeof a.el.compareDocumentPosition === 'function') {
+        const pos = a.el.compareDocumentPosition(b.el);
+        if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+        if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      }
+      return a.seq - b.seq;
+    });
+    return alive.map((item) => item.el);
+  }
+
+  function syncOsPositionState(el) {
+    if (!el || !('mediaSession' in navigator) || !navigator.mediaSession) return;
+    if (typeof navigator.mediaSession.setPositionState !== 'function') return;
+    const duration = Number(el.duration);
+    if (!Number.isFinite(duration) || duration <= 0) return;
+    const rawPos = Number(el.currentTime) || 0;
+    const position = Math.min(duration, Math.max(0, rawPos));
+    const rate = Number(el.playbackRate);
+    const playbackRate = Number.isFinite(rate) && rate > 0 ? rate : 1;
+    try {
+      navigator.mediaSession.setPositionState({ duration, playbackRate, position });
+    } catch {}
+  }
+
+  function syncOsMediaSession() {
+    if (!('mediaSession' in navigator) || !navigator.mediaSession) return;
+    const ms = navigator.mediaSession;
+    if (!activeMediaEl || mediaCardDismissed) {
+      try {
+        ms.playbackState = 'none';
+      } catch {}
+      return;
+    }
+    const meta = activeMediaMeta || extractMediaContext(activeMediaEl);
+    activeMediaMeta = meta;
+    if (typeof MediaMetadata === 'function') {
+      try {
+        ms.metadata = new MediaMetadata({
+          title: meta.title,
+          artist: meta.artist,
+          album: meta.album,
+          artwork: meta.artwork,
+        });
+      } catch {}
+    }
+    try {
+      ms.playbackState = activeMediaEl.paused ? 'paused' : 'playing';
+    } catch {}
+    syncOsPositionState(activeMediaEl);
+  }
+
+  function activateMediaElement(el, revealCard = true) {
+    if (!el || shouldIgnoreMediaPlayback(el)) return;
+    registerMediaElement(el);
+    activeMediaEl = el;
+    activeMediaMeta = extractMediaContext(el);
+    if (revealCard) mediaCardDismissed = false;
+    syncOsMediaSession();
+    if (renderMediaCardUiFn) renderMediaCardUiFn();
+  }
+
+  function registerMediaElement(el) {
+    if (!el || typeof el !== 'object' || boundMediaSet.has(el)) return;
+    if (el.__olazInternalThumb === true) return;
+    boundMediaSet.add(el);
+
+    const holder =
+      typeof WeakRef === 'function'
+        ? (() => {
+            const wr = new WeakRef(el);
+            return { deref: () => wr.deref(), seq: ++mediaSeqCounter };
+          })()
+        : { deref: () => el, seq: ++mediaSeqCounter };
+    mediaRegistry.push(holder);
+
+    const onPlayLike = () => {
+      if (shouldIgnoreMediaPlayback(el)) return;
+      activateMediaElement(el, true);
+    };
+    const onStateUpdate = () => {
+      if (el !== activeMediaEl) return;
+      syncOsMediaSession();
+      if (renderMediaCardUiFn) renderMediaCardUiFn();
+    };
+    const onTimeUpdate = () => {
+      if (el !== activeMediaEl) return;
+      syncOsPositionState(el);
+      if (renderMediaCardUiFn) renderMediaCardUiFn();
+    };
+    const onMetadataUpdate = () => {
+      if (el !== activeMediaEl) return;
+      activeMediaMeta = extractMediaContext(el);
+      syncOsMediaSession();
+      if (renderMediaCardUiFn) renderMediaCardUiFn();
+    };
+
+    el.addEventListener('play', onPlayLike);
+    el.addEventListener('playing', onPlayLike);
+    el.addEventListener('pause', onStateUpdate);
+    el.addEventListener('ended', onStateUpdate);
+    el.addEventListener('ratechange', onStateUpdate);
+    el.addEventListener('volumechange', onStateUpdate);
+    el.addEventListener('loadedmetadata', onMetadataUpdate);
+    el.addEventListener('durationchange', onMetadataUpdate);
+    el.addEventListener('timeupdate', onTimeUpdate);
+    el.addEventListener('emptied', () => {
+      if (el === activeMediaEl) {
+        if (renderMediaCardUiFn) renderMediaCardUiFn();
+      }
+    });
+  }
+
+  function installMediaSessionController() {
+    if (window.__olazMediaController) return window.__olazMediaController;
+
+    // Wrap `new Audio(...)` so detached voice notes/streams register immediately
+    if (typeof window.Audio === 'function' && !window.Audio.__olazWrapped) {
+      const NativeAudio = window.Audio;
+      const WrappedAudio = function (...args) {
+        const inst = new NativeAudio(...args);
+        registerMediaElement(inst);
+        return inst;
+      };
+      WrappedAudio.prototype = NativeAudio.prototype;
+      Object.setPrototypeOf(WrappedAudio, NativeAudio);
+      WrappedAudio.__olazWrapped = true;
+      window.Audio = WrappedAudio;
+    }
+
+    // Wrap `HTMLMediaElement.prototype.play` to catch detached & in-DOM playback
+    if (
+      window.HTMLMediaElement &&
+      window.HTMLMediaElement.prototype &&
+      typeof window.HTMLMediaElement.prototype.play === 'function' &&
+      !window.HTMLMediaElement.prototype.play.__olazWrapped
+    ) {
+      const origPlay = window.HTMLMediaElement.prototype.play;
+      const wrappedPlay = function (...args) {
+        try {
+          if (!shouldIgnoreMediaPlayback(this)) {
+            activateMediaElement(this, true);
+          }
+        } catch {}
+        return origPlay.apply(this, args);
+      };
+      wrappedPlay.__olazWrapped = true;
+      window.HTMLMediaElement.prototype.play = wrappedPlay;
+    }
+
+    // Capturing document listeners for native browser controls & DOM media
+    const docEvents = [
+      'play',
+      'playing',
+      'pause',
+      'ended',
+      'timeupdate',
+      'loadedmetadata',
+      'durationchange',
+      'ratechange',
+      'volumechange',
+      'emptied',
+    ];
+    for (const evName of docEvents) {
+      document.addEventListener(
+        evName,
+        (ev) => {
+          const target = ev && ev.target;
+          if (!target || !(target instanceof window.HTMLMediaElement)) return;
+          if (shouldIgnoreMediaPlayback(target)) return;
+          registerMediaElement(target);
+          if (evName === 'play' || evName === 'playing') {
+            activateMediaElement(target, true);
+          } else if (target === activeMediaEl) {
+            if (evName === 'loadedmetadata' || evName === 'durationchange') {
+              activeMediaMeta = extractMediaContext(target);
+            }
+            syncOsMediaSession();
+            if (renderMediaCardUiFn) renderMediaCardUiFn();
+          }
+        },
+        true
+      );
+    }
+
+    const controller = {
+      getState() {
+        const list = pruneAndOrderMediaList();
+        const el = activeMediaEl;
+        const dur = el && Number.isFinite(el.duration) && el.duration > 0 ? Number(el.duration) : 0;
+        const pos = el && Number.isFinite(el.currentTime) ? Math.max(0, Number(el.currentTime)) : 0;
+        const isVideo = Boolean(el && String(el.tagName || '').toUpperCase() === 'VIDEO');
+        const pipAvailable = Boolean(isVideo && document.pictureInPictureEnabled && !el.disablePictureInPicture);
+        return {
+          active: Boolean(el && !mediaCardDismissed),
+          visible: Boolean(el && !mediaCardDismissed),
+          paused: el ? Boolean(el.paused) : true,
+          muted: el ? Boolean(el.muted) : false,
+          currentTime: dur > 0 ? Math.min(dur, pos) : pos,
+          duration: dur,
+          playbackRate: el && Number.isFinite(el.playbackRate) && el.playbackRate > 0 ? el.playbackRate : 1,
+          mediaType: el ? String(el.tagName || '').toLowerCase() : null,
+          pipAvailable,
+          pipActive: Boolean(el && document.pictureInPictureElement === el),
+          trackCount: list.length,
+          metadata: activeMediaMeta ? Object.assign({}, activeMediaMeta) : null,
+        };
+      },
+      play() {
+        if (!activeMediaEl) {
+          const list = pruneAndOrderMediaList();
+          if (list.length > 0) activateMediaElement(list[list.length - 1], true);
+        }
+        if (!activeMediaEl) return Promise.resolve();
+        mediaCardDismissed = false;
+        try {
+          const p = activeMediaEl.play();
+          syncOsMediaSession();
+          if (renderMediaCardUiFn) renderMediaCardUiFn();
+          return p && typeof p.catch === 'function' ? p.catch(() => {}) : Promise.resolve();
+        } catch {
+          return Promise.resolve();
+        }
+      },
+      pause() {
+        if (!activeMediaEl) return;
+        try {
+          activeMediaEl.pause();
+        } catch {}
+        syncOsMediaSession();
+        if (renderMediaCardUiFn) renderMediaCardUiFn();
+      },
+      toggle() {
+        if (!activeMediaEl) return controller.play();
+        if (activeMediaEl.paused || activeMediaEl.ended) {
+          if (activeMediaEl.ended) {
+            try {
+              activeMediaEl.currentTime = 0;
+            } catch {}
+          }
+          return controller.play();
+        }
+        controller.pause();
+        return Promise.resolve();
+      },
+      stop() {
+        if (activeMediaEl) {
+          try {
+            activeMediaEl.pause();
+            activeMediaEl.currentTime = 0;
+          } catch {}
+          if (document.pictureInPictureElement === activeMediaEl && typeof document.exitPictureInPicture === 'function') {
+            document.exitPictureInPicture().catch(() => {});
+          }
+        }
+        mediaCardDismissed = true;
+        syncOsMediaSession();
+        if (renderMediaCardUiFn) renderMediaCardUiFn();
+      },
+      seekTo(sec, fastSeek = false) {
+        if (!activeMediaEl) return;
+        const targetSec = Number(sec);
+        if (!Number.isFinite(targetSec)) return;
+        const dur = Number(activeMediaEl.duration);
+        const clamped =
+          Number.isFinite(dur) && dur > 0
+            ? Math.min(dur, Math.max(0, targetSec))
+            : Math.max(0, targetSec);
+        try {
+          if (fastSeek && typeof activeMediaEl.fastSeek === 'function') {
+            activeMediaEl.fastSeek(clamped);
+          } else {
+            activeMediaEl.currentTime = clamped;
+          }
+        } catch {}
+        syncOsPositionState(activeMediaEl);
+        if (renderMediaCardUiFn) renderMediaCardUiFn();
+      },
+      seekBy(delta) {
+        if (!activeMediaEl) return;
+        const cur = Number(activeMediaEl.currentTime) || 0;
+        controller.seekTo(cur + (Number(delta) || 0));
+      },
+      cycleRate() {
+        if (!activeMediaEl) return 1;
+        const cur = Number(activeMediaEl.playbackRate) || 1;
+        const idx = PLAYBACK_RATES.findIndex((r) => Math.abs(r - cur) < 0.05);
+        const nextRate = PLAYBACK_RATES[(idx + 1) % PLAYBACK_RATES.length];
+        try {
+          activeMediaEl.playbackRate = nextRate;
+        } catch {}
+        syncOsMediaSession();
+        if (renderMediaCardUiFn) renderMediaCardUiFn();
+        return nextRate;
+      },
+      toggleMute() {
+        if (!activeMediaEl) return false;
+        try {
+          activeMediaEl.muted = !activeMediaEl.muted;
+        } catch {}
+        if (renderMediaCardUiFn) renderMediaCardUiFn();
+        return Boolean(activeMediaEl.muted);
+      },
+      previousTrack() {
+        const list = pruneAndOrderMediaList();
+        if (activeMediaEl && (Number(activeMediaEl.currentTime) || 0) > 3) {
+          controller.seekTo(0);
+          return;
+        }
+        if (list.length > 1 && activeMediaEl) {
+          const idx = list.indexOf(activeMediaEl);
+          const prevIdx = idx > 0 ? idx - 1 : list.length - 1;
+          try {
+            activeMediaEl.pause();
+          } catch {}
+          const nextEl = list[prevIdx];
+          activateMediaElement(nextEl, true);
+          controller.seekTo(0);
+          controller.play();
+          return;
+        }
+        controller.seekTo(0);
+      },
+      nextTrack() {
+        const list = pruneAndOrderMediaList();
+        if (list.length > 1 && activeMediaEl) {
+          const idx = list.indexOf(activeMediaEl);
+          const nextIdx = idx >= 0 ? (idx + 1) % list.length : 0;
+          try {
+            activeMediaEl.pause();
+          } catch {}
+          const nextEl = list[nextIdx];
+          activateMediaElement(nextEl, true);
+          controller.seekTo(0);
+          controller.play();
+          return;
+        }
+        if (activeMediaEl) {
+          controller.seekTo(0);
+        }
+      },
+      async togglePip() {
+        if (
+          !activeMediaEl ||
+          String(activeMediaEl.tagName || '').toUpperCase() !== 'VIDEO' ||
+          !document.pictureInPictureEnabled
+        ) {
+          return false;
+        }
+        try {
+          if (document.pictureInPictureElement === activeMediaEl) {
+            await document.exitPictureInPicture();
+          } else if (typeof activeMediaEl.requestPictureInPicture === 'function') {
+            await activeMediaEl.requestPictureInPicture();
+          }
+        } catch {}
+        if (renderMediaCardUiFn) renderMediaCardUiFn();
+        return document.pictureInPictureElement === activeMediaEl;
+      },
+      attachMedia(el) {
+        if (!el) return controller.getState();
+        el.__olazInternalThumb = false;
+        activateMediaElement(el, true);
+        return controller.getState();
+      },
+    };
+
+    if ('mediaSession' in navigator && navigator.mediaSession && typeof navigator.mediaSession.setActionHandler === 'function') {
+      const actionMap = [
+        ['play', () => controller.play()],
+        ['pause', () => controller.pause()],
+        ['stop', () => controller.stop()],
+        ['seekbackward', (details) => controller.seekBy(-((details && Number(details.seekOffset)) || 10))],
+        ['seekforward', (details) => controller.seekBy((details && Number(details.seekOffset)) || 10)],
+        [
+          'seekto',
+          (details) => {
+            if (details && Number.isFinite(details.seekTime)) {
+              controller.seekTo(details.seekTime, Boolean(details.fastSeek));
+            }
+          },
+        ],
+        ['previoustrack', () => controller.previousTrack()],
+        ['nexttrack', () => controller.nextTrack()],
+      ];
+      for (const [action, fn] of actionMap) {
+        try {
+          navigator.mediaSession.setActionHandler(action, fn);
+        } catch {}
+      }
+    }
+
+    window.__olazMediaController = controller;
+    return controller;
+  }
+
+  // --------------------------------------------------------------------------
+  // 8B. Mobile Responsive Master-Detail Navigation Controller
+  // --------------------------------------------------------------------------
+
+  const mobileViewportMql =
+    typeof window.matchMedia === 'function' ? window.matchMedia('(max-width: 767.98px)') : null;
+
+  let fallbackMobilePaneState = 'list';
+
+  function getRootMobilePane() {
+    const docEl = document && document.documentElement;
+    if (docEl && docEl.dataset && typeof docEl.dataset.kvzaloMobilePane === 'string') {
+      return docEl.dataset.kvzaloMobilePane || fallbackMobilePaneState;
+    }
+    if (docEl && typeof docEl.getAttribute === 'function') {
+      const attr = docEl.getAttribute('data-kvzalo-mobile-pane');
+      if (attr) return attr;
+    }
+    return fallbackMobilePaneState;
+  }
+
+  function setRootMobilePane(val) {
+    fallbackMobilePaneState = val;
+    const docEl = document && document.documentElement;
+    if (docEl && docEl.dataset) {
+      docEl.dataset.kvzaloMobilePane = val;
+    } else if (docEl && typeof docEl.setAttribute === 'function') {
+      docEl.setAttribute('data-kvzalo-mobile-pane', val);
+    }
+  }
+
+  function syncDeckHostMobileAttrs() {
+    const host =
+      typeof document.getElementById === 'function'
+        ? document.getElementById('__olaz-privacy-pill-host')
+        : null;
+    if (!host) return;
+    const pane = getRootMobilePane() || 'list';
+    const isMobile = Boolean(mobileViewportMql && mobileViewportMql.matches);
+    host.setAttribute('data-mobile-pane', pane);
+    host.setAttribute('data-is-mobile', isMobile ? 'true' : 'false');
+    if (refreshDeckUiFn) refreshDeckUiFn();
+  }
+
+  function setMobilePane(nextPane, opts = {}) {
+    const normalized = nextPane === 'chat' ? 'chat' : 'list';
+    setRootMobilePane(normalized);
+    syncDeckHostMobileAttrs();
+
+    if (
+      normalized === 'chat' &&
+      opts.pushHistory !== false &&
+      mobileViewportMql &&
+      mobileViewportMql.matches
+    ) {
+      try {
+        const curState = window.history && window.history.state;
+        if (!curState || curState.__kvzaloMobilePane !== 'chat') {
+          const nextState = Object.assign({}, curState && typeof curState === 'object' ? curState : {}, {
+            __kvzaloMobilePane: 'chat',
+          });
+          const url = window.location.pathname + window.location.search + '#chat';
+          if (window.history && typeof window.history.pushState === 'function') {
+            window.history.pushState(nextState, '', url);
+          }
+        }
+      } catch {}
+    }
+  }
+
+  function ensureMobileBackButton() {
+    if (typeof document.querySelector !== 'function') return null;
+    const headerEl = document.querySelector(
+      '#header, #chatViewContainer > header, #messageViewContainer header, article#chatView header'
+    );
+    if (!headerEl || typeof headerEl.querySelector !== 'function') return null;
+    const existing = headerEl.querySelector('.kvzalo-mobile-back-btn');
+    if (existing) return existing;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'kvzalo-mobile-back-btn';
+    btn.setAttribute('aria-label', 'Back to conversations');
+    btn.innerHTML =
+      '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">' +
+      '<path d="M15 18l-6-6 6-6"/>' +
+      '</svg>' +
+      '<span>Chats</span>';
+    btn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      setMobilePane('list', { pushHistory: false });
+      try {
+        if (window.history && window.history.state && window.history.state.__kvzaloMobilePane === 'chat') {
+          window.history.back();
+        }
+      } catch {}
+    });
+    if (typeof headerEl.insertBefore === 'function') {
+      headerEl.insertBefore(btn, headerEl.firstChild);
+    } else if (typeof headerEl.appendChild === 'function') {
+      headerEl.appendChild(btn);
+    }
+    return btn;
+  }
+
+  function installMobilePaneController() {
+    if (isAuxiliaryFrame || window.__olazMobileController) return;
+    const isMainChatRoute =
+      window.location.pathname.endsWith('/index.html') ||
+      window.location.pathname === '/' ||
+      Boolean(typeof document.getElementById === 'function' && document.getElementById('container'));
+
+    if (!isMainChatRoute) return;
+
+    if (!getRootMobilePane()) {
+      setRootMobilePane('list');
+    } else {
+      setRootMobilePane(getRootMobilePane());
+    }
+    syncDeckHostMobileAttrs();
+
+    if (mobileViewportMql) {
+      const onViewportChange = () => {
+        if (mobileViewportMql.matches && !getRootMobilePane()) {
+          setRootMobilePane('list');
+        }
+        ensureMobileBackButton();
+        syncDeckHostMobileAttrs();
+      };
+      if (typeof mobileViewportMql.addEventListener === 'function') {
+        mobileViewportMql.addEventListener('change', onViewportChange);
+      } else if (typeof mobileViewportMql.addListener === 'function') {
+        mobileViewportMql.addListener(onViewportChange);
+      }
+    }
+
+    window.addEventListener('popstate', (ev) => {
+      const st = ev && ev.state;
+      if (st && st.__kvzaloMobilePane === 'chat') {
+        setMobilePane('chat', { pushHistory: false });
+      } else if (getRootMobilePane() === 'chat') {
+        setMobilePane('list', { pushHistory: false });
+      }
+    });
+
+    const schedFrame =
+      typeof window.requestAnimationFrame === 'function'
+        ? window.requestAnimationFrame.bind(window)
+        : (fn) => setTimeout(fn, 16);
+
+    // Switch to active chat pane when a conversation row is selected
+    document.addEventListener(
+      'click',
+      (ev) => {
+        if (!mobileViewportMql || !mobileViewportMql.matches) return;
+        const t = ev && ev.target;
+        if (!t || typeof t.closest !== 'function') return;
+        if (
+          t.closest(
+            '.kvzalo-mobile-back-btn, .conv-action__menu, .conv-action__popup, .zmenu-body, .popover-v2, .popover-v3, #main-tab, #contact-search'
+          )
+        ) {
+          return;
+        }
+        const convRow = t.closest(
+          '.conv-item, .msg-item, #conversationListId .item, #conversationListId [data-id], #searchResultList .item, [data-id^="div_ReceivedMsg"], [data-id^="div_SentMsg"]'
+        );
+        if (convRow) {
+          setMobilePane('chat', { pushHistory: true });
+          schedFrame(() => ensureMobileBackButton());
+        }
+      },
+      false
+    );
+
+    if (typeof window.MutationObserver === 'function' && document.body) {
+      let rafPending = false;
+      const observer = new window.MutationObserver(() => {
+        if (rafPending) return;
+        rafPending = true;
+        schedFrame(() => {
+          rafPending = false;
+          ensureMobileBackButton();
+        });
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    }
+    ensureMobileBackButton();
+
+    window.__olazMobileController = {
+      getPane: () => getRootMobilePane() || 'list',
+      setPane: (pane, opts) => setMobilePane(pane, opts),
+      ensureBackButton: ensureMobileBackButton,
+    };
+  }
+
+  // --------------------------------------------------------------------------
+  // 8C. Floating KV Zalo Account Pill, Vault Panel & Now-Playing Media Card
+  // --------------------------------------------------------------------------
+
   function mountAccountAndPrivacyPill() {
-    if (IS_SHARED_WORKER_FRAME || window.opener) return;
-    if (document.getElementById('__olaz-privacy-pill-host')) return;
+    try {
+      syncSlotWebManifest();
+    } catch {}
+    const mediaCtrl = installMediaSessionController();
+    installMobilePaneController();
+
+    if (isAuxiliaryFrame) return;
+    if (typeof document.getElementById === 'function' && document.getElementById('__olaz-privacy-pill-host')) return;
 
     const host = document.createElement('div');
     host.id = '__olaz-privacy-pill-host';
+    host.setAttribute('data-mobile-pane', getRootMobilePane() || 'list');
+    host.setAttribute(
+      'data-has-bottom-nav',
+      window.location.pathname.endsWith('/index.html') ||
+        Boolean(typeof document.getElementById === 'function' && document.getElementById('main-tab'))
+        ? 'true'
+        : 'false'
+    );
+    host.setAttribute(
+      'data-is-mobile',
+      mobileViewportMql && mobileViewportMql.matches ? 'true' : 'false'
+    );
+
     const shadow = host.attachShadow({ mode: 'open' });
     shadow.innerHTML = `
       <style>
-        :host { all: initial; }
+        :host {
+          all: initial;
+          display: block;
+        }
+        *, *::before, *::after {
+          box-sizing: border-box;
+        }
+        button, input, select {
+          font: inherit;
+          color: inherit;
+        }
+        .vv-probe {
+          position: fixed;
+          right: 0;
+          bottom: 0;
+          width: 0;
+          height: 0;
+          pointer-events: none;
+          visibility: hidden;
+        }
         .wrap {
-          position: fixed; right: 16px; bottom: 16px; z-index: 2147483640;
+          position: fixed;
+          right: 16px;
+          bottom: calc(16px + var(--kvz-vv-offset, 0px) + env(safe-area-inset-bottom, 0px));
+          z-index: 2147483640;
+          display: flex;
+          flex-direction: column;
+          align-items: flex-end;
+          gap: 10px;
           font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-          color: #f1f5f9; user-select: none;
+          color: #f8fafc;
+          user-select: none;
+          -webkit-user-select: none;
         }
         .pill {
-          display: inline-flex; align-items: center; gap: 8px;
-          padding: 7px 13px; border-radius: 999px;
-          background: rgba(15, 23, 42, 0.9);
-          border: 1px solid rgba(56, 189, 248, 0.35);
-          box-shadow: 0 8px 24px rgba(0, 0, 0, 0.38);
-          cursor: pointer; font-size: 12px; font-weight: 600;
-          backdrop-filter: blur(10px);
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          min-height: 36px;
+          padding: 6px 13px 6px 8px;
+          border-radius: 999px;
+          background: rgba(15, 23, 42, 0.92);
+          border: 1px solid rgba(56, 189, 248, 0.36);
+          box-shadow: 0 10px 26px rgba(2, 6, 23, 0.42);
+          cursor: pointer;
+          font-size: 12px;
+          font-weight: 600;
+          color: #f8fafc;
+          backdrop-filter: blur(12px);
+          -webkit-backdrop-filter: blur(12px);
+          transition: transform 0.14s ease, border-color 0.14s ease;
+        }
+        .pill:hover {
+          border-color: rgba(96, 165, 250, 0.72);
+        }
+        .pill:focus-visible,
+        .btn:focus-visible,
+        .acct:focus-visible,
+        .mc-btn:focus-visible,
+        .mc-seek:focus-visible {
+          outline: 2px solid #38bdf8;
+          outline-offset: 2px;
+        }
+        .brand-logo {
+          width: 20px;
+          height: 20px;
+          display: inline-flex;
+          flex: none;
+        }
+        .brand-logo svg {
+          width: 100%;
+          height: 100%;
+          display: block;
         }
         .dot {
-          width: 8px; height: 8px; border-radius: 50%;
-          background: #10b981; box-shadow: 0 0 8px #10b981;
+          width: 7px;
+          height: 7px;
+          border-radius: 50%;
+          background: #10b981;
+          box-shadow: 0 0 8px #10b981;
+          flex: none;
+        }
+        .pill-label {
+          white-space: nowrap;
         }
         .panel {
-          display: none; position: absolute; right: 0; bottom: 42px;
-          width: 290px; padding: 14px; border-radius: 14px;
+          display: none;
+          width: 312px;
+          max-width: calc(100vw - 24px);
+          max-width: calc(100dvw - 24px);
+          max-height: calc(var(--kvz-vv-height, 100dvh) - 96px);
+          overflow-y: auto;
+          overscroll-behavior: contain;
+          padding: 14px;
+          border-radius: 16px;
           background: rgba(15, 23, 42, 0.96);
           border: 1px solid rgba(148, 163, 184, 0.24);
-          box-shadow: 0 20px 48px rgba(0, 0, 0, 0.55);
-          backdrop-filter: blur(14px);
+          box-shadow: 0 20px 48px rgba(2, 6, 23, 0.58);
+          backdrop-filter: blur(16px);
+          -webkit-backdrop-filter: blur(16px);
         }
-        .panel.open { display: block; }
-        .hdr { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #38bdf8; margin-bottom: 4px; font-weight: 700; }
-        .sub { font-size: 11px; color: #94a3b8; margin-bottom: 10px; }
-        .sec { border-top: 1px solid rgba(148, 163, 184, 0.14); padding-top: 10px; margin-top: 10px; }
-        .acct-list { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+        .panel.open {
+          display: block;
+        }
+        .brand-hdr {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          margin-bottom: 8px;
+        }
+        .brand-hdr-icon {
+          width: 32px;
+          height: 32px;
+          flex: none;
+        }
+        .brand-hdr-icon svg {
+          width: 100%;
+          height: 100%;
+          display: block;
+        }
+        .hdr {
+          font-size: 12.5px;
+          letter-spacing: 0.02em;
+          color: #f8fafc;
+          font-weight: 700;
+          line-height: 1.25;
+        }
+        .sub {
+          font-size: 11px;
+          color: #94a3b8;
+          line-height: 1.35;
+        }
+        .sec {
+          border-top: 1px solid rgba(148, 163, 184, 0.14);
+          padding-top: 10px;
+          margin-top: 10px;
+        }
+        .sec-lbl {
+          font-size: 11px;
+          color: #94a3b8;
+          margin-bottom: 6px;
+          font-weight: 600;
+        }
+        .acct-list {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+          margin-bottom: 8px;
+        }
         .acct {
-          padding: 4px 10px; border-radius: 999px; font-size: 12px; cursor: pointer;
-          background: rgba(51, 65, 85, 0.65); color: #e2e8f0; border: 1px solid transparent;
+          padding: 5px 11px;
+          border-radius: 999px;
+          font-size: 12px;
+          cursor: pointer;
+          background: rgba(51, 65, 85, 0.68);
+          color: #e2e8f0;
+          border: 1px solid transparent;
         }
-        .acct.active { background: rgba(2, 132, 199, 0.35); border-color: #38bdf8; color: #fff; font-weight: 600; }
-        .row { display: flex; align-items: center; justify-content: space-between; font-size: 12.5px; margin: 7px 0; }
+        .acct.active {
+          background: rgba(0, 104, 255, 0.36);
+          border-color: #60a5fa;
+          color: #ffffff;
+          font-weight: 600;
+        }
+        .row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          font-size: 12.5px;
+          margin: 7px 0;
+          cursor: pointer;
+        }
         .btn {
-          width: 100%; padding: 7px 10px; border-radius: 8px; border: 1px solid rgba(148, 163, 184, 0.24);
-          background: rgba(30, 41, 59, 0.9); color: #e2e8f0; font-size: 12px; font-weight: 600;
-          cursor: pointer; margin-top: 6px;
+          width: 100%;
+          min-height: 36px;
+          padding: 8px 11px;
+          border-radius: 10px;
+          border: 1px solid rgba(148, 163, 184, 0.24);
+          background: rgba(30, 41, 59, 0.92);
+          color: #f1f5f9;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+          margin-top: 6px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 7px;
         }
-        .btn:hover { background: rgba(51, 65, 85, 0.95); }
-        .btn.danger { border-color: rgba(239, 68, 68, 0.4); color: #fca5a5; background: rgba(127, 29, 29, 0.28); }
-        input[type="checkbox"] { accent-color: #0284c7; width: 15px; height: 15px; cursor: pointer; }
+        .btn:hover {
+          background: rgba(51, 65, 85, 0.96);
+        }
+        .btn.primary {
+          background: linear-gradient(135deg, #1a7cff 0%, #0068ff 100%);
+          border-color: rgba(147, 197, 253, 0.45);
+          color: #ffffff;
+          box-shadow: 0 6px 18px rgba(0, 104, 255, 0.35);
+        }
+        .btn.primary:hover {
+          background: linear-gradient(135deg, #2584ff 0%, #005ce6 100%);
+        }
+        .btn.danger {
+          border-color: rgba(239, 68, 68, 0.42);
+          color: #fca5a5;
+          background: rgba(127, 29, 29, 0.3);
+        }
+        .btn svg {
+          width: 15px;
+          height: 15px;
+          flex: none;
+        }
+        .hidden {
+          display: none !important;
+        }
+        input[type="checkbox"] {
+          accent-color: #0068ff;
+          width: 16px;
+          height: 16px;
+          cursor: pointer;
+          flex: none;
+        }
+
+        /* Now-Playing Media Card & Transport Bar */
+        .media-card {
+          display: none;
+          width: min(340px, calc(100vw - 24px));
+          width: min(340px, calc(100dvw - 24px));
+          padding: 12px 13px;
+          border-radius: 16px;
+          background: rgba(15, 23, 42, 0.96);
+          border: 1px solid rgba(96, 165, 250, 0.34);
+          box-shadow: 0 18px 42px rgba(2, 6, 23, 0.56);
+          backdrop-filter: blur(16px);
+          -webkit-backdrop-filter: blur(16px);
+          color: #f8fafc;
+        }
+        .media-card.visible {
+          display: block;
+        }
+        .mc-top {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        }
+        .mc-art {
+          width: 40px;
+          height: 40px;
+          border-radius: 10px;
+          overflow: hidden;
+          background: rgba(30, 41, 59, 0.9);
+          border: 1px solid rgba(148, 163, 184, 0.22);
+          flex: none;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+        .mc-art img,
+        .mc-art svg {
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+          display: block;
+        }
+        .mc-meta {
+          min-width: 0;
+          flex: 1 1 auto;
+        }
+        .mc-title {
+          font-size: 13px;
+          font-weight: 600;
+          color: #f8fafc;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          line-height: 1.3;
+        }
+        .mc-artist {
+          font-size: 11.5px;
+          color: #93c5fd;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          line-height: 1.3;
+          margin-top: 2px;
+        }
+        .mc-progress {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          margin-top: 10px;
+        }
+        .mc-seek {
+          flex: 1 1 auto;
+          min-width: 0;
+          height: 5px;
+          accent-color: #0068ff;
+          cursor: pointer;
+          margin: 0;
+        }
+        .mc-time {
+          font-size: 11px;
+          color: #cbd5e1;
+          font-variant-numeric: tabular-nums;
+          white-space: nowrap;
+          flex: none;
+        }
+        .mc-controls {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 4px;
+          margin-top: 9px;
+        }
+        .mc-btn {
+          min-width: 32px;
+          min-height: 32px;
+          padding: 0 6px;
+          border-radius: 9px;
+          border: 1px solid transparent;
+          background: transparent;
+          color: #e2e8f0;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          cursor: pointer;
+          transition: background-color 0.14s ease, color 0.14s ease;
+        }
+        .mc-btn:hover {
+          background: rgba(51, 65, 85, 0.72);
+          color: #ffffff;
+        }
+        .mc-btn svg {
+          width: 17px;
+          height: 17px;
+          display: block;
+          flex: none;
+        }
+        .mc-btn.mc-play {
+          min-width: 38px;
+          min-height: 38px;
+          border-radius: 999px;
+          background: #0068ff;
+          color: #ffffff;
+          box-shadow: 0 6px 16px rgba(0, 104, 255, 0.42);
+        }
+        .mc-btn.mc-play:hover {
+          background: #1a7cff;
+        }
+        .mc-btn.mc-rate {
+          font-size: 11px;
+          font-weight: 700;
+          font-variant-numeric: tabular-nums;
+          background: rgba(30, 41, 59, 0.9);
+          border-color: rgba(148, 163, 184, 0.24);
+          padding: 0 7px;
+        }
+        .mc-close {
+          min-width: 28px;
+          min-height: 28px;
+          border-radius: 8px;
+          color: #94a3b8;
+        }
+
+        @media (pointer: coarse) {
+          .pill,
+          .btn,
+          .acct {
+            min-height: 44px;
+          }
+          .mc-btn {
+            min-width: 40px;
+            min-height: 44px;
+          }
+          .mc-btn.mc-play {
+            min-width: 44px;
+            min-height: 44px;
+          }
+          .mc-seek {
+            height: 24px;
+          }
+        }
+
+        @media (max-width: 767.98px) {
+          .wrap {
+            right: 12px;
+            bottom: calc(14px + var(--kvz-vv-offset, 0px) + env(safe-area-inset-bottom, 0px));
+          }
+          :host([data-has-bottom-nav="true"]) .wrap {
+            bottom: calc(64px + var(--kvz-vv-offset, 0px) + env(safe-area-inset-bottom, 0px));
+          }
+          .panel {
+            width: calc(100vw - 24px);
+            width: calc(100dvw - 24px);
+            max-width: 340px;
+            max-height: calc(var(--kvz-vv-height, 100dvh) - 82px);
+          }
+          /* Lift pill out of the bottom composer area when inside an active mobile chat */
+          :host([data-mobile-pane="chat"]) .wrap {
+            top: max(10px, env(safe-area-inset-top, 0px));
+            right: 10px;
+            bottom: auto;
+            flex-direction: column-reverse;
+          }
+          :host([data-mobile-pane="chat"]) .pill {
+            min-height: 34px;
+            padding: 4px 10px 4px 6px;
+            font-size: 11.5px;
+          }
+          :host([data-mobile-pane="chat"]) .pill-slot {
+            display: none;
+          }
+        }
       </style>
-      <div class="wrap">
-        <div class="panel" id="panel">
-          <div class="hdr">Olaz Zero-Persistence Vault</div>
-          <div class="sub">100% Browser IndexedDB · 0 Bytes on Server</div>
-          <div class="sec">
-            <div style="font-size:11px;color:#94a3b8;margin-bottom:6px;">Accounts (Isolated Browser DBs)</div>
-            <div class="acct-list" id="accts"></div>
-            <button class="btn" id="addAcct">+ Add Account</button>
+      <div class="vv-probe" id="vvProbe" aria-hidden="true"></div>
+      <div class="wrap" id="wrap">
+        <div class="panel" id="panel" role="region" aria-label="KV Zalo Vault and Accounts">
+          <div class="brand-hdr">
+            <span class="brand-hdr-icon">${renderKvZaloLogoSvg('panel')}</span>
+            <div>
+              <div class="hdr">KV Zalo Vault &amp; Accounts</div>
+              <div class="sub">100% Browser IndexedDB · 0 Bytes on Server</div>
+            </div>
           </div>
+
+          <div class="sec hidden" id="pwaSec">
+            <button type="button" class="btn primary" id="installPwaBtn">
+              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/>
+              </svg>
+              <span>Install KV Zalo App</span>
+            </button>
+          </div>
+
+          <div class="sec hidden" id="mobileNavSec">
+            <button type="button" class="btn" id="mobilePaneBtn">
+              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>
+              </svg>
+              <span id="mobilePaneLabel">Mobile View: Chats</span>
+            </button>
+          </div>
+
           <div class="sec">
-            <label class="row">
+            <div class="sec-lbl">Accounts (Isolated Browser DBs)</div>
+            <div class="acct-list" id="accts"></div>
+            <button type="button" class="btn" id="addAcct">+ Add Account</button>
+          </div>
+
+          <div class="sec">
+            <label class="row" for="antiRecall">
               <span>Xem tin thu hồi (Anti-Recall)</span>
               <input type="checkbox" id="antiRecall" />
             </label>
             <div class="row">
               <span>Vault PIN Lock: <strong id="pinState">Off</strong></span>
             </div>
-            <button class="btn" id="pinBtn">Set / Clear Local PIN</button>
+            <button type="button" class="btn" id="pinBtn">Set / Clear Local PIN</button>
           </div>
+
           <div class="sec">
-            <button class="btn danger" id="wipeBtn">Wipe Local Session (${ACTIVE_SLOT})</button>
+            <button type="button" class="btn danger" id="wipeBtn">Wipe Local Session (${ACTIVE_SLOT})</button>
           </div>
         </div>
-        <div class="pill" id="pill" title="Olaz Multi-Account & Privacy">
-          <span class="dot"></span>
-          <span>Olaz · ${ACTIVE_SLOT}</span>
-        </div>
+
+        <section class="media-card" id="mediaCard" aria-label="Now Playing Media Controls">
+          <div class="mc-top">
+            <div class="mc-art" id="mcArt">${renderKvZaloLogoSvg('media')}</div>
+            <div class="mc-meta">
+              <div class="mc-title" id="mcTitle">Voice Message</div>
+              <div class="mc-artist" id="mcArtist">KV Zalo</div>
+            </div>
+            <button type="button" class="mc-btn mc-close" id="mcClose" aria-label="Stop and close media player">
+              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M18 6L6 18"/><path d="M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="mc-progress">
+            <input type="range" class="mc-seek" id="mcSeek" min="0" max="1000" value="0" step="1" aria-label="Seek media" />
+            <span class="mc-time" id="mcTime">0:00 / 0:00</span>
+          </div>
+
+          <div class="mc-controls">
+            <button type="button" class="mc-btn" id="mcPrev" aria-label="Previous media">
+              <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+                <path d="M6 6h2v12H6V6zm3.5 6 8.5 6V6l-8.5 6z"/>
+              </svg>
+            </button>
+            <button type="button" class="mc-btn" id="mcRew" aria-label="Rewind 10 seconds">
+              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M11 17l-5-5 5-5"/><path d="M18 17l-5-5 5-5"/>
+              </svg>
+            </button>
+            <button type="button" class="mc-btn mc-play" id="mcPlayPause" aria-label="Play">
+              <svg id="mcPlayIcon" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+                <path d="M8 5.14v13.72a1 1 0 0 0 1.52.85l11-6.86a1 1 0 0 0 0-1.7l-11-6.86A1 1 0 0 0 8 5.14z"/>
+              </svg>
+              <svg id="mcPauseIcon" class="hidden" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+                <rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>
+              </svg>
+            </button>
+            <button type="button" class="mc-btn" id="mcFwd" aria-label="Forward 10 seconds">
+              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M13 17l5-5-5-5"/><path d="M6 17l5-5-5-5"/>
+              </svg>
+            </button>
+            <button type="button" class="mc-btn" id="mcNext" aria-label="Next media">
+              <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+                <path d="M16 6h2v12h-2V6zM6 18l8.5-6L6 6v12z"/>
+              </svg>
+            </button>
+            <button type="button" class="mc-btn mc-rate" id="mcRate" aria-label="Playback speed">1×</button>
+            <button type="button" class="mc-btn" id="mcMute" aria-label="Mute">
+              <svg id="mcVolOn" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+              </svg>
+              <svg id="mcVolOff" class="hidden" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                <line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>
+              </svg>
+            </button>
+            <button type="button" class="mc-btn hidden" id="mcPip" aria-label="Picture in Picture">
+              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="2" y="4" width="20" height="15" rx="2"/><rect x="11" y="10" width="9" height="7" rx="1" fill="currentColor"/>
+              </svg>
+            </button>
+          </div>
+        </section>
+
+        <button type="button" class="pill" id="pill" aria-expanded="false" aria-controls="panel" aria-label="KV Zalo Multi-Account and Vault">
+          <span class="brand-logo">${renderKvZaloLogoSvg('pill')}</span>
+          <span class="dot" aria-hidden="true"></span>
+          <span class="pill-label">KV Zalo<span class="pill-slot"> · ${ACTIVE_SLOT}</span></span>
+        </button>
       </div>
     `;
 
     document.body.appendChild(host);
+
+    const vvProbe = shadow.getElementById('vvProbe');
+    const wrapEl = shadow.getElementById('wrap');
     const pill = shadow.getElementById('pill');
     const panel = shadow.getElementById('panel');
+    const pwaSec = shadow.getElementById('pwaSec');
+    const installPwaBtn = shadow.getElementById('installPwaBtn');
+    const mobileNavSec = shadow.getElementById('mobileNavSec');
+    const mobilePaneBtn = shadow.getElementById('mobilePaneBtn');
+    const mobilePaneLabel = shadow.getElementById('mobilePaneLabel');
     const acctsEl = shadow.getElementById('accts');
     const addBtn = shadow.getElementById('addAcct');
     const antiRecallCb = shadow.getElementById('antiRecall');
@@ -3360,10 +5217,146 @@ function bootstrapSessionRuntime(globalScope) {
     const pinBtn = shadow.getElementById('pinBtn');
     const wipeBtn = shadow.getElementById('wipeBtn');
 
+    const syncViewportOffset = () => {
+      if (!vvProbe || !wrapEl || typeof vvProbe.getBoundingClientRect !== 'function') return;
+      const vv = window.visualViewport;
+      const visibleTop = vv && Number.isFinite(vv.offsetTop) ? Math.max(0, vv.offsetTop) : 0;
+      const visibleHeight =
+        vv && Number.isFinite(vv.height) && vv.height > 0
+          ? vv.height
+          : Number(window.innerHeight) || 0;
+      if (visibleHeight <= 0) return;
+      const visibleBottom = visibleTop + visibleHeight;
+      const probeRect = vvProbe.getBoundingClientRect();
+      const probeBottom =
+        probeRect && Number.isFinite(probeRect.bottom) && probeRect.bottom > 0
+          ? probeRect.bottom
+          : visibleBottom;
+      const extraBottom = Math.max(0, Math.ceil(probeBottom - visibleBottom));
+      const clampedHeight = Math.max(240, Math.floor(visibleHeight));
+      if (wrapEl.style && typeof wrapEl.style.setProperty === 'function') {
+        wrapEl.style.setProperty('--kvz-vv-offset', extraBottom + 'px');
+        wrapEl.style.setProperty('--kvz-vv-height', clampedHeight + 'px');
+      }
+      const docEl = document && document.documentElement;
+      if (docEl && docEl.style && typeof docEl.style.setProperty === 'function') {
+        docEl.style.setProperty('--kvzalo-vv-offset', extraBottom + 'px');
+        docEl.style.setProperty('--kvzalo-vv-height', clampedHeight + 'px');
+      }
+    };
+
+    syncViewportOffset();
+    window.addEventListener('resize', syncViewportOffset, { passive: true });
+    window.addEventListener('orientationchange', syncViewportOffset, { passive: true });
+    if (window.visualViewport && typeof window.visualViewport.addEventListener === 'function') {
+      window.visualViewport.addEventListener('resize', syncViewportOffset, { passive: true });
+      window.visualViewport.addEventListener('scroll', syncViewportOffset, { passive: true });
+    }
+    if (typeof window.ResizeObserver === 'function') {
+      try {
+        const ro = new window.ResizeObserver(() => syncViewportOffset());
+        if (document.documentElement) ro.observe(document.documentElement);
+        if (document.body) ro.observe(document.body);
+      } catch {}
+    }
+    if (typeof window.MutationObserver === 'function' && typeof window.requestAnimationFrame === 'function' && document.body) {
+      let vvRaf = false;
+      const mo = new window.MutationObserver(() => {
+        if (vvRaf) return;
+        vvRaf = true;
+        window.requestAnimationFrame(() => {
+          vvRaf = false;
+          syncViewportOffset();
+        });
+      });
+      mo.observe(document.body, { childList: true, subtree: true });
+    }
+
+    const mediaCard = shadow.getElementById('mediaCard');
+    const mcArt = shadow.getElementById('mcArt');
+    const mcTitle = shadow.getElementById('mcTitle');
+    const mcArtist = shadow.getElementById('mcArtist');
+    const mcClose = shadow.getElementById('mcClose');
+    const mcSeek = shadow.getElementById('mcSeek');
+    const mcTime = shadow.getElementById('mcTime');
+    const mcPrev = shadow.getElementById('mcPrev');
+    const mcRew = shadow.getElementById('mcRew');
+    const mcPlayPause = shadow.getElementById('mcPlayPause');
+    const mcPlayIcon = shadow.getElementById('mcPlayIcon');
+    const mcPauseIcon = shadow.getElementById('mcPauseIcon');
+    const mcFwd = shadow.getElementById('mcFwd');
+    const mcNext = shadow.getElementById('mcNext');
+    const mcRate = shadow.getElementById('mcRate');
+    const mcMute = shadow.getElementById('mcMute');
+    const mcVolOn = shadow.getElementById('mcVolOn');
+    const mcVolOff = shadow.getElementById('mcVolOff');
+    const mcPip = shadow.getElementById('mcPip');
+
+    let isDraggingSeek = false;
+    let lastRenderedArtwork = '';
+
+    const renderMediaCard = () => {
+      syncViewportOffset();
+      const st = mediaCtrl.getState();
+      mediaCard.classList.toggle('visible', Boolean(st.visible));
+      if (!st.visible) return;
+
+      const meta = st.metadata || { title: 'Voice Message', artist: 'KV Zalo', artworkUrl: '' };
+      mcTitle.textContent = meta.title || 'Voice Message';
+      mcArtist.textContent = meta.artist || 'KV Zalo';
+
+      const artSrc =
+        meta.artworkUrl && meta.artworkUrl !== '/__olaz/logo.svg' ? meta.artworkUrl : '';
+      if (artSrc !== lastRenderedArtwork) {
+        lastRenderedArtwork = artSrc;
+        if (artSrc) {
+          const img = document.createElement('img');
+          img.alt = '';
+          img.src = artSrc;
+          img.onerror = () => {
+            lastRenderedArtwork = '';
+            mcArt.innerHTML = renderKvZaloLogoSvg('media');
+          };
+          mcArt.innerHTML = '';
+          mcArt.appendChild(img);
+        } else {
+          mcArt.innerHTML = renderKvZaloLogoSvg('media');
+        }
+      }
+
+      const playing = !st.paused;
+      mcPlayPause.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+      mcPlayIcon.classList.toggle('hidden', playing);
+      mcPauseIcon.classList.toggle('hidden', !playing);
+
+      if (!isDraggingSeek) {
+        if (st.duration > 0) {
+          mcSeek.disabled = false;
+          mcSeek.value = String(Math.round((st.currentTime / st.duration) * 1000));
+        } else {
+          mcSeek.disabled = true;
+          mcSeek.value = '0';
+        }
+      }
+      mcTime.textContent =
+        formatMediaClock(st.currentTime) +
+        ' / ' +
+        (st.duration > 0 ? formatMediaClock(st.duration) : '--:--');
+
+      mcRate.textContent = st.playbackRate + '×';
+      mcMute.setAttribute('aria-label', st.muted ? 'Unmute' : 'Mute');
+      mcVolOn.classList.toggle('hidden', Boolean(st.muted));
+      mcVolOff.classList.toggle('hidden', !st.muted);
+      mcPip.classList.toggle('hidden', !st.pipAvailable);
+    };
+    renderMediaCardUiFn = renderMediaCard;
+
     const render = () => {
+      syncViewportOffset();
       acctsEl.innerHTML = '';
       for (const item of loadKnownProfiles()) {
         const b = document.createElement('button');
+        b.type = 'button';
         b.className = 'acct' + (item.id === ACTIVE_SLOT ? ' active' : '');
         b.textContent = item.label;
         b.onclick = () => {
@@ -3375,11 +5368,49 @@ function bootstrapSessionRuntime(globalScope) {
       }
       antiRecallCb.checked = Boolean(privacyState.antiRecall);
       pinStateEl.textContent = getVaultMeta() ? 'AES-256-GCM' : 'Off';
+
+      pwaSec.classList.toggle('hidden', !deferredPwaPrompt);
+
+      const isMobileNow = Boolean(mobileViewportMql && mobileViewportMql.matches);
+      const hasMainChat =
+        window.location.pathname.endsWith('/index.html') ||
+        Boolean(document.getElementById('container'));
+      mobileNavSec.classList.toggle('hidden', !(isMobileNow && hasMainChat));
+      if (isMobileNow && hasMainChat) {
+        const curPane = getRootMobilePane() || 'list';
+        mobilePaneLabel.textContent =
+          curPane === 'chat' ? 'Mobile View: Switch to Chats' : 'Mobile View: Switch to Thread';
+      }
+      renderMediaCard();
     };
+    refreshDeckUiFn = render;
 
     pill.addEventListener('click', () => {
       render();
-      panel.classList.toggle('open');
+      const isOpen = panel.classList.toggle('open');
+      pill.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+    });
+
+    installPwaBtn.addEventListener('click', async () => {
+      if (!deferredPwaPrompt) return;
+      const promptEvent = deferredPwaPrompt;
+      try {
+        promptEvent.prompt();
+        const choice = await promptEvent.userChoice;
+        if (choice && choice.outcome === 'accepted') {
+          deferredPwaPrompt = null;
+        }
+      } catch {
+        deferredPwaPrompt = null;
+      }
+      render();
+    });
+
+    mobilePaneBtn.addEventListener('click', () => {
+      const curPane = getRootMobilePane() || 'list';
+      setMobilePane(curPane === 'chat' ? 'list' : 'chat');
+      panel.classList.remove('open');
+      pill.setAttribute('aria-expanded', 'false');
     });
 
     addBtn.addEventListener('click', () => {
@@ -3389,7 +5420,7 @@ function bootstrapSessionRuntime(globalScope) {
       const newSlot = 'acc-' + n;
       profiles.push({ id: newSlot, label: 'Account ' + n });
       saveKnownProfiles(profiles);
-      window.open('/?profile=' + encodeURIComponent(newSlot), '_blank');
+      window.open('/?profile=' + encodeURIComponent(newSlot), '_blank', 'noopener');
       render();
     });
 
@@ -3414,6 +5445,41 @@ function bootstrapSessionRuntime(globalScope) {
         await wipeLocalSlotSession();
       }
     });
+
+    // Media Card interactive transport bindings
+    mcClose.addEventListener('click', () => mediaCtrl.stop());
+    mcPrev.addEventListener('click', () => mediaCtrl.previousTrack());
+    mcRew.addEventListener('click', () => mediaCtrl.seekBy(-10));
+    mcPlayPause.addEventListener('click', () => mediaCtrl.toggle());
+    mcFwd.addEventListener('click', () => mediaCtrl.seekBy(10));
+    mcNext.addEventListener('click', () => mediaCtrl.nextTrack());
+    mcRate.addEventListener('click', () => mediaCtrl.cycleRate());
+    mcMute.addEventListener('click', () => mediaCtrl.toggleMute());
+    mcPip.addEventListener('click', () => mediaCtrl.togglePip());
+
+    mcSeek.addEventListener('pointerdown', () => {
+      isDraggingSeek = true;
+    });
+    mcSeek.addEventListener('pointerup', () => {
+      isDraggingSeek = false;
+    });
+    mcSeek.addEventListener('input', () => {
+      const st = mediaCtrl.getState();
+      if (st.duration > 0) {
+        const targetTime = (Number(mcSeek.value) / 1000) * st.duration;
+        mediaCtrl.seekTo(targetTime);
+      }
+    });
+    mcSeek.addEventListener('change', () => {
+      isDraggingSeek = false;
+      const st = mediaCtrl.getState();
+      if (st.duration > 0) {
+        const targetTime = (Number(mcSeek.value) / 1000) * st.duration;
+        mediaCtrl.seekTo(targetTime);
+      }
+    });
+
+    render();
   }
 
   // ==========================================================================
@@ -3526,8 +5592,16 @@ function bootstrapSessionRuntime(globalScope) {
     } catch {}
   }
 
-  // Install `$z*` globals immediately in `<head>`
+  // Install `$z*` globals & initial mobile pane attribute immediately in `<head>`
   installPreloadGlobals();
+  try {
+    if (
+      !isAuxiliaryFrame &&
+      (window.location.pathname.endsWith('/index.html') || window.location.pathname === '/')
+    ) {
+      setRootMobilePane('list');
+    }
+  } catch {}
 
   window.__olazBootReady = (async () => {
     await hydrateBrowserVault();

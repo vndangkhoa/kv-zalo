@@ -31,7 +31,9 @@ use tracing::{info, warn};
 use crate::allowlist::{AllowlistConfig, AllowlistValidator};
 use crate::auth::{AuthGate, UNLOCK_PAGE_HTML};
 use crate::bundle::{
-    web_bridge_spec_script, BundleProvider, BOOT_HTML, CRYPTO_SYNC_JS, PRELOAD_JS, SW_JS,
+    build_web_manifest_json, web_bridge_spec_script, BundleProvider, APPLE_TOUCH_ICON_PNG,
+    BOOT_HTML, CRYPTO_SYNC_JS, FAVICON_ICO, ICON_192_PNG, ICON_512_PNG, ICON_MASKABLE_512_PNG,
+    LOGO_SVG, MOBILE_CSS, PRELOAD_JS, SW_JS,
 };
 use crate::relay::{write_json_response, PrefixedTcpStream, StatelessRelay};
 
@@ -337,6 +339,121 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> Re
     if head.method == "POST" && head.path == "/__olaz/auth" {
         let body = read_http_body(&mut stream, &mut head).await?;
         return handle_auth_post(&mut stream, &head, &body, &state.auth).await;
+    }
+
+    // 1b. Public PWA manifest, brand icons, favicons & mobile stylesheet — accessible before
+    //     authentication so mobile OS home-screen installers and unlock page always load cleanly.
+    if head.method == "GET" || head.method == "HEAD" {
+        let is_head = head.method == "HEAD";
+        match head.path.as_str() {
+            "/manifest.webmanifest" | "/manifest.json" => {
+                let profile = extract_query_param(&head.query, "profile");
+                let manifest_json = build_web_manifest_json(profile.as_deref());
+                write_static_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "application/manifest+json; charset=utf-8",
+                    manifest_json.as_bytes(),
+                    &[("Cache-Control", "no-cache")],
+                    is_head,
+                )
+                .await?;
+                return Ok(());
+            }
+            "/favicon.ico" => {
+                write_static_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "image/x-icon",
+                    FAVICON_ICO,
+                    &[("Cache-Control", "public, max-age=86400")],
+                    is_head,
+                )
+                .await?;
+                return Ok(());
+            }
+            "/favicon.svg" | "/__olaz/logo.svg" => {
+                write_static_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "image/svg+xml; charset=utf-8",
+                    LOGO_SVG.as_bytes(),
+                    &[("Cache-Control", "public, max-age=86400")],
+                    is_head,
+                )
+                .await?;
+                return Ok(());
+            }
+            "/apple-touch-icon.png" | "/apple-touch-icon-precomposed.png" => {
+                write_static_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "image/png",
+                    APPLE_TOUCH_ICON_PNG,
+                    &[("Cache-Control", "public, max-age=86400")],
+                    is_head,
+                )
+                .await?;
+                return Ok(());
+            }
+            "/__olaz/icons/icon-192.png" => {
+                write_static_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "image/png",
+                    ICON_192_PNG,
+                    &[("Cache-Control", "public, max-age=86400")],
+                    is_head,
+                )
+                .await?;
+                return Ok(());
+            }
+            "/__olaz/icons/icon-512.png" => {
+                write_static_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "image/png",
+                    ICON_512_PNG,
+                    &[("Cache-Control", "public, max-age=86400")],
+                    is_head,
+                )
+                .await?;
+                return Ok(());
+            }
+            "/__olaz/icons/icon-maskable-512.png" => {
+                write_static_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "image/png",
+                    ICON_MASKABLE_512_PNG,
+                    &[("Cache-Control", "public, max-age=86400")],
+                    is_head,
+                )
+                .await?;
+                return Ok(());
+            }
+            "/__olaz/mobile.css" => {
+                write_static_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "text/css; charset=utf-8",
+                    MOBILE_CSS.as_bytes(),
+                    &[("Cache-Control", "no-cache")],
+                    is_head,
+                )
+                .await?;
+                return Ok(());
+            }
+            _ => {}
+        }
     }
 
     // 2. Enforce optional `--token` / `OLAZ_WEB_TOKEN` edge gate on all other routes.
@@ -700,11 +817,13 @@ async fn write_static_response(
     extra_headers: &[(&str, &str)],
     is_head: bool,
 ) -> Result<()> {
+    let has_custom_cache_control = extra_headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("cache-control"));
     let mut head = format!(
         concat!(
             "HTTP/1.1 {code} {reason}\r\n",
             "Content-Type: {ct}\r\n",
-            "Cache-Control: no-store\r\n",
             "X-Content-Type-Options: nosniff\r\n",
             "Referrer-Policy: no-referrer\r\n"
         ),
@@ -712,6 +831,9 @@ async fn write_static_response(
         reason = reason,
         ct = content_type,
     );
+    if !has_custom_cache_control {
+        head.push_str("Cache-Control: no-store\r\n");
+    }
     for (k, v) in extra_headers {
         head.push_str(&format!("{k}: {v}\r\n"));
     }
