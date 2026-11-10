@@ -1838,6 +1838,7 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
     let mut hit_autostart_lang_vi = false;
     let mut hit_video_thumb_flag = false;
     let mut hit_video_thumb_gate = false;
+    let mut hit_sticker_isweb = false;
     let mut raw_had_ntfs_fs_check = false;
     let mut hit_drive_migration_fs = false;
     let mut hit_html_csp = 0usize;
@@ -1958,6 +1959,9 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
         if s.contains("gen_video_thumb:{enable:!0") {
             hit_video_thumb_flag = true;
         }
+        if s.contains(r#""+ou9":"#) && (s.contains("const A=!0;") || s.contains("const h=!0;")) {
+            hit_sticker_isweb = true;
+        }
         if s.contains(r#"!0)throw{error_code:"NOT_SUPPORT""#)
             || (s.contains("genVideoThumbFromFile(") && s.contains("if(!!0){const ") && s.contains(".NOT_SUPPORT"))
         {
@@ -2010,6 +2014,7 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
     assert!(hit_autostart_lang_vi, "Expected STR_OLAZ_START_IN_TRAY Vietnamese translation in live app.asar");
     assert!(hit_video_thumb_flag, "Expected gen_video_thumb:{{enable:!0 patch to match live app.asar");
     assert!(hit_video_thumb_gate, "Expected genVideoThumbFromFile NOT_SUPPORT gate patch to match live app.asar");
+    assert!(hit_sticker_isweb, "Expected sticker module +ou9 isWeb patch to match live app.asar");
     if raw_had_ntfs_fs_check {
         assert!(hit_drive_migration_fs, "Expected DriveMigrationService Linux filesystem patch to match live app.asar");
     }
@@ -2056,6 +2061,27 @@ fn transform_local_url_unwraps_whatwg_url_objects_and_platform_permits_cache_and
             "https://stc-zalo.zadn.vn/sticker/ami.png"
         ])
     );
+}
+
+#[test]
+fn sticker_module_patch_enables_direct_web_rendering_and_remains_idempotent() {
+    let synthetic_lazy = br#""+ou9":function(t,n,a){"use strict";var s=a("q1tI"),i=a.n(s),o=a("z0WU"),r=a("IpzU");let u=null;const A=o.default.isWeb();A||(u=$znode.crypto);let R;const b=o.default.isWeb();b||(R=a("Dprd").default);}"#;
+    let patched_lazy = patch_asar_bundle("pc-dist/lazy/default-login-main-startup-shared-worker-znotification.1234.js", synthetic_lazy)
+        .expect("lazy sticker patch must match");
+    let patched_lazy_str = std::str::from_utf8(&patched_lazy).unwrap();
+    assert!(patched_lazy_str.contains("const A=!0;"));
+    assert!(patched_lazy_str.contains("const b=!0;"));
+    assert!(!patched_lazy_str.contains("o.default.isWeb()"));
+    assert!(patch_asar_bundle("pc-dist/lazy/default-login-main-startup-shared-worker-znotification.1234.js", &patched_lazy).is_none());
+
+    let synthetic_compact = br#""+ou9":function(t,n,a){"use strict";var i=a("q1tI"),r=a.n(i),s=a("z0WU"),o=a("IpzU");let u=null;const h=s.default.isWeb();h||(u=$znode.crypto);let T;const y=s.default.isWeb();y||(T=a("Dprd").default);}"#;
+    let patched_compact = patch_asar_bundle("pc-dist/compact-app-pc.1234.js", synthetic_compact)
+        .expect("compact sticker patch must match");
+    let patched_compact_str = std::str::from_utf8(&patched_compact).unwrap();
+    assert!(patched_compact_str.contains("const h=!0;"));
+    assert!(patched_compact_str.contains("const y=!0;"));
+    assert!(!patched_compact_str.contains("s.default.isWeb()"));
+    assert!(patch_asar_bundle("pc-dist/compact-app-pc.1234.js", &patched_compact).is_none());
 }
 
 #[test]

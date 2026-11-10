@@ -335,6 +335,73 @@ function bootstrapSessionRuntime(globalScope) {
     saveKnownProfiles(loadKnownProfiles());
   }
 
+  // Capture authentic browser User-Agent / touch metadata BEFORE spoofing `navigator.userAgent` -> `ZaloPC-darwin-23v695`
+  const ORIG_USER_AGENT = (() => {
+    try {
+      return String((globalScope.navigator && globalScope.navigator.userAgent) || '');
+    } catch {
+      return '';
+    }
+  })();
+  const ORIG_PLATFORM = (() => {
+    try {
+      return String((globalScope.navigator && globalScope.navigator.platform) || '');
+    } catch {
+      return '';
+    }
+  })();
+  const ORIG_UA_DATA_MOBILE = (() => {
+    try {
+      return Boolean(
+        globalScope.navigator &&
+          globalScope.navigator.userAgentData &&
+          globalScope.navigator.userAgentData.mobile
+      );
+    } catch {
+      return false;
+    }
+  })();
+  const ORIG_MAX_TOUCH_POINTS = (() => {
+    try {
+      return Number((globalScope.navigator && globalScope.navigator.maxTouchPoints) || 0) || 0;
+    } catch {
+      return 0;
+    }
+  })();
+
+  function detectMobileBrowser() {
+    if (!IS_WINDOW) return false;
+    if (ORIG_UA_DATA_MOBILE) return true;
+    if (
+      /\b(Android|iPhone|iPod|iPad|Windows Phone|Mobile|Opera Mini|IEMobile|HarmonyOS|CriOS|FxiOS|EdgiOS)\b/i.test(
+        ORIG_USER_AGENT
+      )
+    ) {
+      return true;
+    }
+    if (
+      /\b(Macintosh|MacIntel)\b/i.test(ORIG_USER_AGENT + ' ' + ORIG_PLATFORM) &&
+      ORIG_MAX_TOUCH_POINTS > 1
+    ) {
+      return true;
+    }
+    try {
+      const liveTouch =
+        Number((globalScope.navigator && globalScope.navigator.maxTouchPoints) || 0) ||
+        ORIG_MAX_TOUCH_POINTS;
+      const coarseNoHover =
+        typeof window.matchMedia === 'function' &&
+        window.matchMedia('(pointer: coarse) and (hover: none)').matches;
+      const vw = Number(window.innerWidth) || 0;
+      const vh = Number(window.innerHeight) || 0;
+      const shortSide = vw > 0 && vh > 0 ? Math.min(vw, vh) : 0;
+      if ((liveTouch > 0 || coarseNoHover) && shortSide > 0 && shortSide <= 540) {
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
   // Override `navigator.userAgent` -> `ZaloPC-darwin-23v695` so `md5(navigator.userAgent)` in `z_uuid` matches upstream!
   try {
     if (globalScope.navigator) {
@@ -853,6 +920,8 @@ function bootstrapSessionRuntime(globalScope) {
     appendProfileParam,
     buildZaloPageQuery,
     decodeBridgeWireResult,
+    origUserAgent: ORIG_USER_AGENT,
+    isMobileBrowser: detectMobileBrowser,
     asyncIpcHandlers: new Map(), // channel -> async (args) => result
     syncIpcHandlers: new Map(), // channel -> (args) => result
     httpFallbackResolvers: [], // Array<async (urlHref, status) => Response | Blob | null>
@@ -5961,11 +6030,49 @@ function bootstrapSessionRuntime(globalScope) {
           -webkit-backdrop-filter: blur(12px);
           transition: border-color 0.14s ease;
         }
+        :host,
+        .wrap,
+        .pill,
+        .panel,
+        .brand-hdr,
+        .panel-grab-bar,
+        .mc-top {
+          -webkit-app-region: no-drag !important;
+          touch-action: none;
+        }
         :host([data-dragging="true"]) .pill,
         :host([data-dragging="true"]) .brand-hdr,
+        :host([data-dragging="true"]) .panel-grab-bar,
+        :host([data-dragging="true"]) .panel,
         :host([data-dragging="true"]) .mc-top,
         :host([data-dragging="true"]) .call-rec-bar {
           cursor: grabbing !important;
+        }
+        .panel-grab-bar {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          width: 100%;
+          height: 14px;
+          margin-top: -6px;
+          margin-bottom: 6px;
+          cursor: grab;
+          touch-action: none;
+          -webkit-user-select: none;
+          user-select: none;
+        }
+        .grab-handle {
+          display: block;
+          width: 44px;
+          height: 4px;
+          border-radius: 999px;
+          background: rgba(148, 163, 184, 0.45);
+          transition: background 0.14s ease, width 0.14s ease;
+        }
+        .panel-grab-bar:hover .grab-handle,
+        .brand-hdr:hover ~ .panel-grab-bar .grab-handle {
+          background: rgba(56, 189, 248, 0.9);
+          width: 56px;
         }
         .pill:hover {
           border-color: rgba(96, 165, 250, 0.72);
@@ -6421,6 +6528,9 @@ function bootstrapSessionRuntime(globalScope) {
       <div class="wrap" id="wrap">
         <div class="float-stack" id="floatStack">
           <div class="panel" id="panel" role="region" aria-label="KV Zalo Vault and Accounts">
+            <div class="panel-grab-bar" id="panelGrabBar" title="Drag to move panel" aria-label="Drag to move panel">
+              <span class="grab-handle"></span>
+            </div>
             <div class="brand-hdr" id="brandHdr">
               <span class="drag-grip" aria-hidden="true">⋮⋮</span>
               <span class="brand-hdr-icon">${renderKvZaloLogoSvg('panel')}</span>
@@ -6578,6 +6688,7 @@ function bootstrapSessionRuntime(globalScope) {
     const floatStack = shadow.getElementById('floatStack');
     const pill = shadow.getElementById('pill');
     const panel = shadow.getElementById('panel');
+    const panelGrabBar = shadow.getElementById('panelGrabBar');
     const brandHdr = shadow.getElementById('brandHdr');
     const resetPosBtn = shadow.getElementById('resetPosBtn');
     const closePanelBtn = shadow.getElementById('closePanelBtn');
@@ -6688,7 +6799,7 @@ function bootstrapSessionRuntime(globalScope) {
       const isLogin = /\/login\.html$/i.test(window.location.pathname || '');
       if (isMobile) {
         if (!isLogin && (getRootMobilePane() || 'list') === 'chat') {
-          return { edgeX: 'right', offsetX: 10, edgeY: 'top', offsetY: 58 };
+          return { edgeX: 'right', offsetX: 10, edgeY: 'bottom', offsetY: 76 };
         }
         return { edgeX: 'right', offsetX: 12, edgeY: 'bottom', offsetY: isLogin ? 18 : 66 };
       }
@@ -6826,12 +6937,25 @@ function bootstrapSessionRuntime(globalScope) {
           t &&
           t !== handleEl &&
           typeof t.closest === 'function' &&
-          t.closest('button, input, select, textarea, a, label')
+          t.closest('button, input, select, textarea, a, label, form, .acct, .acct-list, .btn, .hdr-actions, .pin-form')
         ) {
           return;
         }
         const vpStart = getViewportMetrics();
         if (vpStart.vw <= 0 || vpStart.vh <= 0) return;
+
+        // Prevent browser gestures from hijacking the drag gesture:
+        if (ev.cancelable && typeof ev.preventDefault === 'function') {
+          ev.preventDefault();
+        }
+        if (typeof ev.stopPropagation === 'function') {
+          ev.stopPropagation();
+        }
+        if (typeof handleEl.setPointerCapture === 'function' && ev.pointerId !== undefined) {
+          try {
+            handleEl.setPointerCapture(ev.pointerId);
+          } catch {}
+        }
 
         const wrapRect =
           typeof wrapEl.getBoundingClientRect === 'function' ? wrapEl.getBoundingClientRect() : null;
@@ -6888,6 +7012,11 @@ function bootstrapSessionRuntime(globalScope) {
             window.removeEventListener('pointerup', onUp, true);
             window.removeEventListener('pointercancel', onUp, true);
           }
+          if (typeof handleEl.releasePointerCapture === 'function' && ev.pointerId !== undefined) {
+            try {
+              handleEl.releasePointerCapture(ev.pointerId);
+            } catch {}
+          }
           host.setAttribute('data-dragging', 'false');
           if (dragging && customAnchor) {
             rawLsSet(PILL_POS_KEY, JSON.stringify(customAnchor));
@@ -6911,7 +7040,9 @@ function bootstrapSessionRuntime(globalScope) {
     };
 
     attachDragHandle(pill, { lockOrientationOnDrag: false });
+    attachDragHandle(panelGrabBar, { lockOrientationOnDrag: true });
     attachDragHandle(brandHdr, { lockOrientationOnDrag: true });
+    attachDragHandle(panel, { lockOrientationOnDrag: true });
     attachDragHandle(mcTop, { lockOrientationOnDrag: true });
 
     const onViewportResize = () => layoutFloatingDeck(null);
@@ -7458,18 +7589,76 @@ function bootstrapSessionRuntime(globalScope) {
     if (window.__olazWebpackPatchesInstalled) return;
     window.__olazWebpackPatchesInstalled = true;
 
+    const isHostGlobalOrDomExport = (val) => {
+      if (!val || (typeof val !== 'object' && typeof val !== 'function')) return false;
+      if (
+        val === globalScope ||
+        val === window ||
+        val === window.$capp ||
+        val === window.document ||
+        val === window.navigator ||
+        val === window.location
+      ) {
+        return true;
+      }
+      try {
+        if (typeof Window === 'function' && val instanceof Window) return true;
+        if (typeof Document === 'function' && val instanceof Document) return true;
+        if (typeof Node === 'function' && val instanceof Node) return true;
+      } catch {}
+      return false;
+    };
+
+    const safeOwnVal = (obj, prop) => {
+      if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return undefined;
+      try {
+        const desc = Object.getOwnPropertyDescriptor(obj, prop);
+        if (desc && Object.prototype.hasOwnProperty.call(desc, 'value')) {
+          return desc.value;
+        }
+      } catch {}
+      return undefined;
+    };
+
+    const safeMethodVal = (obj, prop) => {
+      if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return undefined;
+      try {
+        let cur = obj;
+        let hops = 0;
+        while (cur && cur !== Object.prototype && cur !== Function.prototype && hops < 5) {
+          const desc = Object.getOwnPropertyDescriptor(cur, prop);
+          if (desc) {
+            return Object.prototype.hasOwnProperty.call(desc, 'value') &&
+              typeof desc.value === 'function'
+              ? desc.value
+              : undefined;
+          }
+          cur = Object.getPrototypeOf(cur);
+          hops += 1;
+        }
+      } catch {}
+      return undefined;
+    };
+
     const eachExport = (req, visit) => {
       if (!req || !req.c) return;
       for (const [id, mod] of Object.entries(req.c)) {
         const ex = mod && mod.exports;
-        if (!ex) continue;
+        if (!ex || isHostGlobalOrDomExport(ex)) continue;
         try {
           visit(ex, id);
         } catch {}
         if (typeof ex === 'object') {
-          for (const k of Object.keys(ex)) {
+          let keys = [];
+          try {
+            keys = Object.keys(ex);
+          } catch {}
+          for (const k of keys) {
             try {
-              if (ex[k]) visit(ex[k], id);
+              const sub = ex[k];
+              if (sub && !isHostGlobalOrDomExport(sub)) {
+                visit(sub, id);
+              }
             } catch {}
           }
         }
@@ -7481,8 +7670,9 @@ function bootstrapSessionRuntime(globalScope) {
       const seen = new Set();
       eachExport(req, (ex) => {
         if (!ex || typeof ex !== 'object' || seen.has(ex)) return;
-        const registry = ex._registry && ex._registry._registryMap;
-        if (typeof ex.resolve !== 'function' || !(registry instanceof Map)) return;
+        const regObj = safeOwnVal(ex, '_registry');
+        const registry = regObj && typeof regObj === 'object' ? safeOwnVal(regObj, '_registryMap') : null;
+        if (!safeMethodVal(ex, 'resolve') || !(registry instanceof Map)) return;
         seen.add(ex);
         for (const regs of registry.values()) {
           for (const r of regs || []) out.push(r);
@@ -7503,10 +7693,10 @@ function bootstrapSessionRuntime(globalScope) {
         if (gidSvc || !ex || typeof ex !== 'object') return;
         try {
           if (
-            ex._userIdMap instanceof Map &&
-            ex._globalIdMap instanceof Map &&
-            typeof ex.getGlobalId === 'function' &&
-            typeof ex.getGlobalIdFromServer === 'function'
+            safeOwnVal(ex, '_userIdMap') instanceof Map &&
+            safeOwnVal(ex, '_globalIdMap') instanceof Map &&
+            safeMethodVal(ex, 'getGlobalId') &&
+            safeMethodVal(ex, 'getGlobalIdFromServer')
           ) {
             gidSvc = ex;
           }
@@ -7537,27 +7727,32 @@ function bootstrapSessionRuntime(globalScope) {
     const patchSingleRegistration = (reg) => {
       if (!reg || typeof reg !== 'object') return false;
       let done = false;
-      for (const c of [reg.instance, reg.provider && reg.provider.useClass, reg.provider]) {
-        const proto =
-          typeof c === 'function'
-            ? c.prototype
-            : c && typeof c === 'object'
-              ? Object.getPrototypeOf(c)
-              : null;
-        if (!proto || typeof proto.waitForDBMigrate !== 'function' || proto.waitForDBMigrate.__olaz) {
-          continue;
-        }
-        const original = proto.waitForDBMigrate;
-        proto.waitForDBMigrate = function (session, config, diskConfig) {
-          return original.call(
-            this,
-            session,
-            Object.assign({}, config || {}, { enable: false }),
-            diskConfig
-          );
-        };
-        proto.waitForDBMigrate.__olaz = true;
-        done = true;
+      const inst = safeOwnVal(reg, 'instance');
+      const prov = safeOwnVal(reg, 'provider');
+      const useClass = prov && typeof prov === 'object' ? safeOwnVal(prov, 'useClass') : undefined;
+      for (const c of [inst, useClass, prov]) {
+        try {
+          const proto =
+            typeof c === 'function'
+              ? safeOwnVal(c, 'prototype')
+              : c && typeof c === 'object'
+                ? Object.getPrototypeOf(c)
+                : null;
+          const original = proto ? safeMethodVal(proto, 'waitForDBMigrate') : null;
+          if (!proto || !original || original.__olaz) {
+            continue;
+          }
+          proto.waitForDBMigrate = function (session, config, diskConfig) {
+            return original.call(
+              this,
+              session,
+              Object.assign({}, config || {}, { enable: false }),
+              diskConfig
+            );
+          };
+          proto.waitForDBMigrate.__olaz = true;
+          done = true;
+        } catch {}
       }
       return done;
     };
@@ -7599,17 +7794,34 @@ function bootstrapSessionRuntime(globalScope) {
 
     const hookDiRegistries = (req) => {
       eachExport(req, (ex) => {
-        if (!ex || typeof ex !== 'object') return;
-        const regObj = ex._registry;
-        if (
-          !regObj ||
-          typeof regObj !== 'object' ||
-          !(regObj._registryMap instanceof Map) ||
-          typeof ex.resolve !== 'function'
-        ) {
+        if (typeof ex === 'function' && safeMethodVal(ex, 'getDerivedStateFromError')) {
+          const proto = safeOwnVal(ex, 'prototype');
+          const origCatch = proto ? safeMethodVal(proto, 'componentDidCatch') : null;
+          if (proto && origCatch && !origCatch.__olaz) {
+            try {
+              const wrappedCatch = function (err, info) {
+                try {
+                  console.error(
+                    '[olaz-ui-boundary]',
+                    err && (err.stack || err.message || String(err)),
+                    info && info.componentStack ? String(info.componentStack).slice(0, 400) : ''
+                  );
+                } catch {}
+                return origCatch.apply(this, arguments);
+              };
+              Object.defineProperty(wrappedCatch, '__olaz', { value: true });
+              proto.componentDidCatch = wrappedCatch;
+            } catch {}
+          }
           return;
         }
-        for (const regs of regObj._registryMap.values()) {
+        if (!ex || typeof ex !== 'object') return;
+        const regObj = safeOwnVal(ex, '_registry');
+        const regMap = regObj && typeof regObj === 'object' ? safeOwnVal(regObj, '_registryMap') : null;
+        if (!regObj || !(regMap instanceof Map) || !safeMethodVal(ex, 'resolve')) {
+          return;
+        }
+        for (const regs of regMap.values()) {
           for (const r of regs || []) {
             notifyExternalDiHooks(r);
           }
@@ -7617,8 +7829,8 @@ function bootstrapSessionRuntime(globalScope) {
         if (regObj.__olazHooked) return;
         try {
           Object.defineProperty(regObj, '__olazHooked', { value: true });
-          if (typeof regObj.set === 'function') {
-            const origSet = regObj.set;
+          const origSet = safeMethodVal(regObj, 'set');
+          if (origSet) {
             regObj.set = function (token, registration) {
               const r = origSet.apply(this, arguments);
               try {
@@ -7853,6 +8065,174 @@ function bootstrapSessionRuntime(globalScope) {
     }
   } catch {}
 
+  const MOBILE_LOGIN_NOTICE_DISMISS_KEY = 'olaz:__mobile_login_notice_dismissed_v1';
+
+  function mountMobileLoginRestrictionNotice() {
+    if (!IS_WINDOW || isAuxiliaryFrame) return;
+    if (!/\/login\.html$/i.test(window.location.pathname || '')) return;
+    if (!document.body || document.getElementById('__olaz-mobile-login-notice')) return;
+
+    const host = document.createElement('div');
+    host.id = '__olaz-mobile-login-notice';
+    host.style.cssText =
+      'position:fixed;top:0;left:0;right:0;z-index:2147483645;pointer-events:none;display:none;';
+    const shadow = host.attachShadow({ mode: 'open' });
+    shadow.innerHTML = `
+      <style>
+        *, *::before, *::after { box-sizing: border-box; }
+        .wrap {
+          pointer-events: auto;
+          margin: max(8px, env(safe-area-inset-top, 0px)) auto 0 auto;
+          width: calc(100vw - 16px);
+          width: calc(100dvw - 16px);
+          max-width: 440px;
+          padding: 10px 12px;
+          border-radius: 12px;
+          background: rgba(15, 23, 42, 0.96);
+          border: 1px solid rgba(245, 158, 11, 0.55);
+          box-shadow: 0 12px 28px rgba(2, 6, 23, 0.45);
+          color: #f8fafc;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          display: flex;
+          align-items: flex-start;
+          gap: 10px;
+          backdrop-filter: blur(12px);
+          -webkit-backdrop-filter: blur(12px);
+        }
+        .icon {
+          flex: none;
+          width: 22px;
+          height: 22px;
+          margin-top: 1px;
+          border-radius: 999px;
+          background: rgba(245, 158, 11, 0.18);
+          color: #fbbf24;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+        }
+        .icon svg {
+          width: 14px;
+          height: 14px;
+          display: block;
+        }
+        .body {
+          flex: 1 1 auto;
+          min-width: 0;
+        }
+        .title {
+          font-size: 12.5px;
+          font-weight: 700;
+          color: #fde68a;
+          line-height: 1.3;
+          margin-bottom: 3px;
+        }
+        .desc {
+          font-size: 11.5px;
+          line-height: 1.4;
+          color: #e2e8f0;
+          word-break: break-word;
+        }
+        .dismiss {
+          flex: none;
+          align-self: center;
+          min-height: 30px;
+          padding: 5px 10px;
+          border-radius: 8px;
+          border: 1px solid rgba(251, 191, 36, 0.4);
+          background: rgba(245, 158, 11, 0.16);
+          color: #fef3c7;
+          font-size: 11.5px;
+          font-weight: 600;
+          cursor: pointer;
+          white-space: nowrap;
+        }
+        .dismiss:hover {
+          background: rgba(245, 158, 11, 0.28);
+        }
+        .dismiss:focus-visible {
+          outline: 2px solid #fbbf24;
+          outline-offset: 2px;
+        }
+        @media (max-height: 440px) {
+          .wrap {
+            margin-top: 4px;
+            padding: 6px 10px;
+            gap: 8px;
+          }
+          .title {
+            font-size: 11.5px;
+            margin-bottom: 1px;
+          }
+          .desc {
+            font-size: 10.5px;
+            line-height: 1.25;
+          }
+          .dismiss {
+            min-height: 26px;
+            padding: 3px 8px;
+            font-size: 11px;
+          }
+        }
+      </style>
+      <div class="wrap" id="mobileNoticeCard" role="status" aria-live="polite">
+        <span class="icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+            <line x1="12" y1="9" x2="12" y2="13"></line>
+            <line x1="12" y1="17" x2="12.01" y2="17"></line>
+          </svg>
+        </span>
+        <div class="body">
+          <div class="title">Zalo hạn chế đăng nhập bản Web trên điện thoại</div>
+          <div class="desc">Zalo hiện không cho phép đăng nhập trực tiếp trên trình duyệt di động bằng cùng một máy. Vui lòng dùng điện thoại khác mở Zalo để quét mã QR bên dưới, hoặc đăng nhập trên máy tính.</div>
+        </div>
+        <button class="dismiss" id="mobileNoticeDismiss" type="button">Đã hiểu</button>
+      </div>
+    `;
+    document.body.appendChild(host);
+
+    let pagePadStyle = document.getElementById('__olaz-mobile-login-pad-style');
+    if (!pagePadStyle && (document.head || document.documentElement)) {
+      pagePadStyle = document.createElement('style');
+      pagePadStyle.id = '__olaz-mobile-login-pad-style';
+      pagePadStyle.textContent =
+        '@media (min-height: 540px) { #app-page { padding-top: var(--kvz-mobile-notice-pad, 0px) !important; overflow-y: auto !important; } }';
+      (document.head || document.documentElement).appendChild(pagePadStyle);
+    }
+
+    const syncVisibility = () => {
+      const dismissed = rawSsGet(MOBILE_LOGIN_NOTICE_DISMISS_KEY) === '1';
+      const show = !dismissed && detectMobileBrowser();
+      host.style.display = show ? 'block' : 'none';
+      host.setAttribute('data-visible', show ? 'true' : 'false');
+      const docEl = document.documentElement;
+      if (docEl && docEl.style) {
+        if (show) {
+          const cardEl = shadow.getElementById('mobileNoticeCard');
+          const h = cardEl ? Math.ceil(cardEl.getBoundingClientRect().height) : 132;
+          docEl.style.setProperty('--kvz-mobile-notice-pad', Math.max(96, h + 12) + 'px');
+        } else {
+          docEl.style.setProperty('--kvz-mobile-notice-pad', '0px');
+        }
+      }
+    };
+
+    const dismissBtn = shadow.getElementById('mobileNoticeDismiss');
+    if (dismissBtn) {
+      dismissBtn.addEventListener('click', (ev) => {
+        if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation();
+        rawSsSet(MOBILE_LOGIN_NOTICE_DISMISS_KEY, '1');
+        syncVisibility();
+      });
+    }
+
+    syncVisibility();
+    window.addEventListener('resize', syncVisibility, { passive: true });
+    window.addEventListener('orientationchange', syncVisibility, { passive: true });
+    olazHost.syncMobileLoginNotice = syncVisibility;
+  }
+
   window.__olazBootReady = (async () => {
     await hydrateBrowserVault();
     seedZaloClientIdentity();
@@ -7869,6 +8249,7 @@ function bootstrapSessionRuntime(globalScope) {
 
     const startBundles = async () => {
       mountAccountAndPrivacyPill();
+      mountMobileLoginRestrictionNotice();
       if (pathname.endsWith('/index.html')) {
         ensureSharedWorkerFrame();
       }

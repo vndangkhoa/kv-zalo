@@ -4961,6 +4961,8 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         b"detectFilesystemSync",
         b"waitForDBMigrate(",
         b".migrate_db_sf",
+        b"\"+ou9\":",
+        b"sticker-resource-cache",
     ];
     if !FAST_NEEDLES
         .iter()
@@ -5427,6 +5429,29 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
             .into_owned();
         if next != s {
             s = next;
+            changed = true;
+        }
+    }
+
+    // 18. Sticker module `+ou9`: enable direct web sticker rendering (`isWeb = true`).
+    // In Zalo Desktop, `+ou9` checks `isWeb()`. When false, it attempts to download stickers to local disk
+    // via Node.js fs/crypto/Dprd and load via file:/// or zfile://, which fails in browser and shows grey placeholder smileys.
+    // Setting `isWeb = true` in `+ou9` causes Zalo to use direct CDN URLs (`background-image: url(...)`) and animated sprite sheets!
+    if s.contains(r#""+ou9":"#) {
+        if s.contains("const A=o.default.isWeb();") {
+            s = s.replace("const A=o.default.isWeb();", "const A=!0;");
+            changed = true;
+        }
+        if s.contains("const b=o.default.isWeb();") {
+            s = s.replace("const b=o.default.isWeb();", "const b=!0;");
+            changed = true;
+        }
+        if s.contains("const h=s.default.isWeb();") {
+            s = s.replace("const h=s.default.isWeb();", "const h=!0;");
+            changed = true;
+        }
+        if s.contains("const y=s.default.isWeb();") {
+            s = s.replace("const y=s.default.isWeb();", "const y=!0;");
             changed = true;
         }
     }

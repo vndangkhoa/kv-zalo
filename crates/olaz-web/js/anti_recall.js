@@ -1915,9 +1915,61 @@ function bootstrapAntiRecallRuntime(globalScope) {
     return wrapped;
   }
 
+  function isHostGlobalOrDomObject(val) {
+    if (!val || (typeof val !== 'object' && typeof val !== 'function')) return false;
+    if (
+      val === globalScope ||
+      (typeof window !== 'undefined' &&
+        (val === window ||
+          val === window.$capp ||
+          val === window.document ||
+          val === window.navigator ||
+          val === window.location))
+    ) {
+      return true;
+    }
+    try {
+      if (typeof Window === 'function' && val instanceof Window) return true;
+      if (typeof Document === 'function' && val instanceof Document) return true;
+      if (typeof Node === 'function' && val instanceof Node) return true;
+    } catch {}
+    return false;
+  }
+
+  function safeOwnDataValue(obj, prop) {
+    if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return undefined;
+    try {
+      const desc = Object.getOwnPropertyDescriptor(obj, prop);
+      if (desc && Object.prototype.hasOwnProperty.call(desc, 'value')) {
+        return desc.value;
+      }
+    } catch {}
+    return undefined;
+  }
+
+  function safeMethodValue(obj, prop) {
+    if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return undefined;
+    try {
+      let cur = obj;
+      let hops = 0;
+      while (cur && cur !== Object.prototype && cur !== Function.prototype && hops < 5) {
+        const desc = Object.getOwnPropertyDescriptor(cur, prop);
+        if (desc) {
+          return Object.prototype.hasOwnProperty.call(desc, 'value') &&
+            typeof desc.value === 'function'
+            ? desc.value
+            : undefined;
+        }
+        cur = Object.getPrototypeOf(cur);
+        hops += 1;
+      }
+    } catch {}
+    return undefined;
+  }
+
   function patchAntiRecallTarget(obj) {
     if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return false;
-    if (typeof window !== 'undefined' && obj === window.$capp) return false;
+    if (isHostGlobalOrDomObject(obj)) return false;
     let patched = false;
 
     const defineArMethod = (target, prop, wrapper) => {
@@ -1933,8 +1985,8 @@ function bootstrapAntiRecallRuntime(globalScope) {
     };
 
     // 1. `ConversationOperation.modifyMessageData(delInfo, origMsg)`
-    if (typeof obj.modifyMessageData === 'function' && !obj.modifyMessageData.__olazAr) {
-      const origModify = obj.modifyMessageData;
+    const origModify = safeMethodValue(obj, 'modifyMessageData');
+    if (origModify && !origModify.__olazAr) {
       defineArMethod(obj, 'modifyMessageData', function (delInfo, origMsg) {
         if (
           antiRecallEnabled &&
@@ -1976,8 +2028,8 @@ function bootstrapAntiRecallRuntime(globalScope) {
       'cleanReplyMessages',
       'deleteMessageInMediaStore',
     ]) {
-      if (typeof obj[cleanFnName] === 'function' && !obj[cleanFnName].__olazAr) {
-        const origClean = obj[cleanFnName];
+      const origClean = safeMethodValue(obj, cleanFnName);
+      if (origClean && !origClean.__olazAr) {
         defineArMethod(obj, cleanFnName, function () {
           if (isRecallCleanupArgs(arguments)) {
             return Promise.resolve();
@@ -1988,11 +2040,8 @@ function bootstrapAntiRecallRuntime(globalScope) {
     }
 
     // 3. `deleteMessageResourceIfExists(m)`
-    if (
-      typeof obj.deleteMessageResourceIfExists === 'function' &&
-      !obj.deleteMessageResourceIfExists.__olazAr
-    ) {
-      const origDelRes = obj.deleteMessageResourceIfExists;
+    const origDelRes = safeMethodValue(obj, 'deleteMessageResourceIfExists');
+    if (origDelRes && !origDelRes.__olazAr) {
       defineArMethod(obj, 'deleteMessageResourceIfExists', function () {
         if (antiRecallEnabled) return Promise.resolve(false);
         return origDelRes.apply(this, arguments);
@@ -2000,37 +2049,44 @@ function bootstrapAntiRecallRuntime(globalScope) {
     }
 
     // 4. `convertToRecalled(m)` & `convertToDelEveryone(m)`
-    if (typeof obj.convertToRecalled === 'function' && !obj.convertToRecalled.__olazAr) {
+    const origConvRecall = safeMethodValue(obj, 'convertToRecalled');
+    if (origConvRecall && !origConvRecall.__olazAr) {
       try {
-        obj.convertToRecalled = makeConvertHook(obj.convertToRecalled, 20);
+        obj.convertToRecalled = makeConvertHook(origConvRecall, 20);
         patched = true;
       } catch {}
     }
-    if (typeof obj.convertToDelEveryone === 'function' && !obj.convertToDelEveryone.__olazAr) {
+    const origConvDelAll = safeMethodValue(obj, 'convertToDelEveryone');
+    if (origConvDelAll && !origConvDelAll.__olazAr) {
       try {
-        obj.convertToDelEveryone = makeConvertHook(obj.convertToDelEveryone, -27);
+        obj.convertToDelEveryone = makeConvertHook(origConvDelAll, -27);
         patched = true;
       } catch {}
     }
 
     // 5. `mergeUndo(e, t)` & `mergeUndoMulti(e, t)`
     for (const mergeName of ['mergeUndo', 'mergeUndoMulti']) {
-      if (typeof obj[mergeName] === 'function' && !obj[mergeName].__olazAr) {
+      const origMerge = safeMethodValue(obj, mergeName);
+      if (origMerge && !origMerge.__olazAr) {
         try {
-          obj[mergeName] = makeMergeUndoHook(obj[mergeName]);
+          obj[mergeName] = makeMergeUndoHook(origMerge);
           patched = true;
         } catch {}
       }
     }
 
     // 6. `MessageCache.undoMessages(map)`
-    if (typeof obj.undoMessages === 'function' && !obj.undoMessages.__olazAr) {
-      const origUndoMsgs = obj.undoMessages;
+    const origUndoMsgs = safeMethodValue(obj, 'undoMessages');
+    if (origUndoMsgs && !origUndoMsgs.__olazAr) {
       defineArMethod(obj, 'undoMessages', function (mapArg) {
         if (this && typeof this === 'object') {
           liveMessageCacheRefs.add(this);
         }
-        const cacheStore = this && (this._cache || this.cache || this.data);
+        const cacheStore =
+          this &&
+          (safeOwnDataValue(this, '_cache') ||
+            safeOwnDataValue(this, 'cache') ||
+            safeOwnDataValue(this, 'data'));
         if (cacheStore) {
           safeCall(() => walkMessageCacheContainer(cacheStore, true), false);
         }
@@ -2047,8 +2103,8 @@ function bootstrapAntiRecallRuntime(globalScope) {
     }
 
     // 7. `PreviewDataManager.onUndoMessage(src, msg)`
-    if (typeof obj.onUndoMessage === 'function' && !obj.onUndoMessage.__olazAr) {
-      const origOnUndo = obj.onUndoMessage;
+    const origOnUndo = safeMethodValue(obj, 'onUndoMessage');
+    if (origOnUndo && !origOnUndo.__olazAr) {
       defineArMethod(obj, 'onUndoMessage', function (src, msg) {
         if (!antiRecallEnabled) {
           return origOnUndo.apply(this, arguments);
@@ -2246,133 +2302,151 @@ function bootstrapAntiRecallRuntime(globalScope) {
   const inspectedTargets = typeof WeakSet === 'function' ? new WeakSet() : null;
 
   function inspectSingleCandidate(cand) {
-    if (!cand || (typeof cand !== 'object' && typeof cand !== 'function')) return;
-    if (typeof window !== 'undefined' && cand === window.$capp) return;
-    if (inspectedTargets) {
-      if (inspectedTargets.has(cand)) return;
-      inspectedTargets.add(cand);
-    }
-
     try {
-      patchAntiRecallTarget(cand);
-    } catch {}
+      if (!cand || (typeof cand !== 'object' && typeof cand !== 'function')) return;
+      if (isHostGlobalOrDomObject(cand)) return;
+      if (inspectedTargets) {
+        if (inspectedTargets.has(cand)) return;
+        inspectedTargets.add(cand);
+      }
 
-    if (typeof cand === 'function' && cand.prototype) {
       try {
-        patchAntiRecallTarget(cand.prototype);
+        patchAntiRecallTarget(cand);
       } catch {}
-    } else if (typeof cand === 'object') {
-      const proto = safeCall(() => Object.getPrototypeOf(cand), null);
-      if (proto && proto !== Object.prototype && proto !== Array.prototype) {
-        try {
-          patchAntiRecallTarget(proto);
-        } catch {}
-      }
-    }
 
-    // Detect Redux store
-    if (
-      typeof cand === 'object' &&
-      typeof cand.getState === 'function' &&
-      typeof cand.dispatch === 'function' &&
-      typeof cand.subscribe === 'function'
-    ) {
-      const st = safeCall(() => cand.getState(), null);
-      if (st && typeof st === 'object' && (st.conversations || st.user)) {
-        wrapStoreForAntiRecall(cand);
-      }
-    }
-
-    // Detect `MessageCache` instance holding `_cache`
-    if (
-      typeof cand === 'object' &&
-      cand._cache instanceof Map &&
-      typeof cand.undoMessages === 'function'
-    ) {
-      liveMessageCacheRefs.add(cand);
-    }
-
-    // Hook DI container `.resolve` & `_registry.set` so lazily-registered/instantiated services are patched immediately
-    if (
-      typeof cand === 'object' &&
-      cand._registry &&
-      cand._registry._registryMap instanceof Map &&
-      typeof cand.resolve === 'function' &&
-      !cand.resolve.__olazArResolve
-    ) {
-      const origResolve = cand.resolve;
-      const wrappedResolve = function () {
-        const resolved = origResolve.apply(this, arguments);
-        if (resolved && (typeof resolved === 'object' || typeof resolved === 'function')) {
-          inspectSingleCandidate(resolved);
+      if (typeof cand === 'function') {
+        const fnProto = safeOwnDataValue(cand, 'prototype');
+        if (fnProto && typeof fnProto === 'object') {
+          try {
+            patchAntiRecallTarget(fnProto);
+          } catch {}
         }
-        return resolved;
-      };
-      try {
-        Object.defineProperty(wrappedResolve, '__olazArResolve', { value: true });
-        cand.resolve = wrappedResolve;
-      } catch {}
+      } else if (typeof cand === 'object') {
+        const proto = safeCall(() => Object.getPrototypeOf(cand), null);
+        if (proto && proto !== Object.prototype && proto !== Array.prototype) {
+          try {
+            patchAntiRecallTarget(proto);
+          } catch {}
+        }
+      }
 
-      const regObj = cand._registry;
-      if (typeof regObj.set === 'function' && !regObj.set.__olazArRegSet) {
-        const origRegSet = regObj.set;
-        const wrappedRegSet = function (_token, registration) {
-          const out = origRegSet.apply(this, arguments);
-          inspectDiRegistration(registration);
-          return out;
+      // Detect Redux store without invoking unrelated getters
+      if (
+        typeof cand === 'object' &&
+        safeMethodValue(cand, 'getState') &&
+        safeMethodValue(cand, 'dispatch') &&
+        safeMethodValue(cand, 'subscribe')
+      ) {
+        const st = safeCall(() => cand.getState(), null);
+        if (st && typeof st === 'object' && (st.conversations || st.user)) {
+          wrapStoreForAntiRecall(cand);
+        }
+      }
+
+      // Detect `MessageCache` instance holding own `_cache` Map without invoking getters
+      if (
+        typeof cand === 'object' &&
+        safeMethodValue(cand, 'undoMessages') &&
+        safeOwnDataValue(cand, '_cache') instanceof Map
+      ) {
+        liveMessageCacheRefs.add(cand);
+      }
+
+      // Hook DI container `.resolve` & `_registry.set` so lazily-registered/instantiated services are patched immediately
+      const regObj = typeof cand === 'object' ? safeOwnDataValue(cand, '_registry') : null;
+      const regMap = regObj && typeof regObj === 'object' ? safeOwnDataValue(regObj, '_registryMap') : null;
+      const origResolve = typeof cand === 'object' ? safeMethodValue(cand, 'resolve') : null;
+      if (regObj && regMap instanceof Map && origResolve && !origResolve.__olazArResolve) {
+        const wrappedResolve = function () {
+          const resolved = origResolve.apply(this, arguments);
+          if (resolved && (typeof resolved === 'object' || typeof resolved === 'function')) {
+            try {
+              inspectSingleCandidate(resolved);
+            } catch {}
+          }
+          return resolved;
         };
         try {
-          Object.defineProperty(wrappedRegSet, '__olazArRegSet', { value: true });
-          regObj.set = wrappedRegSet;
+          Object.defineProperty(wrappedResolve, '__olazArResolve', { value: true });
+          cand.resolve = wrappedResolve;
         } catch {}
-      }
 
-      for (const regs of cand._registry._registryMap.values()) {
-        if (Array.isArray(regs)) {
-          for (let i = 0; i < regs.length; i++) inspectDiRegistration(regs[i]);
+        const origRegSet = safeMethodValue(regObj, 'set');
+        if (origRegSet && !origRegSet.__olazArRegSet) {
+          const wrappedRegSet = function (_token, registration) {
+            const out = origRegSet.apply(this, arguments);
+            try {
+              inspectDiRegistration(registration);
+            } catch {}
+            return out;
+          };
+          try {
+            Object.defineProperty(wrappedRegSet, '__olazArRegSet', { value: true });
+            regObj.set = wrappedRegSet;
+          } catch {}
+        }
+
+        for (const regs of regMap.values()) {
+          if (Array.isArray(regs)) {
+            for (let i = 0; i < regs.length; i++) inspectDiRegistration(regs[i]);
+          }
         }
       }
-    }
+    } catch {}
   }
 
   function inspectExportTree(ex) {
-    if (!ex || (typeof ex !== 'object' && typeof ex !== 'function')) return;
-    inspectSingleCandidate(ex);
-    if (typeof ex === 'object') {
-      const keys = safeCall(() => Object.keys(ex), []);
-      for (let i = 0; i < keys.length; i++) {
-        const sub = safeCall(() => ex[keys[i]], null);
-        if (sub && (typeof sub === 'object' || typeof sub === 'function')) {
-          inspectSingleCandidate(sub);
+    try {
+      if (!ex || (typeof ex !== 'object' && typeof ex !== 'function')) return;
+      if (isHostGlobalOrDomObject(ex)) return;
+      inspectSingleCandidate(ex);
+      if (typeof ex === 'object') {
+        const keys = safeCall(() => Object.keys(ex), []);
+        for (let i = 0; i < keys.length; i++) {
+          const k = keys[i];
+          const sub = safeCall(() => ex[k], null);
+          if (sub && (typeof sub === 'object' || typeof sub === 'function') && !isHostGlobalOrDomObject(sub)) {
+            inspectSingleCandidate(sub);
+          }
         }
       }
-    }
+    } catch {}
   }
 
   function inspectDiRegistration(reg) {
-    if (!reg || typeof reg !== 'object') return;
-    if (reg.instance) inspectSingleCandidate(reg.instance);
-    if (reg.provider) {
-      if (reg.provider.useClass) inspectSingleCandidate(reg.provider.useClass);
-      if (reg.provider.useValue) inspectSingleCandidate(reg.provider.useValue);
-      inspectSingleCandidate(reg.provider);
-    }
+    try {
+      if (!reg || typeof reg !== 'object' || isHostGlobalOrDomObject(reg)) return;
+      const inst = safeOwnDataValue(reg, 'instance');
+      if (inst) inspectSingleCandidate(inst);
+      const prov = safeOwnDataValue(reg, 'provider');
+      if (prov && typeof prov === 'object') {
+        const uc = safeOwnDataValue(prov, 'useClass');
+        const uv = safeOwnDataValue(prov, 'useValue');
+        if (uc) inspectSingleCandidate(uc);
+        if (uv) inspectSingleCandidate(uv);
+        inspectSingleCandidate(prov);
+      } else if (typeof prov === 'function') {
+        inspectSingleCandidate(prov);
+      }
+    } catch {}
   }
 
   function scanWebpackRequireDelta(req) {
-    const cache = req && req.c;
-    if (!cache || typeof cache !== 'object') return;
-    const ids = Object.keys(cache);
-    for (let i = 0; i < ids.length; i++) {
-      const id = ids[i];
-      if (patchedModuleIds.has(id)) continue;
-      const mod = cache[id];
-      if (!mod || !mod.exports) continue;
-      inspectExportTree(mod.exports);
-      if (mod.l !== false) {
-        patchedModuleIds.add(id);
+    try {
+      const cache = req && req.c;
+      if (!cache || typeof cache !== 'object') return;
+      const ids = Object.keys(cache);
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        if (patchedModuleIds.has(id)) continue;
+        const mod = cache[id];
+        if (!mod || !mod.exports) continue;
+        inspectExportTree(mod.exports);
+        if (mod.l !== false) {
+          patchedModuleIds.add(id);
+        }
       }
-    }
+    } catch {}
   }
 
   if (Array.isArray(host.webpackModuleHooks)) {
