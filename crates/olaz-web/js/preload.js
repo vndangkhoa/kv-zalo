@@ -391,11 +391,12 @@ function bootstrapSessionRuntime(globalScope) {
         ORIG_MAX_TOUCH_POINTS;
       const coarseNoHover =
         typeof window.matchMedia === 'function' &&
-        window.matchMedia('(pointer: coarse) and (hover: none)').matches;
+        (window.matchMedia('(pointer: coarse) and (hover: none)').matches ||
+         window.matchMedia('(max-width: 768px)').matches);
       const vw = Number(window.innerWidth) || 0;
       const vh = Number(window.innerHeight) || 0;
       const shortSide = vw > 0 && vh > 0 ? Math.min(vw, vh) : 0;
-      if ((liveTouch > 0 || coarseNoHover) && shortSide > 0 && shortSide <= 540) {
+      if (liveTouch > 0 && (shortSide <= 768 || coarseNoHover || vw <= 600)) {
         return true;
       }
     } catch {}
@@ -8073,169 +8074,320 @@ function bootstrapSessionRuntime(globalScope) {
   const MOBILE_LOGIN_NOTICE_DISMISS_KEY = 'olaz:__mobile_login_notice_dismissed_v1';
 
   function mountMobileLoginRestrictionNotice() {
-    if (!IS_WINDOW || isAuxiliaryFrame) return;
-    if (!/\/login\.html$/i.test(window.location.pathname || '')) return;
-    if (!document.body || document.getElementById('__olaz-mobile-login-notice')) return;
+    if (!IS_WINDOW || isAuxiliaryFrame || IS_SHARED_WORKER_FRAME) return;
+    if (document.getElementById('__olaz-mobile-login-notice')) return;
+    const parent = document.body || document.documentElement;
+    if (!parent) return;
 
     const host = document.createElement('div');
     host.id = '__olaz-mobile-login-notice';
     host.style.cssText =
-      'position:fixed;top:0;left:0;right:0;z-index:2147483645;pointer-events:none;display:none;';
+      'position:fixed;inset:0;width:100vw;width:100dvw;height:100vh;height:100dvh;z-index:2147483645;display:none;';
     const shadow = host.attachShadow({ mode: 'open' });
     shadow.innerHTML = `
       <style>
-        *, *::before, *::after { box-sizing: border-box; }
-        .wrap {
-          pointer-events: auto;
-          margin: max(8px, env(safe-area-inset-top, 0px)) auto 0 auto;
-          width: calc(100vw - 16px);
-          width: calc(100dvw - 16px);
-          max-width: 440px;
-          padding: 10px 12px;
-          border-radius: 12px;
-          background: rgba(15, 23, 42, 0.96);
-          border: 1px solid rgba(245, 158, 11, 0.55);
-          box-shadow: 0 12px 28px rgba(2, 6, 23, 0.45);
-          color: #f8fafc;
-          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        .backdrop {
+          position: fixed;
+          inset: 0;
+          width: 100vw;
+          width: 100dvw;
+          height: 100vh;
+          height: 100dvh;
+          background: rgba(11, 17, 32, 0.96);
+          backdrop-filter: blur(16px);
+          -webkit-backdrop-filter: blur(16px);
           display: flex;
-          align-items: flex-start;
-          gap: 10px;
-          backdrop-filter: blur(12px);
-          -webkit-backdrop-filter: blur(12px);
-        }
-        .icon {
-          flex: none;
-          width: 22px;
-          height: 22px;
-          margin-top: 1px;
-          border-radius: 999px;
-          background: rgba(245, 158, 11, 0.18);
-          color: #fbbf24;
-          display: inline-flex;
           align-items: center;
           justify-content: center;
+          padding: max(20px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) max(20px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+          overflow-y: auto;
+          -webkit-overflow-scrolling: touch;
         }
-        .icon svg {
+        .wrap {
+          pointer-events: auto;
+          width: 100%;
+          max-width: 410px;
+          margin: auto;
+          padding: 32px 24px 24px 24px;
+          border-radius: 22px;
+          background: #1e293b;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          box-shadow: 0 24px 48px rgba(2, 6, 23, 0.65), 0 0 0 1px rgba(0, 104, 255, 0.2);
+          color: #f8fafc;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          text-align: center;
+        }
+        .icon-wrap {
+          position: relative;
+          width: 68px;
+          height: 68px;
+          border-radius: 20px;
+          background: rgba(239, 68, 68, 0.12);
+          border: 1px solid rgba(239, 68, 68, 0.32);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          margin-bottom: 20px;
+          color: #f87171;
+        }
+        .icon-device {
+          width: 32px;
+          height: 32px;
+          display: block;
+        }
+        .badge-slash {
+          position: absolute;
+          bottom: -4px;
+          right: -4px;
+          width: 24px;
+          height: 24px;
+          border-radius: 999px;
+          background: #ef4444;
+          color: #ffffff;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          border: 2px solid #1e293b;
+        }
+        .badge-slash svg {
           width: 14px;
           height: 14px;
           display: block;
         }
         .body {
-          flex: 1 1 auto;
-          min-width: 0;
+          width: 100%;
+          margin-bottom: 22px;
         }
         .title {
-          font-size: 12.5px;
+          font-size: 19px;
           font-weight: 700;
-          color: #fde68a;
-          line-height: 1.3;
-          margin-bottom: 3px;
+          color: #f8fafc;
+          line-height: 1.35;
+          margin-bottom: 12px;
+          letter-spacing: -0.01em;
         }
         .desc {
-          font-size: 11.5px;
-          line-height: 1.4;
-          color: #e2e8f0;
+          font-size: 13.5px;
+          line-height: 1.6;
+          color: #cbd5e1;
           word-break: break-word;
         }
-        .dismiss {
-          flex: none;
-          align-self: center;
-          min-height: 30px;
-          padding: 5px 10px;
-          border-radius: 8px;
-          border: 1px solid rgba(251, 191, 36, 0.4);
-          background: rgba(245, 158, 11, 0.16);
-          color: #fef3c7;
-          font-size: 11.5px;
+        .actions {
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+          width: 100%;
+          margin-bottom: 16px;
+        }
+        .btn-primary {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 100%;
+          min-height: 44px;
+          padding: 10px 16px;
+          border-radius: 12px;
+          background: #0068ff;
+          color: #ffffff;
+          font-size: 14px;
           font-weight: 600;
+          text-decoration: none;
+          border: none;
           cursor: pointer;
-          white-space: nowrap;
+          transition: background 0.15s ease, transform 0.1s ease;
+          -webkit-tap-highlight-color: transparent;
+        }
+        .btn-primary:active {
+          background: #0056d6;
+          transform: scale(0.98);
+        }
+        .btn-secondary {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 100%;
+          min-height: 42px;
+          padding: 10px 16px;
+          border-radius: 12px;
+          background: rgba(255, 255, 255, 0.08);
+          color: #e2e8f0;
+          font-size: 13.5px;
+          font-weight: 500;
+          border: 1px solid rgba(255, 255, 255, 0.15);
+          cursor: pointer;
+          transition: background 0.15s ease;
+          -webkit-tap-highlight-color: transparent;
+        }
+        .btn-secondary:active {
+          background: rgba(255, 255, 255, 0.16);
+        }
+        .tip-box {
+          display: flex;
+          align-items: flex-start;
+          gap: 8px;
+          width: 100%;
+          background: rgba(255, 255, 255, 0.04);
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          border-radius: 10px;
+          padding: 10px 12px;
+          margin-bottom: 16px;
+          text-align: left;
+          font-size: 12px;
+          line-height: 1.45;
+          color: #cbd5e1;
+        }
+        .tip-box strong {
+          color: #fde68a;
+        }
+        .dismiss {
+          background: transparent;
+          border: none;
+          color: #64748b;
+          font-size: 12px;
+          font-weight: 500;
+          text-decoration: underline;
+          cursor: pointer;
+          padding: 6px 12px;
+          transition: color 0.15s ease;
+          -webkit-tap-highlight-color: transparent;
         }
         .dismiss:hover {
-          background: rgba(245, 158, 11, 0.28);
-        }
-        .dismiss:focus-visible {
-          outline: 2px solid #fbbf24;
-          outline-offset: 2px;
-        }
-        @media (max-height: 440px) {
-          .wrap {
-            margin-top: 4px;
-            padding: 6px 10px;
-            gap: 8px;
-          }
-          .title {
-            font-size: 11.5px;
-            margin-bottom: 1px;
-          }
-          .desc {
-            font-size: 10.5px;
-            line-height: 1.25;
-          }
-          .dismiss {
-            min-height: 26px;
-            padding: 3px 8px;
-            font-size: 11px;
-          }
+          color: #94a3b8;
         }
       </style>
-      <div class="wrap" id="mobileNoticeCard" role="status" aria-live="polite">
-        <span class="icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
-            <line x1="12" y1="9" x2="12" y2="13"></line>
-            <line x1="12" y1="17" x2="12.01" y2="17"></line>
-          </svg>
-        </span>
-        <div class="body">
-          <div class="title">Zalo hạn chế đăng nhập bản Web trên điện thoại</div>
-          <div class="desc">Zalo hiện không cho phép đăng nhập trực tiếp trên trình duyệt di động bằng cùng một máy. Vui lòng dùng điện thoại khác mở Zalo để quét mã QR bên dưới, hoặc đăng nhập trên máy tính.</div>
+      <div class="backdrop" id="mobileUnsupportedBackdrop">
+        <div class="wrap" id="mobileNoticeCard" role="alertdialog" aria-modal="true" aria-labelledby="mobileNoticeTitle">
+          <div class="icon-wrap" aria-hidden="true">
+            <svg class="icon-device" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="5" y="2" width="14" height="20" rx="3" ry="3"></rect>
+              <line x1="12" y1="18" x2="12.01" y2="18"></line>
+            </svg>
+            <span class="badge-slash">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                <line x1="4" y1="4" x2="20" y2="20"></line>
+              </svg>
+            </span>
+          </div>
+
+          <div class="body">
+            <div class="title" id="mobileNoticeTitle">Không hỗ trợ trên thiết bị di động</div>
+            <div class="desc">
+              Zalo Web hiện chỉ hỗ trợ truy cập trên trình duyệt máy tính (PC / Laptop). Vui lòng sử dụng máy tính để đăng nhập hoặc mở ứng dụng Zalo trên điện thoại.
+            </div>
+          </div>
+
+          <div class="actions">
+            <a href="zalo://" class="btn-primary" id="mobileNoticeOpenApp">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;margin-right:6px;">
+                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+                <polyline points="15 3 21 3 21 9"></polyline>
+                <line x1="10" y1="14" x2="21" y2="3"></line>
+              </svg>
+              Mở ứng dụng Zalo
+            </a>
+            <button type="button" class="btn-secondary" id="mobileNoticeCopyLink">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;margin-right:6px;">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+              </svg>
+              Sao chép liên kết
+            </button>
+          </div>
+
+          <div class="tip-box">
+            <span style="font-size:14px;line-height:1;">💡</span>
+            <span>Mẹo: Bạn có thể bật <strong>"Yêu cầu trang web cho máy tính"</strong> (Request Desktop Site) trong cài đặt trình duyệt để xem bản đầy đủ.</span>
+          </div>
+
+          <button class="dismiss" id="mobileNoticeDismiss" type="button">Đã hiểu</button>
         </div>
-        <button class="dismiss" id="mobileNoticeDismiss" type="button">Đã hiểu</button>
       </div>
     `;
-    document.body.appendChild(host);
-
-    let pagePadStyle = document.getElementById('__olaz-mobile-login-pad-style');
-    if (!pagePadStyle && (document.head || document.documentElement)) {
-      pagePadStyle = document.createElement('style');
-      pagePadStyle.id = '__olaz-mobile-login-pad-style';
-      pagePadStyle.textContent =
-        '@media (min-height: 540px) { #app-page { padding-top: var(--kvz-mobile-notice-pad, 0px) !important; overflow-y: auto !important; } }';
-      (document.head || document.documentElement).appendChild(pagePadStyle);
-    }
+    parent.appendChild(host);
 
     const syncVisibility = () => {
-      const dismissed = rawSsGet(MOBILE_LOGIN_NOTICE_DISMISS_KEY) === '1';
+      const dismissed =
+        rawSsGet(MOBILE_LOGIN_NOTICE_DISMISS_KEY) === '1' ||
+        (typeof window !== 'undefined' &&
+          window.sessionStorage &&
+          window.sessionStorage.getItem(MOBILE_LOGIN_NOTICE_DISMISS_KEY) === '1');
       const show = !dismissed && detectMobileBrowser();
       host.style.display = show ? 'block' : 'none';
       host.setAttribute('data-visible', show ? 'true' : 'false');
-      const docEl = document.documentElement;
-      if (docEl && docEl.style) {
-        if (show) {
-          const cardEl = shadow.getElementById('mobileNoticeCard');
-          const h = cardEl ? Math.ceil(cardEl.getBoundingClientRect().height) : 132;
-          docEl.style.setProperty('--kvz-mobile-notice-pad', Math.max(96, h + 12) + 'px');
-        } else {
-          docEl.style.setProperty('--kvz-mobile-notice-pad', '0px');
-        }
+      const pillEl = document.getElementById('__olaz-multi-account-pill');
+      if (pillEl) {
+        pillEl.style.display = show ? 'none' : 'block';
       }
     };
+
+    const openAppBtn = shadow.getElementById('mobileNoticeOpenApp');
+    if (openAppBtn) {
+      openAppBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        window.location.href = 'zalo://';
+        setTimeout(() => {
+          window.location.href = 'https://zalo.me/download';
+        }, 1500);
+      });
+    }
+
+    const copyBtn = shadow.getElementById('mobileNoticeCopyLink');
+    if (copyBtn) {
+      copyBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        try {
+          const url = window.location.href;
+          const setCopied = () => {
+            copyBtn.textContent = '✓ Đã sao chép liên kết!';
+            setTimeout(() => {
+              copyBtn.innerHTML = `
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;margin-right:6px;">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>Sao chép liên kết`;
+            }, 2500);
+          };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(url).then(setCopied).catch(() => {});
+          } else {
+            const ta = document.createElement('textarea');
+            ta.value = url;
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            setCopied();
+          }
+        } catch {}
+      });
+    }
 
     const dismissBtn = shadow.getElementById('mobileNoticeDismiss');
     if (dismissBtn) {
       dismissBtn.addEventListener('click', (ev) => {
         if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation();
         rawSsSet(MOBILE_LOGIN_NOTICE_DISMISS_KEY, '1');
+        try { window.sessionStorage.setItem(MOBILE_LOGIN_NOTICE_DISMISS_KEY, '1'); } catch {}
         syncVisibility();
       });
     }
+
+    const clearDismissal = () => {
+      rawSsRemove(MOBILE_LOGIN_NOTICE_DISMISS_KEY);
+      try { window.sessionStorage.removeItem(MOBILE_LOGIN_NOTICE_DISMISS_KEY); } catch {}
+      syncVisibility();
+    };
 
     syncVisibility();
     window.addEventListener('resize', syncVisibility, { passive: true });
     window.addEventListener('orientationchange', syncVisibility, { passive: true });
     olazHost.syncMobileLoginNotice = syncVisibility;
+    olazHost.clearMobileNoticeDismissal = clearDismissal;
+    olazHost.detectMobile = detectMobileBrowser;
   }
 
   window.__olazBootReady = (async () => {
