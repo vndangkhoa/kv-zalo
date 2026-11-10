@@ -510,6 +510,11 @@ function bootstrapSessionRuntime(globalScope) {
         window.localStorage.setItem('zpw_ver', ZALO_CLIENT_VERSION);
         window.localStorage.setItem('app_ver', ZALO_APP_VERSION);
       }
+      if (rawLocalStorage && rawStorageMethods) {
+        rawStorageMethods.setItem.call(rawLocalStorage, 'zpw_type', ZALO_CLIENT_TYPE);
+        rawStorageMethods.setItem.call(rawLocalStorage, 'zpw_ver', ZALO_CLIENT_VERSION);
+        rawStorageMethods.setItem.call(rawLocalStorage, 'app_ver', ZALO_APP_VERSION);
+      }
     } catch {}
 
     try {

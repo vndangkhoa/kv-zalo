@@ -4963,6 +4963,7 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         b".migrate_db_sf",
         b"\"+ou9\":",
         b"sticker-resource-cache",
+        b"zpw_ver:i.default.apiVersion",
     ];
     if !FAST_NEEDLES
         .iter()
@@ -5454,6 +5455,24 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
             s = s.replace("const y=s.default.isWeb();", "const y=!0;");
             changed = true;
         }
+    }
+
+    // 19. QR Code & Client Version Safeguard in `NDmK`:
+    // Ensure `Je.apiVersion` and `Je.apiType` never evaluate to null/empty when URL params or localStorage
+    // are missing, which causes Zalo backend to reject QR login scans with "Cập nhật Zalo PC lên phiên bản mới nhất".
+    if s.contains(":(Je.apiType=t.getItem(\"zpw_type\"),Je.apiVersion=t.getItem(\"zpw_ver\"),Je.appVersion=t.getItem(\"app_ver\"))") {
+        s = s.replace(
+            ":(Je.apiType=t.getItem(\"zpw_type\"),Je.apiVersion=t.getItem(\"zpw_ver\"),Je.appVersion=t.getItem(\"app_ver\"))",
+            ":(Je.apiType=t.getItem(\"zpw_type\")||\"23\",Je.apiVersion=t.getItem(\"zpw_ver\")||\"695\",Je.appVersion=t.getItem(\"app_ver\")||\"26.11.10\")",
+        );
+        changed = true;
+    }
+    if s.contains("ie={zpw_ver:i.default.apiVersion,zpw_type:i.default.apiType}") {
+        s = s.replace(
+            "ie={zpw_ver:i.default.apiVersion,zpw_type:i.default.apiType}",
+            "ie={zpw_ver:i.default.apiVersion||\"695\",zpw_type:i.default.apiType||\"23\"}",
+        );
+        changed = true;
     }
 
     if changed {

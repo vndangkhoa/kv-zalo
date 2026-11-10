@@ -545,6 +545,11 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> Re
                 loc.push_str(&clean);
             }
         }
+        if let Some(logout) = extract_query_param(&head.query, "logout") {
+            if logout == "1" {
+                loc.push_str("&logout=1");
+            }
+        }
         let resp = format!(
             "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
