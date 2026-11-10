@@ -1538,10 +1538,47 @@ async fn browser_preload_multi_account_pin_vault_sw_and_cli_smoke() {
     //    - SafeStorage, KeychainCipher, BrowserCookieJar, in-browser VFS + fileNoise
     //    - SubtleCrypto PBKDF2-SHA256 (600,000 iterations) + AES-256-GCM Vault sealing
     //    - `sw.js` Service Worker `/__zfile/@slot/acc_2/...` HTTP 206 Partial Content + denoising
+    // Verify concatenated `PRELOAD_JS` contains zero blocking `window.prompt` / `window.confirm` dialogs,
+    // `zd-worker` receives `WORKER_IMPORT_PREAMBLE`, and `b2.dlfl.vn` / `v1.dlmd.me` pass `AllowlistValidator`.
+    assert!(
+        !olaz_web::PRELOAD_JS.contains("window.prompt(")
+            && !olaz_web::PRELOAD_JS.contains("window.confirm("),
+        "PRELOAD_JS must not use native blocking window.prompt/window.confirm dialogs"
+    );
+    let zd_transformed = olaz_web::transform_bundle_asset_opt(
+        "pc-dist/zd-worker.cfeba43a9a8e4e40dda3.js",
+        b"self.onmessage = function () {};",
+    )
+    .expect("zd-worker must be transformed");
+    assert!(
+        std::str::from_utf8(&zd_transformed)
+            .unwrap()
+            .starts_with("try { importScripts('/__olaz/crypto_sync.js', '/__olaz/bridge_table.js', '/__olaz/preload.js'); }"),
+        "zd-worker must receive WORKER_IMPORT_PREAMBLE"
+    );
+    {
+        let mut dns_overrides = std::collections::HashMap::new();
+        let pub_ip = std::net::IpAddr::V4(Ipv4Addr::new(203, 119, 9, 25));
+        dns_overrides.insert("b2.dlfl.vn".to_string(), vec![pub_ip]);
+        dns_overrides.insert("v1.dlmd.me".to_string(), vec![pub_ip]);
+        let validator = olaz_web::AllowlistValidator::new(AllowlistConfig {
+            allow_loopback_upstream_for_tests: false,
+            dns_overrides,
+        });
+        assert!(validator
+            .validate_http_target("https://b2.dlfl.vn/dl/photo.jpg")
+            .await
+            .is_ok());
+        assert!(validator
+            .validate_http_target("https://v1.dlmd.me/stream/video.mp4")
+            .await
+            .is_ok());
+    }
+
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let payload = json!({
         "cryptoJs": manifest_dir.join("js/crypto_sync.js").to_string_lossy(),
-        "preloadJs": manifest_dir.join("js/preload.js").to_string_lossy(),
+        "preloadSource": olaz_web::PRELOAD_JS,
         "swJs": manifest_dir.join("js/sw.js").to_string_lossy(),
         "bridgeTableScript": olaz_web::web_bridge_spec_script(),
     });
@@ -1635,12 +1672,23 @@ async fn browser_preload_multi_account_pin_vault_sw_and_cli_smoke() {
         }
         transaction(names) {
           const selfDb = this;
-          return {
+          const lsComplete = [];
+          const txObj = {
+            oncomplete: null,
+            onerror: null,
+            onabort: null,
             objectStore(n) {
               return new FakeObjectStore(selfDb._meta.stores.get(n));
             },
-            addEventListener() {},
+            addEventListener(t, fn) {
+              if (t === 'complete' && typeof fn === 'function') lsComplete.push(fn);
+            },
           };
+          queueMicrotask(() => queueMicrotask(() => {
+            if (typeof txObj.oncomplete === 'function') txObj.oncomplete({ type: 'complete', target: txObj });
+            for (const fn of lsComplete) fn({ type: 'complete', target: txObj });
+          }));
+          return txObj;
         }
         close() {}
       }
@@ -1685,22 +1733,87 @@ async fn browser_preload_multi_account_pin_vault_sw_and_cli_smoke() {
 
       const ls = new Storage();
       const ss = new Storage();
-      const makeElem = (tag) => ({
-        tagName: String(tag).toUpperCase(),
-        style: {},
-        classList: { toggle() {}, add() {}, remove() {} },
-        children: [],
-        attributes: [],
-        setAttribute(k, v) { this.attributes.push({ name: k, value: String(v) }); },
-        getAttribute() { return null; },
-        appendChild(c) { this.children.push(c); return c; },
-        remove() {},
-        addEventListener() {},
-        attachShadow() { return makeElem('shadow'); },
-        getElementById() { return makeElem('div'); },
-        querySelector() { return null; },
-        querySelectorAll() { return []; },
-      });
+      const makeElem = (tag) => {
+        const classes = new Set();
+        const listeners = new Map();
+        const byId = new Map();
+        const el = {
+          tagName: String(tag).toUpperCase(),
+          id: '',
+          value: '',
+          textContent: '',
+          innerHTML: '',
+          disabled: false,
+          checked: false,
+          style: {},
+          shadowRoot: null,
+          parentNode: null,
+          classList: {
+            toggle(c, force) {
+              const on = force === undefined ? !classes.has(c) : Boolean(force);
+              if (on) classes.add(c); else classes.delete(c);
+              return on;
+            },
+            add(...cs) { cs.forEach((c) => classes.add(c)); },
+            remove(...cs) { cs.forEach((c) => classes.delete(c)); },
+            contains(c) { return classes.has(c); },
+          },
+          children: [],
+          attributes: [],
+          setAttribute(k, v) {
+            if (k === 'id') this.id = String(v);
+            this.attributes.push({ name: k, value: String(v) });
+          },
+          getAttribute(k) {
+            const hit = this.attributes.find((a) => a.name === k);
+            return hit ? hit.value : null;
+          },
+          appendChild(c) {
+            if (c) c.parentNode = this;
+            this.children.push(c);
+            return c;
+          },
+          remove() {
+            if (this.parentNode && Array.isArray(this.parentNode.children)) {
+              const idx = this.parentNode.children.indexOf(this);
+              if (idx >= 0) this.parentNode.children.splice(idx, 1);
+              this.parentNode = null;
+            }
+          },
+          focus() {},
+          select() {},
+          getBoundingClientRect() { return { left: 0, top: 0, right: 100, bottom: 40, width: 100, height: 40 }; },
+          addEventListener(type, fn) {
+            if (typeof fn !== 'function') return;
+            if (!listeners.has(type)) listeners.set(type, []);
+            listeners.get(type).push(fn);
+          },
+          removeEventListener() {},
+          dispatchEvent(ev) {
+            const fns = listeners.get(ev && ev.type) || [];
+            const ps = [];
+            for (const fn of fns) ps.push(fn(ev));
+            return Promise.all(ps);
+          },
+          attachShadow() {
+            const sh = makeElem('shadow');
+            this.shadowRoot = sh;
+            return sh;
+          },
+          getElementById(id) {
+            const k = String(id);
+            if (!byId.has(k)) {
+              const child = makeElem('div');
+              child.id = k;
+              byId.set(k, child);
+            }
+            return byId.get(k);
+          },
+          querySelector() { return null; },
+          querySelectorAll() { return []; },
+        };
+        return el;
+      };
 
       const win = {
         crypto: globalThis.crypto,
@@ -1773,9 +1886,10 @@ async fn browser_preload_multi_account_pin_vault_sw_and_cli_smoke() {
       ls._m.set('olaz:acc_2:zpw_type', 'null');
       ls._m.set('olaz:acc_2:zpw_ver', 'null');
 
-      vm.runInNewContext(fs.readFileSync(input.cryptoJs, 'utf8'), win, { filename: 'crypto_sync.js' });
-      vm.runInNewContext(input.bridgeTableScript, win, { filename: 'bridge_table.js' });
-      vm.runInNewContext(fs.readFileSync(input.preloadJs, 'utf8'), win, { filename: 'preload.js' });
+      vm.createContext(win);
+      vm.runInContext(fs.readFileSync(input.cryptoJs, 'utf8'), win, { filename: 'crypto_sync.js' });
+      vm.runInContext(input.bridgeTableScript, win, { filename: 'bridge_table.js' });
+      vm.runInContext(input.preloadSource, win, { filename: 'preload.js' });
 
       (async () => {
         await win.__olazBootReady;
@@ -1940,7 +2054,55 @@ async fn browser_preload_multi_account_pin_vault_sw_and_cli_smoke() {
         );
         assert.equal(aesKey.extractable, false);
 
-        process.stdout.write(JSON.stringify({ ok: true }));
+        // 8. Verify concatenated Window modules (`__olazVault`, `__olazAntiRecall`, `__olazCallRecorder`, `$zsub.$zMsgChannel`)
+        //    and Shadow DOM `#pinForm` + `#__olaz-vault-unlock-overlay` PIN lock/unlock flow!
+        assert.equal(typeof win.__olazVault, 'object');
+        assert.equal(typeof win.__olazVault.configurePin, 'function');
+        assert.equal(typeof win.__olazVault.lockNow, 'function');
+        assert.equal(typeof win.__olazVault.unlockWithPin, 'function');
+
+        assert.equal(typeof win.__olazAntiRecall, 'object');
+        assert.equal(win.__olazAntiRecall.isEnabled(), true);
+
+        assert.equal(typeof win.__olazCallRecorder, 'object');
+        assert.equal(win.__olazCallRecorder.getState().slot, 'acc_2');
+
+        assert.ok(win.$zsub && win.$zsub.$zMsgChannel, 'expected window.$zsub.$zMsgChannel');
+        assert.equal(typeof win.$zsub.$zMsgChannel.createUtilityMediaPort, 'function');
+
+        // Exercise Shadow DOM `#pinForm` inside the floating deck + `window.__olazVault` lock/unlock
+        const mountedRoots = [
+          ...win.document.documentElement.children,
+          ...win.document.body.children,
+        ];
+        const deckHost = mountedRoots.find((el) => el && el.shadowRoot && String(el.shadowRoot.innerHTML).includes('id="pinForm"'));
+        assert.ok(deckHost && deckHost.shadowRoot, 'expected floating deck Shadow DOM with #pinForm');
+        const deckShadow = deckHost.shadowRoot;
+        const pinBtn = deckShadow.getElementById('pinBtn');
+        const pinForm = deckShadow.getElementById('pinForm');
+        const pinNewInput = deckShadow.getElementById('pinNewInput');
+        const pinConfirmInput = deckShadow.getElementById('pinConfirmInput');
+        await pinBtn.dispatchEvent({ type: 'click' });
+        assert.equal(pinForm.classList.contains('hidden'), false);
+        pinNewInput.value = '4829';
+        pinConfirmInput.value = '4829';
+        await pinForm.dispatchEvent({ type: 'submit', preventDefault() {} });
+        assert.equal(win.__olazVault.hasPin(), true);
+        assert.equal(win.__olazVault.isLocked(), false);
+
+        const lockPromise = win.__olazVault.lockNow();
+        await new Promise((r) => setTimeout(r, 10));
+        assert.equal(win.__olazVault.isLocked(), true);
+        const unlockOverlay = [
+          ...win.document.documentElement.children,
+          ...win.document.body.children,
+        ].find((el) => el && el.id === '__olaz-vault-unlock-overlay');
+        assert.ok(unlockOverlay && unlockOverlay.shadowRoot, 'expected Shadow DOM unlock modal');
+        await win.__olazVault.unlockWithPin('4829');
+        await lockPromise;
+        assert.equal(win.__olazVault.isLocked(), false);
+
+        process.stdout.write(JSON.stringify({ ok: true }), () => process.exit(0));
       })().catch((err) => {
         console.error(err);
         process.exit(1);
@@ -1973,5 +2135,141 @@ async fn browser_preload_multi_account_pin_vault_sw_and_cli_smoke() {
     }
     let parsed: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(parsed["ok"], true);
+}
+
+#[tokio::test]
+async fn zero_copy_asar_caching_etag_and_concurrent_burst_test() {
+    let tmp = TempDir::new().expect("tempdir for synthetic asar");
+    let asar_path = tmp.path().join("app.asar");
+
+    let unpatched_chunk: Vec<u8> = b"window.__lazy52 = 1;\n".repeat(65_536); // ~1.37 MB chunk
+    let raw_html = b"<!doctype html><html><head><title>Zalo</title></head><body><script src=\"/lazy/52.29e128365e7ed193665d.js\"></script></body></html>";
+
+    let header_json = serde_json::to_vec(&json!({
+        "files": {
+            "pc-dist": {
+                "files": {
+                    "index.html": {
+                        "size": raw_html.len(),
+                        "offset": "0"
+                    },
+                    "lazy": {
+                        "files": {
+                            "52.29e128365e7ed193665d.js": {
+                                "size": unpatched_chunk.len(),
+                                "offset": raw_html.len().to_string()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    let json_len = header_json.len() as u32;
+    let padded_json_len = (header_json.len() + 3) & !3;
+    let inner_pickle_size = (4 + padded_json_len) as u32;
+    let header_pickle_size = 4 + inner_pickle_size;
+
+    let mut asar_bytes = Vec::new();
+    asar_bytes.extend_from_slice(&4u32.to_le_bytes());
+    asar_bytes.extend_from_slice(&header_pickle_size.to_le_bytes());
+    asar_bytes.extend_from_slice(&inner_pickle_size.to_le_bytes());
+    asar_bytes.extend_from_slice(&json_len.to_le_bytes());
+    asar_bytes.extend_from_slice(&header_json);
+    asar_bytes.resize(16 + padded_json_len, 0);
+    asar_bytes.extend_from_slice(raw_html);
+    asar_bytes.extend_from_slice(&unpatched_chunk);
+    std::fs::write(&asar_path, &asar_bytes).unwrap();
+
+    let bundle = BundleProvider::from_asar(&asar_path).expect("open synthetic ASAR");
+
+    // Unpatched chunk must be served directly out of `AssetBytes::MmapSlice` with identical pointer address!
+    let c1 = bundle
+        .get_asset("/lazy/52.29e128365e7ed193665d.js")
+        .expect("chunk hit 1");
+    let c2 = bundle
+        .get_asset("/lazy/52.29e128365e7ed193665d.js")
+        .expect("chunk hit 2");
+    assert!(
+        matches!(c1.bytes, olaz_web::AssetBytes::MmapSlice { .. }),
+        "unpatched ASAR chunk must use zero-copy MmapSlice"
+    );
+    assert_eq!(c1.bytes.as_ptr(), c2.bytes.as_ptr());
+    assert_eq!(&*c1.bytes, unpatched_chunk.as_slice());
+
+    // Patched HTML must be cached in `AssetBytes::Shared` and share the exact buffer across calls!
+    let h1 = bundle.get_asset("/index.html").expect("html hit 1");
+    let h2 = bundle.get_asset("/index.html").expect("html hit 2");
+    assert_eq!(h1.bytes.as_ptr(), h2.bytes.as_ptr());
+
+    // Spin up stateless edge server and verify ETag / 304 + 64-way concurrent burst
+    let server = start_web_server(WebServerConfig {
+        listen_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        bundle,
+        token: None,
+        allowlist: AllowlistConfig::default(),
+    })
+    .await
+    .expect("start server");
+    let base = format!("http://{}", server.local_addr());
+    let client = reqwest::Client::new();
+
+    let html_resp = client.get(format!("{base}/index.html")).send().await.unwrap();
+    assert_eq!(html_resp.status(), 200);
+    assert_eq!(
+        html_resp.headers().get("cache-control").unwrap(),
+        "no-store"
+    );
+
+    let chunk_resp = client
+        .get(format!("{base}/lazy/52.29e128365e7ed193665d.js"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chunk_resp.status(), 200);
+    assert_eq!(
+        chunk_resp.headers().get("cache-control").unwrap(),
+        "private, max-age=300"
+    );
+    let etag = chunk_resp
+        .headers()
+        .get("etag")
+        .expect("ETag header on static bundle chunk")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let chunk_body = chunk_resp.bytes().await.unwrap();
+    assert_eq!(chunk_body.as_ref(), unpatched_chunk.as_slice());
+
+    // Conditional request with matching `If-None-Match` must return `304 Not Modified` with empty body
+    let reval_resp = client
+        .get(format!("{base}/lazy/52.29e128365e7ed193665d.js"))
+        .header("If-None-Match", &etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reval_resp.status(), 304);
+    assert!(reval_resp.bytes().await.unwrap().is_empty());
+
+    // 64 concurrent full-body chunk downloads must all return 200 OK with exact byte length
+    let mut tasks = Vec::new();
+    for _ in 0..64 {
+        let c = client.clone();
+        let u = format!("{base}/lazy/52.29e128365e7ed193665d.js");
+        let expected_len = unpatched_chunk.len();
+        tasks.push(tokio::spawn(async move {
+            let r = c.get(u).send().await.expect("burst request");
+            assert_eq!(r.status(), 200);
+            let b = r.bytes().await.expect("burst body");
+            assert_eq!(b.len(), expected_len);
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    server.shutdown().await;
 }
 

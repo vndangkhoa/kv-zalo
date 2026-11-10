@@ -746,7 +746,8 @@ impl ZaloPlatform {
     }
 
     /// Forces every account in `database-config.json` onto IndexedDB (`*adp-st` -> `0`),
-    /// removes any `*upgradeRequired*` keys that would trigger a SQLite migration, and
+    /// removes any `*upgradeRequired*` or Zalo `26.11.10` SQLite migration latch keys
+    /// (`db4-ftu-required`, `sf-mg-gate`, `ismigtin`, `sqlite_m_d`), and
     /// repairs any stale `"0.1.0"` `sh_app_ver` persisted during an earlier first-run boot.
     pub fn normalize_database_adapter_state(&self) {
         let mut store = self.read_store("database-config");
@@ -862,10 +863,21 @@ impl Default for ZaloPlatform {
 }
 
 fn normalize_adapter_map(map: &mut Map<String, Value>) -> bool {
+    const MIGRATION_FLAG_SUFFIXES: &[&str] = &[
+        "db4-ftu-required",
+        "sf-mg-gate",
+        "ismigtin",
+        "sqlite_m_d",
+    ];
     let mut changed = false;
     let keys: Vec<String> = map.keys().cloned().collect();
     for key in keys {
-        if key.to_ascii_lowercase().contains("upgraderequired") {
+        let lower = key.to_ascii_lowercase();
+        if lower.contains("upgraderequired")
+            || MIGRATION_FLAG_SUFFIXES
+                .iter()
+                .any(|s| lower == *s || lower.ends_with(s))
+        {
             map.remove(&key);
             changed = true;
             continue;

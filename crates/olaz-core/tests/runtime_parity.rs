@@ -4409,4 +4409,576 @@ async fn keychain_cipher_with_profile_isolates_accounts_and_keeps_default_backwa
     );
 }
 
+// ============================================================================
+// 10. Zalo 26.11.10 Post-Login SQLite Migration Bundle & Config Guards
+// ============================================================================
+
+#[test]
+fn post_login_db_migration_bundle_patches_rewrite_synthetic_and_live_asar_and_preserve_untouched_lazy_chunks(
+) {
+    // 1. Synthetic `lazy/main-startup.*.js` (both standalone `waitForDBMigrate` and combined with `resolveWithRetry`)
+    let syn_main_only = br#"class MigrateController{waitForDBMigrate(e,t,s){return{session:e,cfg:t,disk:s}}}"#;
+    let patched_main_only = patch_asar_bundle(
+        "pc-dist/lazy/main-startup.89bb530b91927fd5dd28.js",
+        syn_main_only,
+    )
+    .expect("main-startup with waitForDBMigrate must be rewritten");
+    let patched_main_str = std::str::from_utf8(&patched_main_only).unwrap();
+    assert!(
+        patched_main_str
+            .contains("waitForDBMigrate(e,t,s){t=Object.assign({},t||{},{enable:!1});"),
+        "unexpected waitForDBMigrate rewrite: {patched_main_str}"
+    );
+    assert!(
+        patch_asar_bundle(
+            "pc-dist/lazy/main-startup.89bb530b91927fd5dd28.js",
+            &patched_main_only
+        )
+        .is_none(),
+        "waitForDBMigrate bundle patch must be idempotent"
+    );
+
+    let syn_main_combined = br#"class MigrateController{waitForDBMigrate(a,b,c){return{session:a,cfg:b,disk:c}}}function syncIds(o,r,m){return o.resolveWithRetry(r,(e=>m.default.getGlobalIdsFromUserIds(e)))}"#;
+    let patched_combined = patch_asar_bundle(
+        "pc-dist/lazy/main-startup.89bb530b91927fd5dd28.js",
+        syn_main_combined,
+    )
+    .expect("combined main-startup must apply both patches");
+    let patched_combined_str = std::str::from_utf8(&patched_combined).unwrap();
+    assert!(
+        patched_combined_str
+            .contains("waitForDBMigrate(a,b,c){b=Object.assign({},b||{},{enable:!1});")
+    );
+    assert!(patched_combined_str.contains("__swzGlobalIdFallback"));
+    assert!(
+        patch_asar_bundle(
+            "pc-dist/lazy/main-startup.89bb530b91927fd5dd28.js",
+            &patched_combined
+        )
+        .is_none()
+    );
+
+    // 2. Synthetic `lazy/default-login-main-startup-shared-worker-znotification.*.js` (`migrate_db_sf`)
+    let syn_lazy_shared = br#"async function bootAfterLogin(Be,Ge,Fe,t){await Be.waitForDBMigrate(Fe,t.config.settings.features.db_migrate,t.config.settings.features.full_disk_check);return await Ge.start(t.config.settings.features.migrate_db_sf)}"#;
+    let patched_lazy_shared = patch_asar_bundle(
+        "pc-dist/lazy/default-login-main-startup-shared-worker-znotification.4bb5e1e2c2e9bab4f7b3.js",
+        syn_lazy_shared,
+    )
+    .expect("lazy shared startup bundle with .start(*.migrate_db_sf) must be rewritten");
+    let patched_lazy_shared_str = std::str::from_utf8(&patched_lazy_shared).unwrap();
+    assert!(
+        patched_lazy_shared_str.contains(
+            ".start(Object.assign({},t.config.settings.features.migrate_db_sf||{},{enabled:!1}))"
+        ),
+        "unexpected migrate_db_sf rewrite: {patched_lazy_shared_str}"
+    );
+    assert!(
+        patch_asar_bundle(
+            "pc-dist/lazy/default-login-main-startup-shared-worker-znotification.4bb5e1e2c2e9bab4f7b3.js",
+            &patched_lazy_shared
+        )
+        .is_none(),
+        "migrate_db_sf bundle patch must be idempotent"
+    );
+
+    // Execute both rewritten synthetic bundles in live `node` to verify runtime semantics
+    let eval_res = run_node_json(&format!(
+        r#"
+        (async () => {{
+          {patched_main_str}
+          {patched_lazy_shared_str}
+          const ctl = new MigrateController();
+          const frozenServerCfg = Object.freeze({{ enable: true, batchSize: 200 }});
+          const r1 = ctl.waitForDBMigrate('u_1', frozenServerCfg, {{ minFree: 100 }});
+          const r2 = ctl.waitForDBMigrate('u_1', undefined, null);
+          let sfArg1 = null;
+          let sfArg2 = null;
+          await bootAfterLogin(
+            {{ waitForDBMigrate: async () => false }},
+            {{ start: async (cfg) => {{ sfArg1 = cfg; return cfg; }} }},
+            'u_1',
+            {{ config: {{ settings: {{ features: {{ db_migrate: {{ enable: true }}, full_disk_check: {{}}, migrate_db_sf: Object.freeze({{ enabled: true, min_base_space: 512 }}) }} }} }} }}
+          );
+          await bootAfterLogin(
+            {{ waitForDBMigrate: async () => false }},
+            {{ start: async (cfg) => {{ sfArg2 = cfg; return cfg; }} }},
+            'u_1',
+            {{ config: {{ settings: {{ features: {{}} }} }} }}
+          );
+          console.log(JSON.stringify({{
+            callerUnmutated: frozenServerCfg.enable === true,
+            r1Cfg: r1.cfg,
+            r2Cfg: r2.cfg,
+            sfArg1,
+            sfArg2,
+          }}));
+        }})();
+        "#
+    ));
+    assert_eq!(eval_res["callerUnmutated"], json!(true));
+    assert_eq!(
+        eval_res["r1Cfg"],
+        json!({ "enable": false, "batchSize": 200 })
+    );
+    assert_eq!(eval_res["r2Cfg"], json!({ "enable": false }));
+    assert_eq!(
+        eval_res["sfArg1"],
+        json!({ "enabled": false, "min_base_space": 512 })
+    );
+    assert_eq!(eval_res["sfArg2"], json!({ "enabled": false }));
+
+    // 3. Untouched lazy chunks must return `None` (zero-copy MmapSlice preserved), even if a fast needle substring appears harmlessly
+    for (chunk_path, chunk_bytes) in [
+        (
+            "pc-dist/lazy/52.29e128365e7ed193665d.js",
+            &b"(window.webpackJsonp=window.webpackJsonp||[]).push([[52],{\"abc\":function(e,t){t.ok=1}}]);"[..],
+        ),
+        (
+            "pc-dist/lazy/55.deadbeef.js",
+            &b"const schemaName = \"migrate_db_sf\"; function helper(){ return createResizer(1); }"[..],
+        ),
+        (
+            "lazy/19.92f43961ee1401ebfbf7.js",
+            &b"function callSiteOnly(svc,f){ return svc.waitForDBMigrate(f.a, f.b, f.c); }"[..],
+        ),
+    ] {
+        assert!(
+            patch_asar_bundle(chunk_path, chunk_bytes).is_none(),
+            "untouched lazy chunk {chunk_path} must return None"
+        );
+    }
+
+    // 4. Live `~/.local/share/olaz/ZaloRuntime/current/Contents/Resources/app.asar` verification if present on disk
+    let live_asar_path = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|h| h.join(".local/share/olaz/ZaloRuntime/current/Contents/Resources/app.asar"))
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            let mgr = ZaloRuntimeManager::from_platform(&ZaloPlatform::default());
+            let p = mgr.current_dir().join("Contents/Resources/app.asar");
+            p.is_file().then_some(p)
+        });
+
+    if let Some(asar_path) = live_asar_path {
+        let asar = AsarArchive::open(&asar_path).expect("open live app.asar");
+        let check_syntax = |label: &str, js_bytes: &[u8]| {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(tmp.path(), js_bytes).unwrap();
+            let status = Command::new("node")
+                .arg("--check")
+                .arg(tmp.path())
+                .status()
+                .expect("node --check must execute");
+            assert!(status.success(), "JS syntax check failed for {label}");
+        };
+
+        let main_startup_paths: Vec<String> = asar
+            .paths_with_prefix("pc-dist/lazy/main-startup.")
+            .into_iter()
+            .filter(|p| p.ends_with(".js"))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            !main_startup_paths.is_empty(),
+            "expected pc-dist/lazy/main-startup.*.js in live app.asar"
+        );
+        for p in &main_startup_paths {
+            let raw = asar.read_or_unpacked(p).unwrap();
+            let patched = patch_asar_bundle(p, &raw)
+                .unwrap_or_else(|| panic!("expected {p} to be patched"));
+            let s = std::str::from_utf8(&patched).unwrap();
+            assert!(
+                s.contains("=Object.assign({},") && s.contains(",{enable:!1});"),
+                "expected waitForDBMigrate enable:!1 override in {p}"
+            );
+            check_syntax(p, &patched);
+            assert!(
+                patch_asar_bundle(p, &patched).is_none(),
+                "patch_asar_bundle must be idempotent on live {p}"
+            );
+        }
+
+        let shared_startup_paths: Vec<String> = asar
+            .paths_with_prefix(
+                "pc-dist/lazy/default-login-main-startup-shared-worker-znotification.",
+            )
+            .into_iter()
+            .filter(|p| p.ends_with(".js"))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            !shared_startup_paths.is_empty(),
+            "expected pc-dist/lazy/default-login-main-startup-shared-worker-znotification.*.js in live app.asar"
+        );
+        for p in &shared_startup_paths {
+            let raw = asar.read_or_unpacked(p).unwrap();
+            let patched = patch_asar_bundle(p, &raw)
+                .unwrap_or_else(|| panic!("expected {p} to be patched"));
+            let s = std::str::from_utf8(&patched).unwrap();
+            assert!(
+                s.contains(".migrate_db_sf||{},{enabled:!1}))"),
+                "expected migrate_db_sf enabled:!1 override in {p}"
+            );
+            check_syntax(p, &patched);
+            assert!(
+                patch_asar_bundle(p, &patched).is_none(),
+                "patch_asar_bundle must be idempotent on live {p}"
+            );
+        }
+
+        // Verify untouched numeric lazy chunks in the real archive still return `None`
+        let mut untouched_lazy_count = 0usize;
+        for p in asar.paths_with_prefix("pc-dist/lazy/") {
+            if !p.ends_with(".js") {
+                continue;
+            }
+            let raw = asar.read_or_unpacked(p).unwrap();
+            if patch_asar_bundle(p, &raw).is_none() {
+                untouched_lazy_count += 1;
+            }
+        }
+        assert!(
+            untouched_lazy_count > 0,
+            "expected untouched lazy chunks in live app.asar to return None for zero-copy MmapSlice"
+        );
+    }
+}
+
+#[test]
+fn database_config_normalization_strips_zalo_26_11_10_sqlite_migration_flags_and_resets_adp_st() {
+    let tmp = TempDir::new().unwrap();
+    let platform = ZaloPlatform::with_root(tmp.path(), "26.11.10");
+
+    let mut db_cfg = Map::new();
+    // Zalo 26.11.10 module `0W0H` & Snowflake SQLite migration latch keys (exact, prefixed, uppercase)
+    db_cfg.insert("db4-ftu-required".into(), json!(true));
+    db_cfg.insert("987654_db4-ftu-required".into(), json!(1));
+    db_cfg.insert("DB4-FTU-REQUIRED".into(), json!("1"));
+    db_cfg.insert("sf-mg-gate".into(), json!(true));
+    db_cfg.insert("987654_sf-mg-gate".into(), json!({ "passed": true }));
+    db_cfg.insert("ismigtin".into(), json!(true));
+    db_cfg.insert("987654_ismigtin".into(), json!(1));
+    db_cfg.insert("sqlite_m_d".into(), json!(true));
+    db_cfg.insert("987654_sqlite_m_d".into(), json!("done"));
+    db_cfg.insert("sqliteUpgradeRequired".into(), json!(true));
+
+    // Adapter state variants (`adp-st`)
+    db_cfg.insert(
+        "987654_adp-st".into(),
+        json!("{\"msg\":2,\"group\":1,\"friend\":0}"),
+    );
+    db_cfg.insert("111111_adp-st".into(), json!(2));
+    db_cfg.insert("222222_adp-st".into(), json!({ "chat": 1, "contact": 0 }));
+    db_cfg.insert("333333_adp-st".into(), json!("1"));
+
+    // Nested per-account map
+    db_cfg.insert(
+        "nestedAccount".into(),
+        json!({
+            "db4-ftu-required": true,
+            "u1_sf-mg-gate": 1,
+            "u1_ismigtin": true,
+            "u1_sqlite_m_d": 1,
+            "u1_adp-st": 3,
+            "safeNestedKey": "intact",
+        }),
+    );
+    db_cfg.insert("keepKey".into(), json!("preserved"));
+
+    platform.write_store("database-config", &db_cfg).unwrap();
+    platform.normalize_database_adapter_state();
+
+    let norm = platform.read_store("database-config");
+    for removed in [
+        "db4-ftu-required",
+        "987654_db4-ftu-required",
+        "DB4-FTU-REQUIRED",
+        "sf-mg-gate",
+        "987654_sf-mg-gate",
+        "ismigtin",
+        "987654_ismigtin",
+        "sqlite_m_d",
+        "987654_sqlite_m_d",
+        "sqliteUpgradeRequired",
+    ] {
+        assert!(
+            !norm.contains_key(removed),
+            "expected {removed} to be stripped from database-config.json"
+        );
+    }
+
+    assert_eq!(
+        norm.get("987654_adp-st"),
+        Some(&json!("{\"friend\":0,\"group\":0,\"msg\":0}"))
+    );
+    assert_eq!(norm.get("111111_adp-st"), Some(&json!(0)));
+    assert_eq!(
+        norm.get("222222_adp-st"),
+        Some(&json!({ "chat": 0, "contact": 0 }))
+    );
+    assert_eq!(norm.get("333333_adp-st"), Some(&json!(0)));
+    assert_eq!(
+        norm.get("nestedAccount"),
+        Some(&json!({
+            "u1_adp-st": 0,
+            "safeNestedKey": "intact",
+        }))
+    );
+    assert_eq!(norm.get("keepKey"), Some(&json!("preserved")));
+}
+
+#[test]
+fn anti_recall_worker_prelude_preserves_ev1_encrypted_fields_e2ee_3007_and_respects_olaz_idb_ar_guard(
+) {
+    let prelude = worker_prelude();
+    let script = format!(
+        r#"
+const vm = require('node:vm');
+
+(async () => {{
+  function makeAsyncReq(result) {{
+    const req = {{
+      readyState: 'pending',
+      result: undefined,
+      error: null,
+      onsuccess: null,
+      onerror: null,
+      _ls: {{ success: [], error: [] }},
+      addEventListener(t, fn) {{ if (this._ls[t]) this._ls[t].push(fn); }},
+    }};
+    setTimeout(() => {{
+      req.readyState = 'done';
+      req.result = result;
+      const ev = {{ type: 'success', target: req }};
+      for (const fn of req._ls.success) fn(ev);
+      if (typeof req.onsuccess === 'function') req.onsuccess(ev);
+    }}, 1);
+    return req;
+  }}
+
+  class MockIDBObjectStore {{
+    constructor(name, keyPath = 'msgId') {{
+      this.name = name;
+      this.keyPath = keyPath;
+      this.transaction = {{}};
+      this._rows = new Map();
+    }}
+    get(key) {{
+      return makeAsyncReq(this._rows.get(String(key)));
+    }}
+    put(val, explicitKey) {{
+      const k = String(explicitKey !== undefined ? explicitKey : val[this.keyPath || 'msgId']);
+      this._rows.set(k, JSON.parse(JSON.stringify(val)));
+      return makeAsyncReq(explicitKey !== undefined ? explicitKey : val[this.keyPath || 'msgId']);
+    }}
+    add(val, explicitKey) {{
+      return this.put(val, explicitKey);
+    }}
+  }}
+
+  // Part A: Run worker_prelude() on fresh IDBObjectStore -> sets __olazIdbAr = true and preserves ev:1 fields
+  const ctxA = {{
+    setTimeout,
+    clearTimeout,
+    Date,
+    JSON,
+    Object,
+    Array,
+    Number,
+    Boolean,
+    String,
+    Error,
+    IDBDatabase: class {{ transaction() {{ return {{ addEventListener() {{}} }}; }} }},
+    IDBFactory: class {{ open() {{ return makeAsyncReq(null); }} }},
+    IDBObjectStore: MockIDBObjectStore,
+    postMessage: () => {{}},
+    addEventListener: () => {{}},
+  }};
+  ctxA.self = ctxA;
+  ctxA.globalThis = ctxA;
+  vm.createContext(ctxA);
+  vm.runInContext({prelude:?}, ctxA);
+
+  const wrappedPutMarked = MockIDBObjectStore.prototype.put.__olazIdbAr === true;
+  const waitReq = (req) => new Promise((resolve, reject) => {{
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }});
+
+  const store = new MockIDBObjectStore('message', 'msgId');
+
+  // 1. ev: 1 AES-256-CBC encrypted message recalled with msgType: 20
+  await waitReq(store.put({{
+    msgId: 'm_ev_20',
+    msgType: 1,
+    ev: 1,
+    message: 'U2FsdGVkX1+encryptedBody20==',
+    z_parsedTokens: 'encTokens20==',
+    dName: 'encSender20==',
+    previewThumb: 'data:image/jpeg;base64,thumb20',
+    dimension: {{ width: 1920, height: 1080 }},
+    quote: 'encQuote20==',
+    e2eeStatus: 1,
+    status: 0,
+  }}));
+  await waitReq(store.put({{
+    msgId: 'm_ev_20',
+    msgType: 20,
+    originMsgType: 'chat.undo',
+    ev: 0,
+    message: '[Tin nhắn đã được thu hồi]',
+    z_parsedTokens: null,
+    dName: 'PlainOverwrite',
+    previewThumb: '',
+    dimension: null,
+  }}));
+  const afterMsgType20 = await waitReq(store.get('m_ev_20'));
+
+  // 2. ev: 1 AES-256-CBC encrypted message recalled with e2eeStatus: 3007 (and msgType still 1!)
+  await waitReq(store.put({{
+    msgId: 'm_ev_3007',
+    msgType: 2,
+    ev: 1,
+    message: 'U2FsdGVkX1+encryptedPhotoCaption==',
+    z_parsedTokens: 'encTokens3007==',
+    dName: 'encSender3007==',
+    previewThumb: 'data:image/jpeg;base64,thumb3007',
+    dimension: {{ width: 800, height: 600 }},
+    e2eeStatus: 1,
+  }}));
+  await waitReq(store.put({{
+    msgId: 'm_ev_3007',
+    msgType: 2,
+    e2eeStatus: 3007,
+    ev: 0,
+    message: '',
+    z_parsedTokens: null,
+    dName: '',
+    previewThumb: null,
+    dimension: null,
+  }}));
+  const afterE2ee3007 = await waitReq(store.get('m_ev_3007'));
+
+  // 3. ev: 1 message recalled with status: -27
+  await waitReq(store.put({{
+    msgId: 'm_ev_status_neg27',
+    msgType: 1,
+    ev: 1,
+    message: 'U2FsdGVkX1+encryptedStatusMsg==',
+    z_parsedTokens: 'encTokensNeg27==',
+    dName: 'encSenderNeg27==',
+    previewThumb: 'data:image/jpeg;base64,thumbNeg27',
+    dimension: {{ width: 640, height: 480 }},
+    status: 0,
+  }}));
+  await waitReq(store.put({{
+    msgId: 'm_ev_status_neg27',
+    msgType: 1,
+    status: -27,
+    ev: 0,
+    message: '',
+  }}));
+  const afterStatusNeg27 = await waitReq(store.get('m_ev_status_neg27'));
+
+  // Part B: Pre-marking IDBObjectStore.prototype.put.__olazIdbAr = true prevents double-wrapping
+  let customPutCalls = 0;
+  function preWrappedPut(val) {{
+    customPutCalls += 1;
+    return makeAsyncReq(val);
+  }}
+  Object.defineProperty(preWrappedPut, '__olazIdbAr', {{ value: true }});
+  class PreMarkedIDBObjectStore {{}}
+  PreMarkedIDBObjectStore.prototype.put = preWrappedPut;
+  PreMarkedIDBObjectStore.prototype.add = function () {{}};
+
+  const ctxB = {{
+    setTimeout,
+    clearTimeout,
+    Object,
+    IDBDatabase: class {{ transaction() {{ return {{ addEventListener() {{}} }}; }} }},
+    IDBFactory: class {{ open() {{ return makeAsyncReq(null); }} }},
+    IDBObjectStore: PreMarkedIDBObjectStore,
+    postMessage: () => {{}},
+    addEventListener: () => {{}},
+  }};
+  ctxB.self = ctxB;
+  ctxB.globalThis = ctxB;
+  vm.createContext(ctxB);
+  vm.runInContext({prelude:?}, ctxB);
+
+  const notDoubleWrapped = PreMarkedIDBObjectStore.prototype.put === preWrappedPut;
+  new PreMarkedIDBObjectStore().put({{ msgId: 'x' }});
+
+  console.log(JSON.stringify({{
+    wrappedPutMarked,
+    afterMsgType20,
+    afterE2ee3007,
+    afterStatusNeg27,
+    notDoubleWrapped,
+    customPutCalls,
+  }}));
+  process.exit(0);
+}})();
+"#
+    );
+
+    let res = run_node_json(&script);
+    assert_eq!(res["wrappedPutMarked"], true);
+    assert_eq!(res["notDoubleWrapped"], true);
+    assert_eq!(res["customPutCalls"], 1);
+
+    assert_eq!(res["afterMsgType20"]["msgType"], 1);
+    assert_eq!(res["afterMsgType20"]["ev"], 1);
+    assert_eq!(
+        res["afterMsgType20"]["message"],
+        "U2FsdGVkX1+encryptedBody20=="
+    );
+    assert_eq!(res["afterMsgType20"]["z_parsedTokens"], "encTokens20==");
+    assert_eq!(res["afterMsgType20"]["dName"], "encSender20==");
+    assert_eq!(
+        res["afterMsgType20"]["previewThumb"],
+        "data:image/jpeg;base64,thumb20"
+    );
+    assert_eq!(
+        res["afterMsgType20"]["dimension"],
+        json!({ "width": 1920, "height": 1080 })
+    );
+    assert_eq!(res["afterMsgType20"]["quote"], "encQuote20==");
+    assert_eq!(res["afterMsgType20"]["__olazRecalled"], true);
+    assert_eq!(res["afterMsgType20"]["__olazPreserved"], true);
+
+    assert_eq!(res["afterE2ee3007"]["msgType"], 2);
+    assert_eq!(res["afterE2ee3007"]["ev"], 1);
+    assert_eq!(res["afterE2ee3007"]["e2eeStatus"], 1);
+    assert_eq!(
+        res["afterE2ee3007"]["message"],
+        "U2FsdGVkX1+encryptedPhotoCaption=="
+    );
+    assert_eq!(res["afterE2ee3007"]["z_parsedTokens"], "encTokens3007==");
+    assert_eq!(res["afterE2ee3007"]["dName"], "encSender3007==");
+    assert_eq!(
+        res["afterE2ee3007"]["previewThumb"],
+        "data:image/jpeg;base64,thumb3007"
+    );
+    assert_eq!(
+        res["afterE2ee3007"]["dimension"],
+        json!({ "width": 800, "height": 600 })
+    );
+    assert_eq!(res["afterE2ee3007"]["__olazRecalled"], true);
+
+    assert_eq!(res["afterStatusNeg27"]["ev"], 1);
+    assert_eq!(res["afterStatusNeg27"]["status"], 0);
+    assert_eq!(
+        res["afterStatusNeg27"]["message"],
+        "U2FsdGVkX1+encryptedStatusMsg=="
+    );
+    assert_eq!(
+        res["afterStatusNeg27"]["z_parsedTokens"],
+        "encTokensNeg27=="
+    );
+    assert_eq!(res["afterStatusNeg27"]["dName"], "encSenderNeg27==");
+    assert_eq!(res["afterStatusNeg27"]["__olazRecalled"], true);
+}
+
+
 

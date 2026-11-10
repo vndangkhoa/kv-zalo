@@ -2010,12 +2010,26 @@ function initializeSessionCryptoCore(root) {
   const SESSION_COOKIE_DOMAINS = ['zaloapp.com', 'zalo.me', 'chat.zalo.me'];
   const ZALO_COOKIE_CLEAR_DOMAINS = [
     'zalo.me',
+    'zalo.vn',
+    'zalo.ai',
     'zaloapp.com',
     'zadn.vn',
     'zdn.vn',
+    'z-cdn.me',
+    'dlfl.vn',
+    'dlfl.me',
+    'dlfl.info',
+    'flchat.vn',
+    'pchat.vn',
+    'dlmd.me',
+    'mdchat.me',
+    'zavi.me',
+    'zapps.vn',
     'zing.vn',
     'zingcdn.me',
-    'zalo.vn',
+    'zingmp3.vn',
+    'zingmp3.com',
+    'zingtv.vn',
   ];
 
   function normalizeHttpUrl(rawUrl) {
@@ -2646,14 +2660,25 @@ function initializeSessionCryptoCore(root) {
   // 9. Database Config Normalization (`crates/olaz-core/src/platform.rs:864-916`)
   // ==========================================================================
 
+  const STALE_DB_MIGRATION_SUFFIXES = [
+    'db4-ftu-required',
+    'sf-mg-gate',
+    'ismigtin',
+    'sqlite_m_d',
+  ];
+
   function normalizeDatabaseConfig(rawObj) {
     if (!rawObj || typeof rawObj !== 'object' || Array.isArray(rawObj)) return rawObj;
     const out = {};
     for (const [k, v] of Object.entries(rawObj)) {
-      if (k.toLowerCase().includes('upgraderequired')) {
-        continue; // drop upgradeRequired flags so Zalo stays on IndexedDB
+      const kl = k.toLowerCase();
+      if (
+        kl.includes('upgraderequired') ||
+        STALE_DB_MIGRATION_SUFFIXES.some((s) => kl === s || kl.endsWith(s))
+      ) {
+        continue; // drop upgradeRequired & SQLite migration flags so Zalo stays on IndexedDB
       }
-      if (k.endsWith('adp-st')) {
+      if (kl.endsWith('adp-st')) {
         if (typeof v === 'string') {
           try {
             const parsed = JSON.parse(v);
@@ -2720,6 +2745,7 @@ function initializeSessionCryptoCore(root) {
     KEYCHAIN_MIN_LEN,
     KeychainCipher,
     BrowserCookieJar,
+    ZALO_COOKIE_CLEAR_DOMAINS,
     ZALO_NOISE_SIGN,
     ZALO_NOISE_XOR_KEY,
     ZALO_NOISE_XOR_LEN,

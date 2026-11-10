@@ -157,11 +157,9 @@ impl AsarArchive {
         self.entry(path).is_some()
     }
 
-    /// Returns a zero-copy byte slice for a packed file inside the mapped archive.
-    ///
-    /// Percent-decodes `path` and strips any leading `/`. Returns `None` if the entry
-    /// is missing, marked `unpacked`, or out of bounds.
-    pub fn read(&self, path: &str) -> Option<&[u8]> {
+    /// Returns the validated `(start, end)` byte range inside the memory-mapped archive
+    /// for a packed file, or `None` if missing, marked `unpacked`, or out of bounds.
+    pub fn byte_range(&self, path: &str) -> Option<(usize, usize)> {
         let entry = self.entry(path)?;
         if entry.unpacked {
             return None;
@@ -171,7 +169,25 @@ impl AsarArchive {
         if end > self.mmap.len() {
             return None;
         }
-        Some(&self.mmap[start..end])
+        Some((start, end))
+    }
+
+    /// Returns a zero-copy byte slice for a validated `[start..end]` range in the mapped archive.
+    pub fn slice(&self, start: usize, end: usize) -> Option<&[u8]> {
+        if start <= end && end <= self.mmap.len() {
+            Some(&self.mmap[start..end])
+        } else {
+            None
+        }
+    }
+
+    /// Returns a zero-copy byte slice for a packed file inside the mapped archive.
+    ///
+    /// Percent-decodes `path` and strips any leading `/`. Returns `None` if the entry
+    /// is missing, marked `unpacked`, or out of bounds.
+    pub fn read(&self, path: &str) -> Option<&[u8]> {
+        let (start, end) = self.byte_range(path)?;
+        self.slice(start, end)
     }
 
     /// Reads either a zero-copy slice from the mapped archive or, if the entry is marked

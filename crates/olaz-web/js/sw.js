@@ -199,7 +199,17 @@ function registerSessionServiceWorker() {
     }
     const normPath = normalizeVfsPath(rest);
 
-    const record = await readVfsBlobFromIdb(slot, normPath);
+    let record = await readVfsBlobFromIdb(slot, normPath);
+    if (!record) {
+      syncEpochCursorQuota(2);
+      await new Promise((r) => setTimeout(r, 80));
+      record = await readVfsBlobFromIdb(slot, normPath);
+      if (!record) {
+        syncEpochCursorQuota(4);
+        await new Promise((r) => setTimeout(r, 150));
+        record = await readVfsBlobFromIdb(slot, normPath);
+      }
+    }
     if (!record || record.isDir) {
       return new Response('ENOENT', {
         status: 404,

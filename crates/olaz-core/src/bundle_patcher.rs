@@ -125,7 +125,7 @@ pub const WORKER_PRELUDE_BASE: &str = r#"(() => {
       };
     }
     const origPut = IDBObjectStore.prototype.put;
-    if (typeof origPut === 'function') {
+    if (typeof origPut === 'function' && !origPut.__olazIdbAr) {
       const callOrigPut = (store, val, k, hasKey) => {
         try {
           const r = hasKey && k !== undefined ? origPut.call(store, val, k) : origPut.call(store, val);
@@ -218,7 +218,13 @@ pub const WORKER_PRELUDE_BASE: &str = r#"(() => {
         const store = this;
         const hasKey = arguments.length >= 2 && key !== undefined;
         if (__olazAntiRecall && store && store.name === 'message' && value && typeof value === 'object' && typeof store.get === 'function') {
-          const isRecallTombstone = (Number(value.msgType) === 20 || Number(value.msgType) === -27 || value.originMsgType === 'chat.undo') && !value.__olazPreserved;
+          const isRecallTombstone = (
+            Number(value.msgType) === 20 ||
+            Number(value.msgType) === -27 ||
+            Number(value.e2eeStatus) === 3007 ||
+            Number(value.status) === -27 ||
+            value.originMsgType === 'chat.undo'
+          ) && !value.__olazPreserved;
           const isQuoteWiping = Boolean(value.quote && (Number(value.quote.cliMsgType) === 20 || Number(value.quote.cliMsgType) === -27) && !value.__olazQuoteChecked);
           if (isRecallTombstone || isQuoteWiping) {
             const lookupKey = key !== undefined
@@ -236,17 +242,29 @@ pub const WORKER_PRELUDE_BASE: &str = r#"(() => {
                   (prev) => {
                     let nextVal = value;
                     if (isRecallTombstone) {
-                      if (prev && Number(prev.msgType) !== 20 && Number(prev.msgType) !== -27 && prev.message !== undefined) {
+                      const prevIsTombstone = prev && !prev.__olazRecalled && (
+                        Number(prev.msgType) === 20 ||
+                        Number(prev.msgType) === -27 ||
+                        Number(prev.e2eeStatus) === 3007 ||
+                        Number(prev.status) === -27
+                      );
+                      if (prev && !prevIsTombstone && (prev.message !== undefined || prev.properties !== undefined || prev.thumb !== undefined || prev.previewThumb !== undefined || prev.localPath !== undefined)) {
                         nextVal = Object.assign({}, nextVal, {
                           msgType: prev.msgType,
                           message: prev.message,
+                          ev: prev.ev !== undefined ? prev.ev : value.ev,
+                          z_parsedTokens: prev.z_parsedTokens !== undefined ? prev.z_parsedTokens : value.z_parsedTokens,
+                          dName: prev.dName !== undefined ? prev.dName : value.dName,
+                          dimension: prev.dimension !== undefined ? prev.dimension : value.dimension,
+                          previewThumb: prev.previewThumb !== undefined ? prev.previewThumb : value.previewThumb,
                           properties: prev.properties !== undefined ? prev.properties : nextVal.properties,
                           thumb: prev.thumb || nextVal.thumb,
                           localPath: prev.localPath || nextVal.localPath,
                           folderPath: prev.folderPath || nextVal.folderPath,
-                          quote: prev.quote || nextVal.quote,
+                          quote: prev.quote !== undefined ? prev.quote : nextVal.quote,
                           mentions: prev.mentions || nextVal.mentions,
                           e2eeStatus: prev.e2eeStatus,
+                          status: prev.status !== undefined ? prev.status : (Number(value.status) === -27 ? undefined : value.status),
                           __olazPresalledType: Number(value.msgType),
                           __olazRecalled: true,
                           __olazRecalledAt: Date.now(),
@@ -257,7 +275,12 @@ pub const WORKER_PRELUDE_BASE: &str = r#"(() => {
                       }
                     }
                     if (nextVal.quote && (Number(nextVal.quote.cliMsgType) === 20 || Number(nextVal.quote.cliMsgType) === -27) && !nextVal.__olazQuoteChecked) {
-                      if (prev && prev.quote && Number(prev.quote.cliMsgType) !== 20 && Number(prev.quote.cliMsgType) !== -27 && prev.quote.msg) {
+                      if (prev && typeof prev.quote === 'string' && prev.quote.length > 0) {
+                        nextVal = Object.assign({}, nextVal, {
+                          quote: prev.quote,
+                          __olazQuoteChecked: true,
+                        });
+                      } else if (prev && prev.quote && typeof prev.quote === 'object' && Number(prev.quote.cliMsgType) !== 20 && Number(prev.quote.cliMsgType) !== -27 && prev.quote.msg) {
                         nextVal = Object.assign({}, nextVal, {
                           quote: Object.assign({}, prev.quote, { __olazQuoteRecalled: true }),
                           __olazQuoteChecked: true,
@@ -291,6 +314,7 @@ pub const WORKER_PRELUDE_BASE: &str = r#"(() => {
         }
         return callOrigPut(store, value, key, hasKey);
       };
+      Object.defineProperty(IDBObjectStore.prototype.put, '__olazIdbAr', { value: true });
     }
     const open = IDBFactory.prototype.open;
     IDBFactory.prototype.open = function (...a) {
@@ -4885,6 +4909,18 @@ static DRIVE_MIGRATION_FS_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("valid DriveMigrationService detectFilesystemSync regex")
 });
 
+static WAIT_FOR_DB_MIGRATE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"waitForDBMigrate\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\)\{"#,
+    )
+    .expect("valid waitForDBMigrate regex")
+});
+
+static MIGRATE_DB_SF_START_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\.start\(([A-Za-z_$][\w$.]*\.migrate_db_sf)\)"#)
+        .expect("valid migrate_db_sf start regex")
+});
+
 /// Applies `vndangkhoa/zalo-linux` renderer patches on-the-fly without altering `getClientType() == 23`:
 /// - Login titlebar `platform:"WIN32"` (`fa-Minus` + `fa-Close`)
 /// - Main `#titleBar` Windows controls (`Lock`, `Minus`, `Maximize`/`Minimize`, `Close`) + `"WIN32"` layout class
@@ -4896,6 +4932,7 @@ static DRIVE_MIGRATION_FS_RE: Lazy<Regex> = Lazy::new(|| {
 /// - General Settings Linux autostart + "Launch minimized to system tray" toggle (`STR_OLAZ_START_IN_TRAY`)
 /// - Client-side video thumbnail generation flag (`gen_video_thumb:{enable:!0}` + `NOT_SUPPORT` gate bypass)
 /// - Linux filesystem allowlist (`ext4`, `btrfs`, `xfs`, `f2fs`, `zfs`, `ntfs`) in `DriveMigrationService`
+/// - Post-login SQLite DB migration (`waitForDBMigrate` + `migrate_db_sf`) deterministic disable
 pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
     const FAST_NEEDLES: &[&[u8]] = &[
         b"handlerMinimiseAppWindowOS",
@@ -4922,6 +4959,8 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         b")throw{error_code:\"NOT_SUPPORT\"",
         b".NOT_SUPPORT",
         b"detectFilesystemSync",
+        b"waitForDBMigrate(",
+        b".migrate_db_sf",
     ];
     if !FAST_NEEDLES
         .iter()
@@ -5351,6 +5390,40 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
                 &s,
                 r#"(["ntfs","ext4","btrfs","xfs","f2fs","zfs"].includes(${1}))"#,
             )
+            .into_owned();
+        if next != s {
+            s = next;
+            changed = true;
+        }
+    }
+
+    // 17. Deterministically disable post-login SQLite DB migration (`waitForDBMigrate`) and
+    //     Snowflake SQLite alter-column migration (`migrate_db_sf`) so IndexedDB sessions never
+    //     race into `signalRestartAppToStartMigrate()` (`migratedb:signal_restart`).
+    if s.contains("waitForDBMigrate(") && WAIT_FOR_DB_MIGRATE_RE.is_match(&s) {
+        let cur = s.as_str();
+        let next = WAIT_FOR_DB_MIGRATE_RE
+            .replace_all(cur, |caps: &regex::Captures<'_>| {
+                let full = caps.get(0).unwrap();
+                let a1 = &caps[1];
+                let a2 = &caps[2];
+                let a3 = &caps[3];
+                let guard = format!("{a2}=Object.assign({{}},{a2}||{{}},{{enable:!1}});");
+                if cur[full.end()..].starts_with(&guard) {
+                    full.as_str().to_string()
+                } else {
+                    format!("waitForDBMigrate({a1},{a2},{a3}){{{guard}")
+                }
+            })
+            .into_owned();
+        if next != s {
+            s = next;
+            changed = true;
+        }
+    }
+    if s.contains(".migrate_db_sf") && MIGRATE_DB_SF_START_RE.is_match(&s) {
+        let next = MIGRATE_DB_SF_START_RE
+            .replace_all(&s, ".start(Object.assign({},${1}||{},{enabled:!1}))")
             .into_owned();
         if next != s {
             s = next;

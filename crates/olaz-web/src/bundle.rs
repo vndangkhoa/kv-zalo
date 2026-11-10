@@ -8,24 +8,36 @@
 //!   relaxes `<meta http-equiv="Content-Security-Policy">` for browser `blob: data: ws: wss: https:`,
 //!   defers Zalo `<script src="...">` tags behind `data-olaz-defer-src` until `window.__olazBootReady`
 //!   hydrates `IndexedDB`, and injects `/__olaz/{crypto_sync,bridge_table,preload}.js` in `<head>`
-//!   and `dal-worker.*.js`.
+//!   and Zalo Web Workers (`*-worker.*.js`, excluding `pdf-worker.*.js`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use bytes::Bytes;
 use once_cell::sync::Lazy;
 use olaz_core::bundle_patcher::{bridge_ipc_table, patch_asar_bundle, BRIDGE_GLOBALS};
 use olaz_core::{mime_for_path, AsarArchive};
+use parking_lot::{Mutex, RwLock};
 use regex::{Captures, Regex};
 use serde_json::{json, Value};
 
 /// Embedded pure-TypedArray browser crypto/vault/cookie/stream runtime (`js/crypto_sync.js`).
 pub const CRYPTO_SYNC_JS: &str = include_str!("../js/crypto_sync.js");
 
-/// Embedded browser preload, multi-account namespacer, PIN vault & relay client (`js/preload.js`).
-pub const PRELOAD_JS: &str = include_str!("../js/preload.js");
+/// Embedded browser preload, multi-account namespacer, PIN vault, media bridge,
+/// anti-recall & call recorder runtime (`js/{preload,media_bridge,anti_recall,call_recorder}.js`).
+pub const PRELOAD_JS: &str = concat!(
+    include_str!("../js/preload.js"),
+    "\n",
+    include_str!("../js/media_bridge.js"),
+    "\n",
+    include_str!("../js/anti_recall.js"),
+    "\n",
+    include_str!("../js/call_recorder.js"),
+);
 
 /// Embedded Service Worker serving `/__zfile/*` with HTTP `Range` (`206`) & denoising (`js/sw.js`).
 pub const SW_JS: &str = include_str!("../js/sw.js");
@@ -339,10 +351,78 @@ enum BundleBacking {
     Memory(Arc<BTreeMap<String, Vec<u8>>>),
 }
 
-/// Read-only static Zalo bundle asset provider with on-the-fly HTML & JS patching.
+/// Zero-copy or reference-counted immutable asset payload.
+///
+/// Cloning an [`AssetBytes`] only increments an atomic reference count (`Arc` or `Bytes`)
+/// and allocates **zero** heap bytes per HTTP request.
+#[derive(Clone)]
+pub enum AssetBytes {
+    /// Zero-copy slice directly into the memory-mapped read-only `app.asar` archive.
+    MmapSlice {
+        archive: Arc<AsarArchive>,
+        start: usize,
+        end: usize,
+    },
+    /// Reference-counted immutable buffer for transformed/patched assets or Dir/Memory backings.
+    Shared(Bytes),
+}
+
+impl std::fmt::Debug for AssetBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MmapSlice { start, end, .. } => f
+                .debug_struct("AssetBytes::MmapSlice")
+                .field("len", &end.saturating_sub(*start))
+                .finish(),
+            Self::Shared(b) => f
+                .debug_struct("AssetBytes::Shared")
+                .field("len", &b.len())
+                .finish(),
+        }
+    }
+}
+
+impl AsRef<[u8]> for AssetBytes {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::MmapSlice {
+                archive,
+                start,
+                end,
+            } => archive.slice(*start, *end).unwrap_or(&[]),
+            Self::Shared(b) => b.as_ref(),
+        }
+    }
+}
+
+impl Deref for AssetBytes {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+impl PartialEq<[u8]> for AssetBytes {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.as_ref() == other
+    }
+}
+
+impl PartialEq<Vec<u8>> for AssetBytes {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.as_ref() == other.as_slice()
+    }
+}
+
+/// Read-only static Zalo bundle asset provider with zero-copy ASAR slicing and cached patching.
 #[derive(Clone)]
 pub struct BundleProvider {
     backing: BundleBacking,
+    cache: Arc<RwLock<HashMap<String, ServedAsset>>>,
+    miss_gate: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for BundleProvider {
@@ -361,21 +441,27 @@ impl std::fmt::Debug for BundleProvider {
     }
 }
 
-/// Resolved bundle asset ready to serve over HTTP.
+/// Resolved bundle asset ready to serve over HTTP with zero per-request heap cloning.
 #[derive(Debug, Clone)]
 pub struct ServedAsset {
-    pub bytes: Vec<u8>,
-    pub content_type: String,
+    pub bytes: AssetBytes,
+    pub content_type: Arc<str>,
 }
 
 impl BundleProvider {
+    fn with_backing(backing: BundleBacking) -> Self {
+        Self {
+            backing,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            miss_gate: Arc::new(Mutex::new(())),
+        }
+    }
+
     /// Opens a read-only `app.asar` archive (`olaz_core::asar::AsarArchive::open`).
     pub fn from_asar(path: impl AsRef<Path>) -> Result<Self> {
         let archive = AsarArchive::open(path.as_ref())
             .with_context(|| format!("failed to open ASAR archive at {}", path.as_ref().display()))?;
-        Ok(Self {
-            backing: BundleBacking::Asar(Arc::new(archive)),
-        })
+        Ok(Self::with_backing(BundleBacking::Asar(Arc::new(archive))))
     }
 
     /// Opens a read-only asset directory on disk (useful for tests without a 100 MB `.asar`).
@@ -384,16 +470,12 @@ impl BundleProvider {
         if !p.is_dir() {
             bail!("bundle directory does not exist: {}", p.display());
         }
-        Ok(Self {
-            backing: BundleBacking::Dir(p.to_path_buf()),
-        })
+        Ok(Self::with_backing(BundleBacking::Dir(p.to_path_buf())))
     }
 
     /// Constructs a pure-RAM bundle provider from `(relative_path -> bytes)`.
     pub fn from_memory(files: BTreeMap<String, Vec<u8>>) -> Self {
-        Self {
-            backing: BundleBacking::Memory(Arc::new(files)),
-        }
+        Self::with_backing(BundleBacking::Memory(Arc::new(files)))
     }
 
     /// Automatically opens `path` as a directory if `path.is_dir()` or as an `AsarArchive` if it is a file.
@@ -406,39 +488,88 @@ impl BundleProvider {
         }
     }
 
-    /// Looks up `request_path`, applies bundle/HTML/worker patches in memory, and returns the asset.
+    /// Looks up `request_path`, applies bundle/HTML/worker patches once in memory, and returns
+    /// an [`AssetBytes`]-backed [`ServedAsset`] (`O(1)` atomic refcount clone on cache hits).
     pub fn get_asset(&self, request_path: &str) -> Option<ServedAsset> {
         let clean_rel = sanitize_relative_asset_path(request_path)?;
-        let candidates = if let Some(stripped) = clean_rel.strip_prefix("pc-dist/") {
-            vec![clean_rel.clone(), stripped.to_string()]
-        } else {
-            vec![format!("pc-dist/{clean_rel}"), clean_rel.clone()]
-        };
+        if let Some(hit) = self.cache.read().get(&clean_rel) {
+            return Some(hit.clone());
+        }
 
-        let (matched_rel, raw_bytes) = candidates
-            .into_iter()
-            .find_map(|cand| self.read_raw_candidate(&cand).map(|b| (cand, b)))?;
+        // Singleflight cold-miss gate prevents concurrent burst requests for 17+ MB bundles
+        // from running duplicate regex/string transforms simultaneously on cold boot.
+        let _guard = self.miss_gate.lock();
+        if let Some(hit) = self.cache.read().get(&clean_rel) {
+            return Some(hit.clone());
+        }
 
-        let patched = transform_bundle_asset(&matched_rel, &raw_bytes);
-        let content_type = detect_mime(&matched_rel);
-        Some(ServedAsset {
-            bytes: patched,
-            content_type,
-        })
+        let asset = self.load_and_transform_uncached(&clean_rel)?;
+        self.cache.write().insert(clean_rel, asset.clone());
+        Some(asset)
     }
 
-    fn read_raw_candidate(&self, rel: &str) -> Option<Vec<u8>> {
-        match &self.backing {
-            BundleBacking::Asar(archive) => archive.read(rel).map(|slice| slice.to_vec()),
-            BundleBacking::Dir(root) => {
-                let full = root.join(rel);
-                if !full.is_file() {
-                    return None;
+    fn load_and_transform_uncached(&self, clean_rel: &str) -> Option<ServedAsset> {
+        let candidates = if let Some(stripped) = clean_rel.strip_prefix("pc-dist/") {
+            [clean_rel.to_string(), stripped.to_string()]
+        } else {
+            [format!("pc-dist/{clean_rel}"), clean_rel.to_string()]
+        };
+
+        for cand in &candidates {
+            match &self.backing {
+                BundleBacking::Asar(archive) => {
+                    if let Some((start, end)) = archive.byte_range(cand) {
+                        let raw_slice = archive.slice(start, end)?;
+                        let bytes = match transform_bundle_asset_opt(cand, raw_slice) {
+                            Some(patched) => AssetBytes::Shared(Bytes::from(patched)),
+                            None => AssetBytes::MmapSlice {
+                                archive: Arc::clone(archive),
+                                start,
+                                end,
+                            },
+                        };
+                        return Some(ServedAsset {
+                            bytes,
+                            content_type: Arc::from(detect_mime(cand)),
+                        });
+                    }
+                    if let Some(cow) = archive.read_or_unpacked(cand) {
+                        let bytes = match transform_bundle_asset_opt(cand, &cow) {
+                            Some(patched) => AssetBytes::Shared(Bytes::from(patched)),
+                            None => AssetBytes::Shared(Bytes::from(cow.into_owned())),
+                        };
+                        return Some(ServedAsset {
+                            bytes,
+                            content_type: Arc::from(detect_mime(cand)),
+                        });
+                    }
                 }
-                std::fs::read(&full).ok()
+                BundleBacking::Dir(root) => {
+                    let full = root.join(cand);
+                    if full.is_file() {
+                        if let Ok(raw_vec) = std::fs::read(&full) {
+                            let final_vec =
+                                transform_bundle_asset_opt(cand, &raw_vec).unwrap_or(raw_vec);
+                            return Some(ServedAsset {
+                                bytes: AssetBytes::Shared(Bytes::from(final_vec)),
+                                content_type: Arc::from(detect_mime(cand)),
+                            });
+                        }
+                    }
+                }
+                BundleBacking::Memory(map) => {
+                    if let Some(raw_vec) = map.get(cand) {
+                        let final_vec = transform_bundle_asset_opt(cand, raw_vec)
+                            .unwrap_or_else(|| raw_vec.clone());
+                        return Some(ServedAsset {
+                            bytes: AssetBytes::Shared(Bytes::from(final_vec)),
+                            content_type: Arc::from(detect_mime(cand)),
+                        });
+                    }
+                }
             }
-            BundleBacking::Memory(map) => map.get(rel).cloned(),
         }
+        None
     }
 }
 
@@ -478,38 +609,56 @@ fn detect_mime(rel_path: &str) -> String {
         .to_string()
 }
 
-/// Applies `olaz_core::bundle_patcher::patch_asar_bundle` plus web-specific HTML/Worker transforms.
-pub fn transform_bundle_asset(rel_path: &str, raw_bytes: &[u8]) -> Vec<u8> {
+#[inline]
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Applies `olaz_core::bundle_patcher::patch_asar_bundle` plus web-specific HTML/Worker transforms,
+/// returning `Some(patched_bytes)` only when the asset actually requires modification, or `None`
+/// when the raw slice can be served zero-copy without allocating.
+pub fn transform_bundle_asset_opt(rel_path: &str, raw_bytes: &[u8]) -> Option<Vec<u8>> {
     let maybe_patched = patch_asar_bundle(rel_path, raw_bytes);
     let bytes: &[u8] = maybe_patched.as_deref().unwrap_or(raw_bytes);
-    let filename = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    let clean_path = rel_path.split(['?', '#']).next().unwrap_or(rel_path);
+    let filename = clean_path.rsplit('/').next().unwrap_or(clean_path);
     let lower_name = filename.to_ascii_lowercase();
 
     if lower_name.ends_with(".html") || lower_name.ends_with(".htm") {
         if let Ok(html) = std::str::from_utf8(bytes) {
-            return transform_zalo_html(html).into_bytes();
+            return Some(transform_zalo_html(html).into_bytes());
         }
     }
 
-    if lower_name.starts_with("dal-worker.") && lower_name.ends_with(".js") {
+    if lower_name.ends_with(".js")
+        && lower_name.contains("-worker.")
+        && !lower_name.starts_with("pdf-worker.")
+    {
         if let Ok(js) = std::str::from_utf8(bytes) {
             let rewritten = js.replace("zfile://local/", "/__zfile/");
             let mut out = String::with_capacity(WORKER_IMPORT_PREAMBLE.len() + rewritten.len());
             out.push_str(WORKER_IMPORT_PREAMBLE);
             out.push_str(&rewritten);
-            return out.into_bytes();
+            return Some(out.into_bytes());
         }
     }
 
-    if lower_name.ends_with(".js") || lower_name.ends_with(".css") {
+    if (lower_name.ends_with(".js") || lower_name.ends_with(".css"))
+        && contains_subslice(bytes, b"zfile://local/")
+    {
         if let Ok(text) = std::str::from_utf8(bytes) {
-            if text.contains("zfile://local/") {
-                return text.replace("zfile://local/", "/__zfile/").into_bytes();
-            }
+            return Some(text.replace("zfile://local/", "/__zfile/").into_bytes());
         }
     }
 
-    maybe_patched.unwrap_or_else(|| raw_bytes.to_vec())
+    maybe_patched
+}
+
+/// Applies `olaz_core::bundle_patcher::patch_asar_bundle` plus web-specific HTML/Worker transforms.
+pub fn transform_bundle_asset(rel_path: &str, raw_bytes: &[u8]) -> Vec<u8> {
+    transform_bundle_asset_opt(rel_path, raw_bytes).unwrap_or_else(|| raw_bytes.to_vec())
 }
 
 fn sanitize_profile_slot(raw: Option<&str>) -> Option<String> {
@@ -673,5 +822,205 @@ pub fn transform_zalo_html(html: &str) -> String {
         out
     } else {
         format!("{head_injection}{step3}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_import_preamble_injected_into_all_zalo_workers_except_pdf_worker() {
+        let sample_zd = br#"const u = "zfile://local/olaz-vfs/photo.jpg"; self.onmessage = () => {};"#;
+        for worker_path in [
+            "pc-dist/zd-worker.cfeba43a9a8e4e40dda3.js",
+            "pc-dist/dal-worker.cfeba43a9a8e4e40dda3.js",
+            "pc-dist/search-worker.cfeba43a9a8e4e40dda3.js",
+            "pc-dist/opfs-worker.cfeba43a9a8e4e40dda3.js",
+            "pc-dist/preview-thumb-worker.cfeba43a9a8e4e40dda3.js",
+            "pc-dist/mainless-worker.cfeba43a9a8e4e40dda3.js",
+            "pc-dist/cpu-heavy-worker.cfeba43a9a8e4e40dda3.js",
+            "pc-dist/trust-worker.cfeba43a9a8e4e40dda3.js",
+        ] {
+            let out = transform_bundle_asset_opt(worker_path, sample_zd)
+                .unwrap_or_else(|| panic!("expected {worker_path} to be transformed"));
+            let s = std::str::from_utf8(&out).unwrap();
+            assert!(
+                s.starts_with(WORKER_IMPORT_PREAMBLE),
+                "expected WORKER_IMPORT_PREAMBLE on {worker_path}, got: {s}"
+            );
+            assert!(
+                s.contains("/__zfile/olaz-vfs/photo.jpg") && !s.contains("zfile://local/"),
+                "expected zfile://local/ rewrite on {worker_path}"
+            );
+        }
+
+        // `sync-v2-sub-worker.*.js` must get BOTH `expose_webpack_require` (`self.__swReq=`) AND `WORKER_IMPORT_PREAMBLE`
+        let sw_raw = b"!function(modules){var a={};function r(n){return modules[n];}r.c={};r.e=function(e){var t=[],n=a[e];return t}}([]);";
+        let sw_out = transform_bundle_asset_opt(
+            "pc-dist/sync-v2-sub-worker.cfeba43a9a8e4e40dda3.js",
+            sw_raw,
+        )
+        .expect("sync-v2-sub-worker must be transformed");
+        let sw_str = std::str::from_utf8(&sw_out).unwrap();
+        assert!(sw_str.starts_with(WORKER_IMPORT_PREAMBLE));
+        assert!(sw_str.contains("self.__swReq=r;"));
+
+        // `pdf-worker.*.js` must NOT receive `WORKER_IMPORT_PREAMBLE`
+        let pdf_raw = b"self.pdfjsWorker = true;";
+        assert!(
+            transform_bundle_asset_opt("pc-dist/pdf-worker.cfeba43a9a8e4e40dda3.js", pdf_raw)
+                .is_none(),
+            "untouched pdf-worker.*.js must remain None (zero-copy) without WORKER_IMPORT_PREAMBLE"
+        );
+        let pdf_transformed =
+            transform_bundle_asset("pc-dist/pdf-worker.cfeba43a9a8e4e40dda3.js", pdf_raw);
+        assert_eq!(pdf_transformed, pdf_raw);
+    }
+
+    #[test]
+    fn sw_js_retries_delayed_idb_writes_before_returning_404() {
+        let harness = r#"
+          const fs = require('node:fs');
+          const vm = require('node:vm');
+          const assert = require('node:assert/strict');
+          const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+
+          (async () => {
+            const stores = new Map();
+            let getAttempts = 0;
+
+            const fakeIndexedDB = {
+              open(dbName) {
+                const req = {};
+                queueMicrotask(() => {
+                  const dbMap = stores.get(dbName) || new Map();
+                  stores.set(dbName, dbMap);
+                  req.result = {
+                    objectStoreNames: { contains: () => true },
+                    createObjectStore() {},
+                    close() {},
+                    transaction() {
+                      return {
+                        objectStore() {
+                          return {
+                            get(key) {
+                              getAttempts += 1;
+                              const g = {};
+                              queueMicrotask(() => {
+                                g.result = dbMap.get(key);
+                                if (g.onsuccess) g.onsuccess();
+                              });
+                              return g;
+                            },
+                          };
+                        },
+                      };
+                    },
+                  };
+                  if (req.onsuccess) req.onsuccess();
+                });
+                return req;
+              },
+            };
+
+            let fetchHandler = null;
+            const swScope = {
+              URL,
+              Uint8Array,
+              ArrayBuffer,
+              DataView,
+              TextEncoder,
+              TextDecoder,
+              crypto: globalThis.crypto,
+              Blob,
+              Response,
+              Headers,
+              Request,
+              queueMicrotask,
+              setTimeout,
+              clearTimeout,
+              console,
+              location: { origin: 'http://127.0.0.1:8080' },
+              indexedDB: fakeIndexedDB,
+              clients: { claim: () => Promise.resolve() },
+              skipWaiting: () => Promise.resolve(),
+              importScripts: () => {
+                vm.runInContext(input.cryptoJs, swScope, { filename: 'crypto_sync.js' });
+              },
+              addEventListener(type, fn) {
+                if (type === 'fetch') fetchHandler = fn;
+              },
+            };
+            swScope.self = swScope;
+            swScope.globalThis = swScope;
+            vm.createContext(swScope);
+            vm.runInContext(input.swJs, swScope, { filename: 'sw.js' });
+
+            function dispatchZfile(path) {
+              return new Promise((resolve) => {
+                fetchHandler({
+                  request: new Request('http://127.0.0.1:8080' + path),
+                  respondWith: (p) => resolve(p),
+                });
+              });
+            }
+
+            // 1) Delayed commit at 30ms -> resolved by 80ms first retry (2 attempts total)
+            getAttempts = 0;
+            setTimeout(() => {
+              const m = stores.get('olaz_vfs_v1__acc1') || new Map();
+              m.set('/photos/late1.jpg', { path: '/photos/late1.jpg', mime: 'image/jpeg', data: new Uint8Array([1, 2, 3, 4]) });
+              stores.set('olaz_vfs_v1__acc1', m);
+            }, 30);
+            const r1 = await dispatchZfile('/__zfile/@slot/acc1/photos/late1.jpg');
+            assert.equal(r1.status, 200);
+            assert.equal(getAttempts, 2);
+
+            // 2) Delayed commit at 120ms -> resolved by 150ms second retry (3 attempts total)
+            getAttempts = 0;
+            setTimeout(() => {
+              const m = stores.get('olaz_vfs_v1__acc1') || new Map();
+              m.set('/photos/late2.jpg', { path: '/photos/late2.jpg', mime: 'image/jpeg', data: new Uint8Array([9, 8, 7]) });
+              stores.set('olaz_vfs_v1__acc1', m);
+            }, 120);
+            const r2 = await dispatchZfile('/__zfile/@slot/acc1/photos/late2.jpg');
+            assert.equal(r2.status, 200);
+            assert.equal(getAttempts, 3);
+
+            // 3) Truly missing file -> 3 attempts (0ms, +80ms, +150ms) then 404
+            getAttempts = 0;
+            const r3 = await dispatchZfile('/__zfile/@slot/acc1/photos/missing.jpg');
+            assert.equal(r3.status, 404);
+            assert.equal(getAttempts, 3);
+          })().catch((e) => {
+            console.error(e);
+            process.exit(1);
+          });
+        "#;
+
+        let mut child = std::process::Command::new("node")
+            .arg("-e")
+            .arg(harness)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn node");
+        {
+            use std::io::Write;
+            let payload = serde_json::to_vec(&json!({
+                "cryptoJs": CRYPTO_SYNC_JS,
+                "swJs": SW_JS,
+            }))
+            .unwrap();
+            child.stdin.take().unwrap().write_all(&payload).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "sw.js retry test failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

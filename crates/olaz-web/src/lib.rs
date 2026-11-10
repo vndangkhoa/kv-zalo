@@ -20,8 +20,9 @@ pub use allowlist::{
 };
 pub use auth::{AuthGate, GATE_COOKIE_NAME, GATE_COOKIE_TTL_SECS, UNLOCK_PAGE_HTML};
 pub use bundle::{
-    transform_bundle_asset, transform_zalo_html, web_bridge_spec_script, BundleProvider,
-    ServedAsset, BOOT_HTML, CRYPTO_SYNC_JS, PRELOAD_JS, SW_JS,
+    transform_bundle_asset, transform_bundle_asset_opt, transform_zalo_html,
+    web_bridge_spec_script, AssetBytes, BundleProvider, ServedAsset, BOOT_HTML, CRYPTO_SYNC_JS,
+    PRELOAD_JS, SW_JS,
 };
 pub use relay::{
     PrefixedTcpStream, StatelessRelay, DEFAULT_WS_ORIGIN, ZALO_APP_VERSION, ZALO_CLIENT_TYPE,

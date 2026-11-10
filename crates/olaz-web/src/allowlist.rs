@@ -2,8 +2,8 @@
 //!
 //! Enforces three layers of protection before any outbound TCP/TLS socket is opened:
 //! 1. **Scheme check**: strictly `https` (HTTP/media) or `wss` (WebSocket) in production.
-//! 2. **Domain allowlist**: exact or subdomain match on `.zalo.me`, `.zaloapp.com`,
-//!    `.zadn.vn`, `.zdn.vn`, `.zing.vn`.
+//! 2. **Domain allowlist**: exact or subdomain match on [`ALLOWED_ZALO_SUFFIXES`]
+//!    (Zalo API, WebSocket, photo/file/video/GIF CDNs, Zavi, and Zing media domains).
 //! 3. **Public IP verification**: resolves the host and rejects loopback (`127.0.0.0/8`, `::1`),
 //!    RFC1918 private (`10/8`, `172.16/12`, `192.168/16`), link-local (`169.254/16`, `fe80::/10`),
 //!    CGNAT (`100.64/10`), ULA (`fc00::/7`), multicast, broadcast, documentation, and unspecified
@@ -19,12 +19,28 @@ use thiserror::Error;
 use url::Url;
 
 /// Exact domain suffixes permitted through the stateless Zalo web relay.
-pub const ALLOWED_ZALO_SUFFIXES: [&str; 5] = [
+pub const ALLOWED_ZALO_SUFFIXES: [&str; 21] = [
     "zalo.me",
+    "zalo.vn",
+    "zalo.ai",
     "zaloapp.com",
     "zadn.vn",
     "zdn.vn",
+    "z-cdn.me",
+    "dlfl.vn",
+    "dlfl.me",
+    "dlfl.info",
+    "flchat.vn",
+    "pchat.vn",
+    "dlmd.me",
+    "mdchat.me",
+    "zavi.me",
+    "zapps.vn",
     "zing.vn",
+    "zingcdn.me",
+    "zingmp3.vn",
+    "zingmp3.com",
+    "zingtv.vn",
 ];
 
 /// Configuration for [`AllowlistValidator`].
@@ -379,5 +395,110 @@ impl Resolve for AllowlistValidator {
             let iter: Addrs = Box::new(addrs.into_iter());
             Ok(iter)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn allowlist_permits_zalo_26_11_10_media_file_video_and_ws_domains_and_blocks_non_zalo_or_private_ips(
+    ) {
+        for suffix in ALLOWED_ZALO_SUFFIXES {
+            assert!(
+                is_allowed_zalo_domain(suffix),
+                "exact suffix {suffix} must be allowed"
+            );
+        }
+
+        let public_ip = IpAddr::V4(Ipv4Addr::new(203, 119, 9, 10));
+        let mut dns_overrides = HashMap::new();
+        for host in [
+            "f12-zpcloud.zdn.vn",
+            "b2.dlfl.vn",
+            "v1.dlmd.me",
+            "p1.flchat.vn",
+            "c1.pchat.vn",
+            "m1.mdchat.me",
+            "media-ten.z-cdn.me",
+            "ws.zavi.me",
+        ] {
+            assert!(
+                is_allowed_zalo_domain(host),
+                "expected {host} to match ALLOWED_ZALO_SUFFIXES"
+            );
+            dns_overrides.insert(host.to_string(), vec![public_ip]);
+        }
+        dns_overrides.insert(
+            "rebind.dlfl.vn".to_string(),
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))],
+        );
+
+        let validator = AllowlistValidator::new(AllowlistConfig {
+            allow_loopback_upstream_for_tests: false,
+            dns_overrides,
+        });
+
+        for url in [
+            "https://f12-zpcloud.zdn.vn/jpg/encrypted-photo.jpg",
+            "https://b2.dlfl.vn/dl/hd-attachment.bin",
+            "https://v1.dlmd.me/stream/video.mp4",
+            "https://p1.flchat.vn/file/doc.pdf",
+            "https://c1.pchat.vn/photo/thumb.jpg",
+            "https://m1.mdchat.me/media/clip.mp4",
+            "https://media-ten.z-cdn.me/gif/sticker.gif",
+        ] {
+            let (_, addrs) = validator
+                .validate_http_target(url)
+                .await
+                .unwrap_or_else(|e| panic!("expected {url} to be permitted, got {e}"));
+            assert_eq!(addrs, vec![SocketAddr::new(public_ip, 443)]);
+        }
+
+        let (_, ws_addrs) = validator
+            .validate_ws_target("wss://ws.zavi.me/ws")
+            .await
+            .expect("wss://ws.zavi.me/ws must be permitted");
+        assert_eq!(ws_addrs, vec![SocketAddr::new(public_ip, 443)]);
+
+        // Arbitrary & suffix-spoofed external hosts must fail with DisallowedHost
+        for bad_url in [
+            "https://evil.com/payload",
+            "https://dlfl.vn.evil.com/payload",
+            "https://notzdn.vn/payload",
+        ] {
+            assert!(
+                matches!(
+                    validator.validate_http_target(bad_url).await,
+                    Err(AllowlistError::DisallowedHost(_))
+                ),
+                "expected DisallowedHost for {bad_url}"
+            );
+        }
+        assert!(matches!(
+            validator
+                .validate_ws_target("wss://dlfl.vn.evil.com/ws")
+                .await,
+            Err(AllowlistError::DisallowedHost(_))
+        ));
+
+        // Private / loopback / link-local / CGNAT IPs (literal or via DNS rebinding) must fail with DisallowedIp
+        for bad_ip_url in [
+            "https://127.0.0.1/secret",
+            "https://10.0.0.1/secret",
+            "https://192.168.1.1/secret",
+            "https://169.254.169.254/latest/meta-data",
+            "https://100.64.0.1/cgnat",
+            "https://rebind.dlfl.vn/rebound",
+        ] {
+            assert!(
+                matches!(
+                    validator.validate_http_target(bad_ip_url).await,
+                    Err(AllowlistError::DisallowedIp(_))
+                ),
+                "expected DisallowedIp for {bad_ip_url}"
+            );
+        }
     }
 }

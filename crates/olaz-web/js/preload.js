@@ -66,12 +66,26 @@ function bootstrapSessionRuntime(globalScope) {
   const PBKDF2_ITERATIONS = 600000;
   const ZALO_RELAY_SUFFIXES = [
     'zalo.me',
+    'zalo.vn',
+    'zalo.ai',
     'zaloapp.com',
     'zadn.vn',
     'zdn.vn',
+    'z-cdn.me',
+    'dlfl.vn',
+    'dlfl.me',
+    'dlfl.info',
+    'flchat.vn',
+    'pchat.vn',
+    'dlmd.me',
+    'mdchat.me',
+    'zavi.me',
+    'zapps.vn',
     'zing.vn',
     'zingcdn.me',
-    'zalo.vn',
+    'zingmp3.vn',
+    'zingmp3.com',
+    'zingtv.vn',
   ];
 
   // ==========================================================================
@@ -129,6 +143,118 @@ function bootstrapSessionRuntime(globalScope) {
     if (!rawLocalStorage || !rawStorageMethods) return;
     rawStorageMethods.removeItem.call(rawLocalStorage, k);
   }
+  function rawSsGet(k) {
+    if (!rawSessionStorage || !rawStorageMethods) return null;
+    return rawStorageMethods.getItem.call(rawSessionStorage, k);
+  }
+  function rawSsSet(k, v) {
+    if (!rawSessionStorage || !rawStorageMethods) return;
+    rawStorageMethods.setItem.call(rawSessionStorage, k, String(v));
+  }
+  function rawSsRemove(k) {
+    if (!rawSessionStorage || !rawStorageMethods) return;
+    rawStorageMethods.removeItem.call(rawSessionStorage, k);
+  }
+
+  function isOlazProtectedHostNode(node) {
+    if (!node || typeof node !== 'object') return false;
+    const id = node.id;
+    return id === '__olaz-privacy-pill-host' || id === '__olaz-vault-unlock-overlay';
+  }
+
+  function isInsideOlazUiEvent(ev) {
+    if (!ev || typeof ev !== 'object') return false;
+    try {
+      if (isOlazProtectedHostNode(ev.target)) return true;
+      if (typeof ev.composedPath === 'function') {
+        const path = ev.composedPath();
+        if (Array.isArray(path)) {
+          for (let i = 0; i < path.length; i++) {
+            if (isOlazProtectedHostNode(path[i])) return true;
+          }
+        }
+      }
+    } catch {}
+    return false;
+  }
+
+  function shieldShadowRootEvents(shadowRoot) {
+    if (!shadowRoot || typeof shadowRoot.addEventListener !== 'function') return;
+    const stopBubble = (ev) => {
+      if (ev && typeof ev.stopPropagation === 'function') {
+        ev.stopPropagation();
+      }
+    };
+    stopBubble.__olazInternal = true;
+    for (const evType of ['keydown', 'keyup', 'keypress', 'input', 'paste', 'copy', 'cut']) {
+      shadowRoot.addEventListener(evType, stopBubble, false);
+    }
+  }
+
+  function installHeadInputFocusCaptureShield() {
+    if (!IS_WINDOW) return;
+    const shieldedTypes = new Set(['keydown', 'keyup', 'keypress', 'focus', 'focusin']);
+    for (const targetObj of [window, document]) {
+      if (
+        !targetObj ||
+        typeof targetObj.addEventListener !== 'function' ||
+        typeof targetObj.removeEventListener !== 'function' ||
+        targetObj.addEventListener.__olazShielded
+      ) {
+        continue;
+      }
+      const origAdd = targetObj.addEventListener;
+      const origRemove = targetObj.removeEventListener;
+      const wrapperMap = typeof WeakMap === 'function' ? new WeakMap() : null;
+
+      const wrapListener = (listener, createIfMissing) => {
+        if (!listener || (typeof listener !== 'function' && typeof listener !== 'object')) {
+          return listener;
+        }
+        if (listener.__olazInternal === true) return listener;
+        if (!wrapperMap) return listener;
+        let wrapped = wrapperMap.get(listener);
+        if (!wrapped && createIfMissing) {
+          wrapped = function (ev) {
+            if (ev && shieldedTypes.has(ev.type) && isInsideOlazUiEvent(ev)) {
+              return;
+            }
+            if (typeof listener === 'function') {
+              return listener.call(this, ev);
+            }
+            if (listener && typeof listener.handleEvent === 'function') {
+              return listener.handleEvent(ev);
+            }
+          };
+          wrapperMap.set(listener, wrapped);
+        }
+        return wrapped || listener;
+      };
+
+      const shieldedAdd = function (type, listener, options) {
+        if (shieldedTypes.has(String(type)) && listener && !listener.__olazInternal) {
+          return origAdd.call(this, type, wrapListener(listener, true), options);
+        }
+        return origAdd.call(this, type, listener, options);
+      };
+      shieldedAdd.__olazShielded = true;
+
+      const shieldedRemove = function (type, listener, options) {
+        if (shieldedTypes.has(String(type)) && listener && wrapperMap && wrapperMap.has(listener)) {
+          origRemove.call(this, type, wrapperMap.get(listener), options);
+        }
+        return origRemove.call(this, type, listener, options);
+      };
+      shieldedRemove.__olazShielded = true;
+
+      try {
+        targetObj.addEventListener = shieldedAdd;
+        targetObj.removeEventListener = shieldedRemove;
+      } catch {}
+    }
+  }
+
+  installHeadInputFocusCaptureShield();
 
   // ==========================================================================
   // 2. Profile Slot Detection & Multi-Account Browser Namespacing
@@ -419,7 +545,17 @@ function bootstrapSessionRuntime(globalScope) {
           : scriptURL instanceof URL
             ? appendWorkerRuntimeParams(scriptURL.href)
             : scriptURL;
-      return options !== undefined ? new NativeWorker(nextUrl, options) : new NativeWorker(nextUrl);
+      const w =
+        options !== undefined ? new NativeWorker(nextUrl, options) : new NativeWorker(nextUrl);
+      try {
+        w.addEventListener('message', (ev) => {
+          const d = ev && ev.data;
+          if (d && typeof d === 'object' && typeof d.__olazLog === 'string') {
+            ev.stopImmediatePropagation();
+          }
+        });
+      } catch {}
+      return w;
     };
     WrappedWorker.prototype = NativeWorker.prototype;
     Object.setPrototypeOf(WrappedWorker, NativeWorker);
@@ -451,6 +587,210 @@ function bootstrapSessionRuntime(globalScope) {
   });
   globalScope.__olazCookieJar = cookieJar;
 
+  const VFS_USER_DATA = '/Users/olaz/Library/Application Support/ZaloPC';
+  const VFS_DOCUMENTS = '/Users/olaz/Documents';
+  const VFS_DOWNLOADS = '/Users/olaz/Downloads';
+  const VFS_TEMP = '/tmp/olaz';
+
+  function normPosixPath(raw) {
+    const s = String(raw || '').replace(/\\/g, '/').replace(/^file:\/+/i, '/');
+    const parts = s.split('/');
+    const stack = [];
+    for (const p of parts) {
+      if (!p || p === '.') continue;
+      if (p === '..') {
+        stack.pop();
+        continue;
+      }
+      stack.push(p);
+    }
+    return '/' + stack.join('/');
+  }
+
+  function decodeBridgeWireResult(val) {
+    if (!val || typeof val !== 'object') return val;
+    if (val.__undefined === true) return undefined;
+    if (typeof val.__bytes === 'string') {
+      const u8 = core.decodeBase64Forgiving(val.__bytes);
+      return val.__arraybuffer
+        ? u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength)
+        : u8;
+    }
+    return val;
+  }
+
+  const posixPath = {
+    sep: '/',
+    delimiter: ':',
+    normalize: (p) => normPosixPath(p),
+    join: (...segs) => normPosixPath(segs.filter(Boolean).join('/')),
+    resolve: (...segs) => normPosixPath('/' + segs.filter(Boolean).join('/')),
+    dirname: (p) => {
+      const n = normPosixPath(p);
+      const i = n.lastIndexOf('/');
+      return i <= 0 ? '/' : n.slice(0, i);
+    },
+    basename: (p, ext) => {
+      const n = normPosixPath(p);
+      let b = n.slice(n.lastIndexOf('/') + 1);
+      if (ext && b.endsWith(ext)) b = b.slice(0, -ext.length);
+      return b;
+    },
+    extname: (p) => {
+      const b = posixPath.basename(p);
+      const i = b.lastIndexOf('.');
+      return i <= 0 ? '' : b.slice(i);
+    },
+    isAbsolute: (p) => String(p || '').startsWith('/'),
+    relative: (from, to) => {
+      const f = posixPath.resolve(from).split('/').filter(Boolean);
+      const t = posixPath.resolve(to).split('/').filter(Boolean);
+      let i = 0;
+      while (i < f.length && i < t.length && f[i] === t[i]) i++;
+      return [...Array(f.length - i).fill('..'), ...t.slice(i)].join('/');
+    },
+    parse: (p) => {
+      const dir = posixPath.dirname(p);
+      const base = posixPath.basename(p);
+      const ext = posixPath.extname(p);
+      return { root: '/', dir, base, ext, name: ext ? base.slice(0, -ext.length) : base };
+    },
+    format: (o) => {
+      const obj = o && typeof o === 'object' ? o : {};
+      const dir = obj.dir || obj.root || '';
+      const base = obj.base || (obj.name || '') + (obj.ext || '');
+      return dir ? (dir === obj.root ? dir + base : dir + '/' + base) : base;
+    },
+    toNamespacedPath: (p) => p,
+  };
+  posixPath.posix = posixPath;
+
+  function createZnodeOs(existingInfo) {
+    const osInfo = existingInfo || {
+      release: '22.6.0',
+      version: 'Darwin Kernel Version 22.6.0',
+      arch: 'x64',
+      hostname: 'OlazWeb',
+      homedir: '/Users/olaz',
+      tmpdir: VFS_TEMP,
+      totalmem: 8 * 1024 * 1024 * 1024,
+      freemem: 4 * 1024 * 1024 * 1024,
+      cpus: (globalScope.navigator && globalScope.navigator.hardwareConcurrency) || 4,
+      uptime: 3600,
+      username: 'olaz',
+    };
+    return {
+      platform: () => 'darwin',
+      type: () => 'Darwin',
+      release: () => osInfo.release || '22.6.0',
+      version: () => osInfo.version || 'Darwin Kernel Version 22.6.0',
+      arch: () => 'x64',
+      hostname: () => osInfo.hostname || 'OlazWeb',
+      homedir: () => '/Users/olaz',
+      tmpdir: () => VFS_TEMP,
+      endianness: () => 'LE',
+      EOL: '\n',
+      totalmem: () => osInfo.totalmem,
+      freemem: () => osInfo.freemem,
+      uptime: () => osInfo.uptime || 3600,
+      loadavg: () => [0, 0, 0],
+      cpus: () =>
+        Array.from({ length: osInfo.cpus || 4 }, () => ({
+          model: 'BrowserVCPU',
+          speed: 2400,
+          times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
+        })),
+      userInfo: () => ({ username: 'olaz', uid: 1000, gid: 1000, shell: '/bin/sh', homedir: '/Users/olaz' }),
+      networkInterfaces: () => ({}),
+    };
+  }
+
+  const znodeUrl = {
+    URL,
+    URLSearchParams,
+    pathToFileURL: (p) => new URL('file://' + normPosixPath(p)),
+    fileURLToPath: (u) => normPosixPath(typeof u === 'string' ? u : u.pathname),
+  };
+
+  const znodeCrypto = {
+    encrypt: (...a) => decodeBridgeWireResult(cryptoBridge.dispatchSync('encrypt', a)),
+    decrypt: (...a) => decodeBridgeWireResult(cryptoBridge.dispatchSync('decrypt', a)),
+    hash: (...a) => decodeBridgeWireResult(cryptoBridge.dispatchSync('hash', a)),
+    randomBytes: (n) => core.csprngBytes(n),
+    createHash: (alg) => {
+      const h = cryptoBridge.hashCreate([alg]);
+      return {
+        update(data, enc) {
+          cryptoBridge.hashUpdate([h, data, enc]);
+          return this;
+        },
+        digest(enc) {
+          return decodeBridgeWireResult(cryptoBridge.hashDigest([h, enc]));
+        },
+      };
+    },
+    createHmac: (alg, key) => {
+      const chunks = [];
+      const keyBytes = core.decodeInput(key, 'utf8');
+      return {
+        update(data, enc) {
+          chunks.push(core.decodeInput(data, enc));
+          return this;
+        },
+        digest(enc) {
+          const mac = core.hmacBytes(alg, keyBytes, core.concatU8(chunks));
+          return decodeBridgeWireResult(core.encodeOutput(mac, enc));
+        },
+      };
+    },
+    createCipheriv: (alg, key, iv) => {
+      const h = cryptoBridge.cipherCreate(['cipher', alg, key, iv]);
+      return {
+        setAutoPadding(ap) {
+          cryptoBridge.cipherOption([h, 'autoPadding', ap]);
+          return this;
+        },
+        setAAD(aad) {
+          cryptoBridge.cipherSetAAD([h, aad]);
+          return this;
+        },
+        update(data, inEnc, outEnc) {
+          return decodeBridgeWireResult(cryptoBridge.cipherUpdate([h, data, inEnc, outEnc]));
+        },
+        final(outEnc) {
+          return decodeBridgeWireResult(cryptoBridge.cipherFinal([h, outEnc]));
+        },
+        getAuthTag() {
+          const w = cryptoBridge.cipherGetAuthTag([h]);
+          return w ? core.decodeBase64Forgiving(w.__bytes) : new Uint8Array(0);
+        },
+      };
+    },
+    createDecipheriv: (alg, key, iv) => {
+      const h = cryptoBridge.cipherCreate(['decipher', alg, key, iv]);
+      return {
+        setAutoPadding(ap) {
+          cryptoBridge.cipherOption([h, 'autoPadding', ap]);
+          return this;
+        },
+        setAAD(aad) {
+          cryptoBridge.cipherSetAAD([h, aad]);
+          return this;
+        },
+        setAuthTag(tag) {
+          cryptoBridge.cipherSetAuthTag([h, tag]);
+          return this;
+        },
+        update(data, inEnc, outEnc) {
+          return decodeBridgeWireResult(cryptoBridge.cipherUpdate([h, data, inEnc, outEnc]));
+        },
+        final(outEnc) {
+          return decodeBridgeWireResult(cryptoBridge.cipherFinal([h, outEnc]));
+        },
+      };
+    },
+  };
+
   // ==========================================================================
   // 4. Stateless HTTP / Media / WebSocket Relay Shims (Window + Worker)
   // ==========================================================================
@@ -475,6 +815,54 @@ function bootstrapSessionRuntime(globalScope) {
     } catch {}
     return null;
   }
+
+  const olazHost = (globalScope.__olazHost = {
+    core,
+    IS_WINDOW,
+    IS_WORKER,
+    ACTIVE_SLOT,
+    CONTEXT_ID,
+    HOST_DB_NAME,
+    VFS_DB_NAME,
+    ZALO_APP_VERSION,
+    ZALO_USER_AGENT,
+    ZALO_RELAY_SUFFIXES,
+    NativeFetch,
+    NativeXHR,
+    NativeWebSocket,
+    NativeBroadcastChannel,
+    ipcBus,
+    cookieJar,
+    cryptoBridge,
+    nativeIdb,
+    rawIdbOpen,
+    rawIdbPut,
+    rawIdbDeleteRec,
+    rawIdbDelete,
+    openRawIdb,
+    rawLocalStorage,
+    rawStorageMethods,
+    rawLsGet,
+    rawLsSet,
+    rawLsRemove,
+    rawSsGet,
+    rawSsSet,
+    rawSsRemove,
+    isZaloHost,
+    parseZaloTargetUrl,
+    appendProfileParam,
+    buildZaloPageQuery,
+    decodeBridgeWireResult,
+    asyncIpcHandlers: new Map(), // channel -> async (args) => result
+    syncIpcHandlers: new Map(), // channel -> (args) => result
+    httpFallbackResolvers: [], // Array<async (urlHref, status) => Response | Blob | null>
+    ipcBusListeners: [], // Array<(msg) => void>
+    webpackModuleHooks: [], // Array<(req) => void>
+    diRegistrationHooks: [], // Array<(reg) => void>
+    popupWindowHooks: [], // Array<(childWin, url) => void>
+    deckMountHooks: [], // Array<(ctx) => void>
+    privacyListeners: [], // Array<(privacyState) => void>
+  });
 
   function parseZaloWsUrl(rawUrl) {
     const s = String(rawUrl || '').trim();
@@ -563,7 +951,12 @@ function bootstrapSessionRuntime(globalScope) {
   function rewriteLocalZfileUrl(raw) {
     if (typeof raw !== 'string') return raw;
     if (raw.startsWith('//')) return 'https:' + raw;
-    if (/^zfile:/i.test(raw) || /^file:/i.test(raw) || raw.startsWith('zalo-app://local/__olaz/zfile/')) {
+    if (
+      /^zfile:/i.test(raw) ||
+      /^file:/i.test(raw) ||
+      /^zalo-app:\/\/local\/__olaz\/zfile\//i.test(raw) ||
+      /^\/(Users\/olaz|tmp\/olaz|olaz-vfs)(\/|$)/.test(raw)
+    ) {
       let stripped = raw
         .replace(/^zalo-app:\/\/local\/__olaz\/zfile\//i, '')
         .replace(/^zfile:\/+(local\/)?/i, '')
@@ -584,12 +977,7 @@ function bootstrapSessionRuntime(globalScope) {
         })
         .join('/');
       const zfilePath = '/__zfile/@slot/' + ACTIVE_SLOT + '/' + encodedSegs + suffix;
-      if (
-        (!globalScope.navigator ||
-          !globalScope.navigator.serviceWorker ||
-          !globalScope.navigator.serviceWorker.controller) &&
-        typeof globalScope.__olazResolveVfsBlobUrl === 'function'
-      ) {
+      if (typeof globalScope.__olazResolveVfsBlobUrl === 'function') {
         const blobUrl = globalScope.__olazResolveVfsBlobUrl(zfilePath);
         if (blobUrl) return blobUrl;
       }
@@ -614,9 +1002,6 @@ function bootstrapSessionRuntime(globalScope) {
       if (
         (reqUrlStr.startsWith('/__zfile/') ||
           (globalScope.location && reqUrlStr.startsWith(globalScope.location.origin + '/__zfile/'))) &&
-        (!globalScope.navigator ||
-          !globalScope.navigator.serviceWorker ||
-          !globalScope.navigator.serviceWorker.controller) &&
         typeof globalScope.__olazResolveVfsZfile === 'function' &&
         typeof Response === 'function'
       ) {
@@ -705,6 +1090,33 @@ function bootstrapSessionRuntime(globalScope) {
       if (ct && !outHeaders.has('content-type')) outHeaders.set('content-type', ct);
 
       const status = Number.isFinite(upstreamStatus) && upstreamStatus >= 100 ? upstreamStatus : relayResp.status;
+      if (status >= 400 && olazHost.httpFallbackResolvers.length > 0 && typeof Response === 'function') {
+        for (const resolver of olazHost.httpFallbackResolvers) {
+          try {
+            const fb = await resolver(targetUrl.href, status);
+            if (!fb) continue;
+            if (fb instanceof Response) {
+              return fb;
+            }
+            if (
+              (typeof Blob !== 'undefined' && fb instanceof Blob) ||
+              fb instanceof Uint8Array ||
+              fb instanceof ArrayBuffer
+            ) {
+              const fbResp = new Response(fb, {
+                status: 200,
+                headers: {
+                  'Content-Type': (fb && fb.type) || 'application/octet-stream',
+                },
+              });
+              try {
+                Object.defineProperty(fbResp, 'url', { value: targetUrl.href });
+              } catch {}
+              return fbResp;
+            }
+          } catch {}
+        }
+      }
       const nullBodyStatus = status === 101 || status === 204 || status === 205 || status === 304;
       const respOut = new Response(nullBodyStatus ? null : relayResp.body, {
         status,
@@ -1091,9 +1503,6 @@ function bootstrapSessionRuntime(globalScope) {
     globalScope.XMLHttpRequest = OlazXHR;
   }
 
-  // Anti-Recall hook callback (populated in Window context)
-  let inspectIncomingFrameForAntiRecall = null;
-
   if (NativeWebSocket) {
     class OlazWebSocket {
       constructor(url, protocols) {
@@ -1182,12 +1591,6 @@ function bootstrapSessionRuntime(globalScope) {
           }
 
           let dataOut = ev.data;
-          if (inspectIncomingFrameForAntiRecall) {
-            try {
-              const maybeRewritten = inspectIncomingFrameForAntiRecall(dataOut);
-              if (maybeRewritten !== undefined) dataOut = maybeRewritten;
-            } catch {}
-          }
           if (dataOut instanceof ArrayBuffer && this._binaryType === 'blob' && typeof Blob !== 'undefined') {
             dataOut = new Blob([dataOut]);
           }
@@ -1310,20 +1713,53 @@ function bootstrapSessionRuntime(globalScope) {
     globalScope.WebSocket = OlazWebSocket;
   }
 
-  // If running inside a Web Worker (`dal-worker` / `sync-v2-sub-worker`), expose worker-side
-  // crypto & cookie sync and return cleanly without touching DOM APIs!
+  // If running inside a Web Worker (`dal-worker` / `sync-v2-sub-worker` / `zd-worker` / `opfs-worker`),
+  // expose worker-side `$znode`, OPFS slot isolation, crypto & cookie sync and return cleanly!
   if (IS_WORKER) {
+    if (
+      ACTIVE_SLOT !== 'default' &&
+      globalScope.navigator &&
+      globalScope.navigator.storage &&
+      typeof globalScope.navigator.storage.getDirectory === 'function' &&
+      !globalScope.navigator.storage.getDirectory.__olazScoped
+    ) {
+      try {
+        const storageObj = globalScope.navigator.storage;
+        const origGetDir = storageObj.getDirectory.bind(storageObj);
+        const scopedGetDir = async function () {
+          const rootHandle = await origGetDir();
+          if (rootHandle && typeof rootHandle.getDirectoryHandle === 'function') {
+            return rootHandle.getDirectoryHandle('olaz_slot_' + ACTIVE_SLOT, { create: true });
+          }
+          return rootHandle;
+        };
+        scopedGetDir.__olazScoped = true;
+        storageObj.getDirectory = scopedGetDir;
+      } catch {}
+    }
     if (ipcBus) {
       ipcBus.addEventListener('message', (ev) => {
         const msg = ev && ev.data;
-        if (msg && msg.__olazType === 'cookie-sync' && msg.sender !== CONTEXT_ID) {
+        if (!msg || msg.sender === CONTEXT_ID) return;
+        if (msg.__olazType === 'cookie-sync') {
           cookieJar.importJson(msg.cookies);
+        }
+        for (const fn of olazHost.ipcBusListeners) {
+          try {
+            fn(msg);
+          } catch {}
         }
       });
       try {
         ipcBus.postMessage({ __olazType: 'cookie-request', sender: CONTEXT_ID });
       } catch {}
     }
+    globalScope.$znode = Object.assign(globalScope.$znode || {}, {
+      path: posixPath,
+      url: znodeUrl,
+      os: createZnodeOs(globalScope.$znode && globalScope.$znode.os && globalScope.$znode.os.__info),
+      crypto: znodeCrypto,
+    });
     globalScope.$zenv = {
       isPreloaded: true,
       isRenderer: false,
@@ -1399,13 +1835,22 @@ function bootstrapSessionRuntime(globalScope) {
     vfsBlobUrlCache.set(hit.path, { mtimeMs: hit.mtimeMs, url: blobUrl });
     return blobUrl;
   };
+
   let hostImei = '';
+  const ANTI_RECALL_LS_KEY = 'olaz:__anti_recall:' + ACTIVE_SLOT;
+  const initialAntiRecallRaw = rawLsGet(ANTI_RECALL_LS_KEY);
   const privacyState = {
-    antiRecall: true,
+    antiRecall:
+      initialAntiRecallRaw === null
+        ? true
+        : initialAntiRecallRaw !== '0' && initialAntiRecallRaw !== 'false',
     blockTyping: false,
     blockSeen: false,
   };
   let activeVaultCryptoKey = null; // non-extractable SubtleCrypto AES-GCM key when PIN lock is active
+  let vaultDirtyWhileLocked = false;
+  let pendingUnlockPromise = null;
+  let dismissUnlockOverlayFn = null;
 
   const safeStorage = new core.SafeStorage({
     readStore: (name) => hostStoresRam.get(name) || { zsskv: '2', zsskd: {} },
@@ -1468,23 +1913,40 @@ function bootstrapSessionRuntime(globalScope) {
     });
   }
 
-  async function idbPutKv(k, v) {
-    try {
-      const db = await openHostIdb();
-      if (!db) return;
-      await new Promise((resolve) => {
-        const tx = db.transaction('kv', 'readwrite');
-        rawIdbPut.call(tx.objectStore('kv'), { k, v });
-        tx.oncomplete = () => {
-          db.close();
-          resolve();
-        };
-        tx.onerror = () => {
-          db.close();
-          resolve();
-        };
-      });
-    } catch {}
+  const pendingHostWrites = new Set();
+  function trackHostWrite(promise) {
+    if (!promise || typeof promise.then !== 'function') return promise;
+    pendingHostWrites.add(promise);
+    const done = () => pendingHostWrites.delete(promise);
+    promise.then(done, done);
+    return promise;
+  }
+
+  function idbPutKv(k, v) {
+    return trackHostWrite(
+      (async () => {
+        try {
+          const db = await openHostIdb();
+          if (!db) return;
+          await new Promise((resolve) => {
+            const tx = db.transaction('kv', 'readwrite');
+            rawIdbPut.call(tx.objectStore('kv'), { k, v });
+            tx.oncomplete = () => {
+              db.close();
+              resolve();
+            };
+            tx.onerror = () => {
+              db.close();
+              resolve();
+            };
+            tx.onabort = () => {
+              db.close();
+              resolve();
+            };
+          });
+        } catch {}
+      })()
+    );
   }
 
   // ---- SubtleCrypto (with pure-JS LAN HTTP fallback) AES-256-GCM Browser PIN Vault ----
@@ -1503,26 +1965,38 @@ function bootstrapSessionRuntime(globalScope) {
     return acc;
   }
 
-  async function deriveVaultKeyFromPin(pinStr, saltBytes) {
-    const pinBytes = new TextEncoder().encode(String(pinStr));
-    const subtle = globalScope.crypto && globalScope.crypto.subtle;
-    if (!subtle) {
-      // Plain LAN HTTP (`http://192.168.x.x:<port>/`) fallback with identical AES-256-GCM wire format
-      return { __rawAes256Key: pbkdf2HmacSha256Sync(pinBytes, saltBytes, Math.min(PBKDF2_ITERATIONS, 100000)) };
+  async function deriveVaultKeyFromPin(pinStr, saltBytes, iterOverride) {
+    const pin = String(pinStr == null ? '' : pinStr);
+    if (!pin.length) {
+      throw new Error('PIN cannot be empty');
     }
-    const baseKey = await subtle.importKey('raw', pinBytes, 'PBKDF2', false, ['deriveKey']);
-    return subtle.deriveKey(
-      {
-        name: 'PBKDF2',
-        salt: saltBytes,
-        iterations: PBKDF2_ITERATIONS,
-        hash: 'SHA-256',
-      },
-      baseKey,
-      { name: 'AES-GCM', length: 256 },
-      false, // non-extractable!
-      ['encrypt', 'decrypt']
-    );
+    const pinBytes = new TextEncoder().encode(pin);
+    const subtle = globalScope.crypto && globalScope.crypto.subtle;
+    const hasExplicitIter = Number.isFinite(Number(iterOverride)) && Number(iterOverride) > 0;
+    const targetIter = hasExplicitIter ? Math.floor(Number(iterOverride)) : PBKDF2_ITERATIONS;
+    if (subtle && typeof subtle.importKey === 'function' && typeof subtle.deriveKey === 'function') {
+      try {
+        const baseKey = await subtle.importKey('raw', pinBytes, 'PBKDF2', false, ['deriveKey']);
+        const derivedKey = await subtle.deriveKey(
+          {
+            name: 'PBKDF2',
+            salt: saltBytes,
+            iterations: targetIter,
+            hash: 'SHA-256',
+          },
+          baseKey,
+          { name: 'AES-GCM', length: 256 },
+          false, // non-extractable!
+          ['encrypt', 'decrypt']
+        );
+        return { key: derivedKey, iter: targetIter };
+      } catch {}
+    }
+    const fallbackIter = hasExplicitIter ? targetIter : Math.min(PBKDF2_ITERATIONS, 100000);
+    return {
+      key: { __rawAes256Key: pbkdf2HmacSha256Sync(pinBytes, saltBytes, fallbackIter) },
+      iter: fallbackIter,
+    };
   }
 
   async function aesGcmEncryptCompat(cryptoKey, iv, pt) {
@@ -1584,12 +2058,29 @@ function bootstrapSessionRuntime(globalScope) {
     return null;
   }
 
+  function isVaultLocked() {
+    return Boolean(getVaultMeta() && !activeVaultCryptoKey);
+  }
+
   async function verifyVaultPin(pinStr, meta) {
-    const salt = core.decodeBase64Forgiving(meta.saltB64);
-    const key = await deriveVaultKeyFromPin(pinStr, salt);
-    const iv = core.decodeBase64Forgiving(meta.ivB64);
-    const ct = core.decodeBase64Forgiving(meta.verifierB64);
-    const ptBytes = await aesGcmDecryptCompat(key, iv, ct);
+    const activeMeta = meta || getVaultMeta();
+    if (!activeMeta) {
+      throw new Error('No Vault PIN configured');
+    }
+    const salt = core.decodeBase64Forgiving(activeMeta.saltB64);
+    const { key } = await deriveVaultKeyFromPin(
+      pinStr,
+      salt,
+      activeMeta.iter || PBKDF2_ITERATIONS
+    );
+    const iv = core.decodeBase64Forgiving(activeMeta.ivB64);
+    const ct = core.decodeBase64Forgiving(activeMeta.verifierB64);
+    let ptBytes;
+    try {
+      ptBytes = await aesGcmDecryptCompat(key, iv, ct);
+    } catch {
+      throw new Error('Invalid PIN');
+    }
     const txt = new TextDecoder().decode(ptBytes);
     if (txt !== 'olaz-vault-ok-v1:' + ACTIVE_SLOT) {
       throw new Error('Invalid PIN');
@@ -1597,49 +2088,153 @@ function bootstrapSessionRuntime(globalScope) {
     return key;
   }
 
-  async function configureVaultPin(newPinStr) {
-    if (!newPinStr) {
+  async function hydrateSealedRecordsWithKey(cryptoKey) {
+    if (!cryptoKey) return;
+    try {
+      const hostDb = await openHostIdb();
+      if (!hostDb) return;
+      const rows = await idbGetAllKv(hostDb);
+      hostDb.close();
+      for (const row of rows) {
+        if (!row || typeof row.k !== 'string') continue;
+        if (!row.v || typeof row.v !== 'object' || row.v.__sealedVaultV1 !== 1) continue;
+        try {
+          if (row.k === 'cookies' && !cookieJar.exportJson().length) {
+            const opened = await openWithVaultKey(cryptoKey, row.v);
+            cookieJar.importJson(opened);
+          } else if (row.k === 'keychain' && keychainRam.size === 0) {
+            const opened = await openWithVaultKey(cryptoKey, row.v);
+            if (opened && typeof opened === 'object') {
+              for (const [acc, b64] of Object.entries(opened)) {
+                if (typeof b64 === 'string' && !keychainRam.has(acc)) {
+                  keychainRam.set(acc, core.decodeBase64Forgiving(b64));
+                }
+              }
+            }
+          } else if (row.k === 'store:zsafe-storage' && !hostStoresRam.has('zsafe-storage')) {
+            const opened = await openWithVaultKey(cryptoKey, row.v);
+            if (opened && typeof opened === 'object') {
+              hostStoresRam.set('zsafe-storage', opened);
+            }
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+  function postVaultIpcMessage(type, extra) {
+    if (!ipcBus) return;
+    const msg = Object.assign({ __olazType: type, sender: CONTEXT_ID }, extra || {});
+    try {
+      ipcBus.postMessage(msg);
+    } catch {
+      if (msg.key) {
+        const slim = Object.assign({}, msg);
+        delete slim.key;
+        try {
+          ipcBus.postMessage(slim);
+        } catch {}
+      }
+    }
+  }
+
+  async function flushVaultDirtyAfterUnlock() {
+    if (!vaultDirtyWhileLocked || isVaultLocked()) return;
+    vaultDirtyWhileLocked = false;
+    await persistCookiesNow();
+    if (hostStoresRam.has('zsafe-storage')) {
+      await persistStoreToIdb('zsafe-storage', hostStoresRam.get('zsafe-storage'));
+    }
+    if (keychainRam.size > 0) {
+      await persistKeychainToIdb();
+    }
+  }
+
+  async function configureVaultPin(newPinStr, currentPinOrOpts) {
+    const existingMeta = getVaultMeta();
+    const currentPin =
+      typeof currentPinOrOpts === 'string'
+        ? currentPinOrOpts
+        : currentPinOrOpts && typeof currentPinOrOpts === 'object' && typeof currentPinOrOpts.currentPin === 'string'
+          ? currentPinOrOpts.currentPin
+          : '';
+
+    if (existingMeta) {
+      const verifiedOldKey = await verifyVaultPin(currentPin, existingMeta);
+      await hydrateSealedRecordsWithKey(verifiedOldKey);
+    }
+
+    const cleanNewPin = String(newPinStr == null ? '' : newPinStr).trim();
+    if (!cleanNewPin) {
       activeVaultCryptoKey = null;
+      vaultDirtyWhileLocked = false;
       rawLsRemove(VAULT_META_KEY);
     } else {
+      if (cleanNewPin.length < 4) {
+        throw new Error('PIN must be at least 4 characters');
+      }
       const salt = core.csprngBytes(16);
       const iv = core.csprngBytes(12);
-      const key = await deriveVaultKeyFromPin(newPinStr, salt);
+      const { key, iter } = await deriveVaultKeyFromPin(cleanNewPin, salt);
       const verifierPt = new TextEncoder().encode('olaz-vault-ok-v1:' + ACTIVE_SLOT);
       const verifierCt = await aesGcmEncryptCompat(key, iv, verifierPt);
       rawLsSet(
         VAULT_META_KEY,
         JSON.stringify({
           v: 1,
+          iter,
           saltB64: core.bytesToBase64(salt, false),
           ivB64: core.bytesToBase64(iv, false),
           verifierB64: core.bytesToBase64(verifierCt, false),
         })
       );
       activeVaultCryptoKey = key;
+      vaultDirtyWhileLocked = false;
     }
+
     // Re-persist sensitive records (`cookies`, `zsafe-storage`, `keychain`) encrypted (or decrypted if cleared)
     await persistCookiesNow();
     if (hostStoresRam.has('zsafe-storage')) {
       await persistStoreToIdb('zsafe-storage', hostStoresRam.get('zsafe-storage'));
     }
     await persistKeychainToIdb();
+    await flushAllPendingWrites();
+
+    if (dismissUnlockOverlayFn && (!cleanNewPin || activeVaultCryptoKey)) {
+      dismissUnlockOverlayFn(activeVaultCryptoKey);
+    }
+    postVaultIpcMessage('vault-pin-updated', {
+      hasPin: Boolean(cleanNewPin),
+      key: activeVaultCryptoKey || null,
+    });
+    if (refreshDeckUiFn) refreshDeckUiFn();
   }
 
   function promptForVaultUnlockModal(meta) {
+    const activeMeta = meta || getVaultMeta();
+    if (!activeMeta) return Promise.resolve(null);
+    if (activeVaultCryptoKey) return Promise.resolve(activeVaultCryptoKey);
+
     // Same-origin child iframe (`shared-worker.html`) inherits parent's unlocked CryptoKey!
     try {
       if (window.parent && window.parent !== window && window.parent.__olazGetActiveVaultKey) {
         const parentKey = window.parent.__olazGetActiveVaultKey(ACTIVE_SLOT);
-        if (parentKey) return Promise.resolve(parentKey);
+        if (parentKey) {
+          activeVaultCryptoKey = parentKey;
+          return Promise.resolve(parentKey);
+        }
       }
     } catch {}
 
-    return new Promise((resolve) => {
+    if (pendingUnlockPromise) return pendingUnlockPromise;
+
+    pendingUnlockPromise = new Promise((resolve) => {
       const mount = () => {
         const host = document.createElement('div');
         host.id = '__olaz-vault-unlock-overlay';
         const shadow = host.attachShadow({ mode: 'open' });
+        shieldShadowRootEvents(shadow);
+        const roundsLabel = Number(activeMeta.iter || PBKDF2_ITERATIONS).toLocaleString('en-US');
         shadow.innerHTML = `
           <style>
             .backdrop {
@@ -1650,17 +2245,17 @@ function bootstrapSessionRuntime(globalScope) {
               color: #f8fafc;
             }
             .card {
-              width: 360px; max-width: 90vw; padding: 28px; border-radius: 18px;
-              background: rgba(30, 41, 59, 0.92);
-              border: 1px solid rgba(148, 163, 184, 0.22);
-              box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+              width: 368px; max-width: 92vw; padding: 28px; border-radius: 18px;
+              background: rgba(30, 41, 59, 0.94);
+              border: 1px solid rgba(148, 163, 184, 0.24);
+              box-shadow: 0 24px 60px rgba(0, 0, 0, 0.65);
             }
             h2 { margin: 0 0 6px; font-size: 18px; font-weight: 600; }
             p { margin: 0 0 18px; font-size: 13px; color: #94a3b8; line-height: 1.45; }
             input {
               width: 100%; box-sizing: border-box; padding: 11px 14px;
               border-radius: 10px; border: 1px solid #334155;
-              background: #0f172a; color: #f8fafc; font-size: 15px;
+              background: #0f172a; color: #f8fafc; font-size: 16px;
               letter-spacing: 2px; outline: none;
             }
             input:focus { border-color: #38bdf8; }
@@ -1672,17 +2267,22 @@ function bootstrapSessionRuntime(globalScope) {
             }
             .primary { background: #0284c7; color: #fff; }
             .primary:hover { background: #0369a1; }
-            .danger { background: rgba(239, 68, 68, 0.14); color: #fca5a5; flex: 0 0 auto; }
+            .secondary { background: rgba(51, 65, 85, 0.72); color: #e2e8f0; flex: 0 0 auto; }
+            .danger { background: rgba(239, 68, 68, 0.16); color: #fca5a5; flex: 0 0 auto; }
+            .danger-solid { background: #dc2626; color: #fff; flex: 0 0 auto; }
+            .hidden { display: none !important; }
           </style>
           <div class="backdrop">
             <form class="card" id="f">
               <h2>Unlock Browser Vault (${ACTIVE_SLOT})</h2>
-              <p>Your Zalo session &amp; E2EE keys are encrypted locally with AES-256-GCM (PBKDF2 600,000 rounds). Zero data is stored on the server.</p>
+              <p>Your Zalo session &amp; E2EE keys are encrypted locally with AES-256-GCM (PBKDF2 ${roundsLabel} rounds). Zero data is stored on the server.</p>
               <input id="pin" type="password" placeholder="Enter Vault PIN" autocomplete="current-password" autofocus />
               <div class="err" id="err"></div>
               <div class="actions">
                 <button type="submit" class="primary" id="btn">Unlock Session</button>
                 <button type="button" class="danger" id="wipe">Wipe</button>
+                <button type="button" class="danger-solid hidden" id="wipeConfirm">Confirm Wipe?</button>
+                <button type="button" class="secondary hidden" id="wipeCancel">Cancel</button>
               </div>
             </form>
           </div>
@@ -1693,73 +2293,224 @@ function bootstrapSessionRuntime(globalScope) {
         const errEl = shadow.getElementById('err');
         const btn = shadow.getElementById('btn');
         const wipeBtn = shadow.getElementById('wipe');
-        setTimeout(() => input.focus(), 20);
+        const wipeConfirmBtn = shadow.getElementById('wipeConfirm');
+        const wipeCancelBtn = shadow.getElementById('wipeCancel');
+
+        const setWipeStep = (confirming) => {
+          wipeBtn.classList.toggle('hidden', confirming);
+          wipeConfirmBtn.classList.toggle('hidden', !confirming);
+          wipeCancelBtn.classList.toggle('hidden', !confirming);
+          errEl.textContent = confirming
+            ? 'Permanently wipe local session & PIN for "' + ACTIVE_SLOT + '"?'
+            : '';
+        };
+
+        dismissUnlockOverlayFn = (unlockedKey) => {
+          pendingUnlockPromise = null;
+          dismissUnlockOverlayFn = null;
+          try {
+            host.remove();
+          } catch {}
+          resolve(unlockedKey);
+        };
+
+        const focusTimer = setTimeout(() => {
+          if (input && typeof input.focus === 'function') input.focus();
+        }, 20);
+        if (focusTimer && typeof focusTimer.unref === 'function') focusTimer.unref();
 
         form.addEventListener('submit', async (ev) => {
-          ev.preventDefault();
+          if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+          setWipeStep(false);
           errEl.textContent = '';
           btn.disabled = true;
           btn.textContent = 'Deriving Key…';
           try {
-            const key = await verifyVaultPin(input.value, meta);
-            host.remove();
-            resolve(key);
+            const latestMeta = getVaultMeta() || activeMeta;
+            const key = await verifyVaultPin(input.value, latestMeta);
+            activeVaultCryptoKey = key;
+            if (dismissUnlockOverlayFn) dismissUnlockOverlayFn(key);
+            postVaultIpcMessage('vault-unlocked', { key });
+            await flushVaultDirtyAfterUnlock();
+            if (refreshDeckUiFn) refreshDeckUiFn();
           } catch {
             errEl.textContent = 'Incorrect PIN. Please try again.';
             btn.disabled = false;
             btn.textContent = 'Unlock Session';
-            input.select();
+            if (input && typeof input.select === 'function') input.select();
           }
         });
 
-        wipeBtn.addEventListener('click', async () => {
-          if (window.confirm('Wipe local browser session and PIN for profile "' + ACTIVE_SLOT + '"?')) {
-            await wipeLocalSlotSession();
-          }
+        wipeBtn.addEventListener('click', () => {
+          setWipeStep(true);
+        });
+        wipeCancelBtn.addEventListener('click', () => {
+          setWipeStep(false);
+        });
+        wipeConfirmBtn.addEventListener('click', async () => {
+          wipeConfirmBtn.disabled = true;
+          wipeCancelBtn.disabled = true;
+          await wipeLocalSlotSession();
         });
       };
 
-      if (document.documentElement) mount();
+      if (document.documentElement || document.body) mount();
       else document.addEventListener('DOMContentLoaded', mount, { once: true });
     });
+
+    return pendingUnlockPromise;
+  }
+
+  async function unlockVaultWithPin(pinStr) {
+    const meta = getVaultMeta();
+    if (!meta) return null;
+    const key = await verifyVaultPin(pinStr, meta);
+    activeVaultCryptoKey = key;
+    if (dismissUnlockOverlayFn) {
+      dismissUnlockOverlayFn(key);
+    }
+    postVaultIpcMessage('vault-unlocked', { key });
+    await flushVaultDirtyAfterUnlock();
+    if (refreshDeckUiFn) refreshDeckUiFn();
+    return key;
+  }
+
+  async function lockVaultNow() {
+    const meta = getVaultMeta();
+    if (!meta) return false;
+    await flushAllPendingWrites();
+    activeVaultCryptoKey = null;
+    postVaultIpcMessage('vault-lock', {});
+    if (refreshDeckUiFn) refreshDeckUiFn();
+    const unlockedKey = await promptForVaultUnlockModal(meta);
+    activeVaultCryptoKey = unlockedKey;
+    await flushVaultDirtyAfterUnlock();
+    if (refreshDeckUiFn) refreshDeckUiFn();
+    return true;
   }
 
   window.__olazGetActiveVaultKey = (slot) =>
     slot === ACTIVE_SLOT ? activeVaultCryptoKey : null;
 
-  async function persistCookiesNow() {
-    const exported = cookieJar.exportJson();
-    const payload = activeVaultCryptoKey
-      ? await sealWithVaultKey(activeVaultCryptoKey, exported)
-      : exported;
-    await idbPutKv('cookies', payload);
+  window.__olazVault = {
+    hasPin: () => Boolean(getVaultMeta()),
+    isLocked: () => isVaultLocked(),
+    configurePin: configureVaultPin,
+    verifyPin: (pin) => verifyVaultPin(pin, getVaultMeta()),
+    lockNow: lockVaultNow,
+    unlockWithPin: unlockVaultWithPin,
+  };
+
+  function persistCookiesNow() {
+    if (isVaultLocked()) {
+      vaultDirtyWhileLocked = true;
+      return Promise.resolve();
+    }
+    return trackHostWrite(
+      (async () => {
+        if (isVaultLocked()) {
+          vaultDirtyWhileLocked = true;
+          return;
+        }
+        const exported = cookieJar.exportJson();
+        const payload = activeVaultCryptoKey
+          ? await sealWithVaultKey(activeVaultCryptoKey, exported)
+          : exported;
+        await idbPutKv('cookies', payload);
+      })()
+    );
   }
   persistCookiesFn = () => {
     persistCookiesNow().catch(() => {});
   };
 
-  async function persistStoreToIdb(storeName, storeObj) {
+  function persistStoreToIdb(storeName, storeObj) {
     const isSensitive = storeName === 'zsafe-storage';
-    const payload =
-      isSensitive && activeVaultCryptoKey
-        ? await sealWithVaultKey(activeVaultCryptoKey, storeObj)
-        : storeObj;
-    await idbPutKv('store:' + storeName, payload);
+    if (isSensitive && isVaultLocked()) {
+      vaultDirtyWhileLocked = true;
+      return Promise.resolve();
+    }
+    return trackHostWrite(
+      (async () => {
+        if (isSensitive && isVaultLocked()) {
+          vaultDirtyWhileLocked = true;
+          return;
+        }
+        const payload =
+          isSensitive && activeVaultCryptoKey
+            ? await sealWithVaultKey(activeVaultCryptoKey, storeObj)
+            : storeObj;
+        await idbPutKv('store:' + storeName, payload);
+      })()
+    );
   }
 
-  async function persistKeychainToIdb() {
-    const obj = {};
-    for (const [k, u8] of keychainRam.entries()) {
-      obj[k] = core.bytesToBase64(u8, false);
+  function persistKeychainToIdb() {
+    if (isVaultLocked()) {
+      vaultDirtyWhileLocked = true;
+      return Promise.resolve();
     }
-    const payload = activeVaultCryptoKey
-      ? await sealWithVaultKey(activeVaultCryptoKey, obj)
-      : obj;
-    await idbPutKv('keychain', payload);
+    return trackHostWrite(
+      (async () => {
+        if (isVaultLocked()) {
+          vaultDirtyWhileLocked = true;
+          return;
+        }
+        const obj = {};
+        for (const [k, u8] of keychainRam.entries()) {
+          obj[k] = core.bytesToBase64(u8, false);
+        }
+        const payload = activeVaultCryptoKey
+          ? await sealWithVaultKey(activeVaultCryptoKey, obj)
+          : obj;
+        await idbPutKv('keychain', payload);
+      })()
+    );
+  }
+
+  async function flushAllPendingWrites() {
+    try {
+      await persistCookiesNow();
+    } catch {}
+    let guard = 0;
+    while (pendingHostWrites.size > 0 && guard++ < 8) {
+      await Promise.allSettled(Array.from(pendingHostWrites));
+    }
   }
 
   async function persistPrivacySettings() {
     await idbPutKv('privacy', Object.assign({}, privacyState));
+  }
+
+  function notifyPrivacyListeners() {
+    const snapshot = Object.assign({}, privacyState);
+    for (const fn of olazHost.privacyListeners) {
+      try {
+        fn(snapshot);
+      } catch {}
+    }
+  }
+
+  function setAntiRecallState(enabled, opts) {
+    const options = opts && typeof opts === 'object' ? opts : {};
+    const boolVal = Boolean(enabled);
+    privacyState.antiRecall = boolVal;
+    if (options.persist !== false) {
+      rawLsSet(ANTI_RECALL_LS_KEY, boolVal ? '1' : '0');
+      persistPrivacySettings();
+    }
+    if (options.broadcast !== false && ipcBus) {
+      try {
+        ipcBus.postMessage({
+          __olazType: 'privacy-sync',
+          sender: CONTEXT_ID,
+          privacy: Object.assign({}, privacyState),
+        });
+      } catch {}
+    }
+    notifyPrivacyListeners();
+    if (refreshDeckUiFn) refreshDeckUiFn();
+    return boolVal;
   }
 
   function generateDefaultImei() {
@@ -1774,26 +2525,6 @@ function bootstrapSessionRuntime(globalScope) {
   }
 
   // ---- Virtual In-Browser Filesystem (RAM + IndexedDB `olaz_vfs_v1` + OPFS) ----
-
-  const VFS_USER_DATA = '/Users/olaz/Library/Application Support/ZaloPC';
-  const VFS_DOCUMENTS = '/Users/olaz/Documents';
-  const VFS_DOWNLOADS = '/Users/olaz/Downloads';
-  const VFS_TEMP = '/tmp/olaz';
-
-  function normPosixPath(raw) {
-    const s = String(raw || '').replace(/\\/g, '/').replace(/^file:\/+/i, '/');
-    const parts = s.split('/');
-    const stack = [];
-    for (const p of parts) {
-      if (!p || p === '.') continue;
-      if (p === '..') {
-        stack.pop();
-        continue;
-      }
-      stack.push(p);
-    }
-    return '/' + stack.join('/');
-  }
 
   function ensureVfsDirsInRam(filePath) {
     const norm = normPosixPath(filePath);
@@ -1827,64 +2558,104 @@ function bootstrapSessionRuntime(globalScope) {
     ensureVfsDirsInRam(d + '/.keep');
   }
 
-  async function persistVfsEntry(entry) {
-    try {
-      const db = await openVfsIdb();
-      if (!db) return;
-      await new Promise((resolve) => {
-        const tx = db.transaction('files', 'readwrite');
-        rawIdbPut.call(tx.objectStore('files'), {
-          path: entry.path,
-          isDir: Boolean(entry.isDir),
-          size: entry.size || 0,
-          mtimeMs: entry.mtimeMs || Date.now(),
-          data: entry.data || null,
-          mime: entry.mime || '',
-        });
-        tx.oncomplete = () => {
-          db.close();
-          resolve();
-        };
-        tx.onerror = () => {
-          db.close();
-          resolve();
-        };
-      });
-    } catch {}
-    // Best-effort OPFS mirror when available
-    try {
-      if (!entry.isDir && entry.data && navigator.storage && typeof navigator.storage.getDirectory === 'function') {
-        const rootDir = await navigator.storage.getDirectory();
-        const slotDir = await rootDir.getDirectoryHandle('olaz_' + ACTIVE_SLOT, { create: true });
-        const safeName = core.bytesToHex(core.hashBytes('md5', new TextEncoder().encode(entry.path)));
-        const fh = await slotDir.getFileHandle(safeName, { create: true });
-        if (typeof fh.createWritable === 'function') {
-          const w = await fh.createWritable();
-          await w.write(entry.data);
-          await w.close();
-        }
-      }
-    } catch {}
+  function persistVfsEntry(entry) {
+    return trackHostWrite(
+      (async () => {
+        try {
+          const db = await openVfsIdb();
+          if (!db) return;
+          await new Promise((resolve) => {
+            const tx = db.transaction('files', 'readwrite');
+            rawIdbPut.call(tx.objectStore('files'), {
+              path: entry.path,
+              isDir: Boolean(entry.isDir),
+              size: entry.size || 0,
+              mtimeMs: entry.mtimeMs || Date.now(),
+              data: entry.data || null,
+              mime: entry.mime || '',
+            });
+            tx.oncomplete = () => {
+              db.close();
+              resolve();
+            };
+            tx.onerror = () => {
+              db.close();
+              resolve();
+            };
+            tx.onabort = () => {
+              db.close();
+              resolve();
+            };
+          });
+        } catch {}
+        // Best-effort OPFS mirror when available
+        try {
+          if (
+            !entry.isDir &&
+            entry.data &&
+            navigator.storage &&
+            typeof navigator.storage.getDirectory === 'function'
+          ) {
+            const rootDir = await navigator.storage.getDirectory();
+            const slotDir = await rootDir.getDirectoryHandle('olaz_' + ACTIVE_SLOT, { create: true });
+            const safeName = core.bytesToHex(core.hashBytes('md5', new TextEncoder().encode(entry.path)));
+            const fh = await slotDir.getFileHandle(safeName, { create: true });
+            if (typeof fh.createWritable === 'function') {
+              const w = await fh.createWritable();
+              await w.write(entry.data);
+              await w.close();
+            }
+          }
+        } catch {}
+      })()
+    );
   }
 
-  async function removeVfsEntry(normPath) {
+  function removeVfsEntry(normPath) {
     vfsEntriesRam.delete(normPath);
-    try {
-      const db = await openVfsIdb();
-      if (!db) return;
-      await new Promise((resolve) => {
-        const tx = db.transaction('files', 'readwrite');
-        rawIdbDeleteRec.call(tx.objectStore('files'), normPath);
-        tx.oncomplete = () => {
-          db.close();
-          resolve();
-        };
-        tx.onerror = () => {
-          db.close();
-          resolve();
-        };
-      });
-    } catch {}
+    const prevBlob = vfsBlobUrlCache.get(normPath);
+    if (prevBlob) {
+      vfsBlobUrlCache.delete(normPath);
+      if (typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
+        try {
+          URL.revokeObjectURL(prevBlob.url);
+        } catch {}
+      }
+    }
+    if (ipcBus) {
+      try {
+        ipcBus.postMessage({
+          __olazType: 'vfs-sync',
+          sender: CONTEXT_ID,
+          op: 'rm',
+          path: normPath,
+        });
+      } catch {}
+    }
+    return trackHostWrite(
+      (async () => {
+        try {
+          const db = await openVfsIdb();
+          if (!db) return;
+          await new Promise((resolve) => {
+            const tx = db.transaction('files', 'readwrite');
+            rawIdbDeleteRec.call(tx.objectStore('files'), normPath);
+            tx.oncomplete = () => {
+              db.close();
+              resolve();
+            };
+            tx.onerror = () => {
+              db.close();
+              resolve();
+            };
+            tx.onabort = () => {
+              db.close();
+              resolve();
+            };
+          });
+        } catch {}
+      })()
+    );
   }
 
   function writeVfsFileSync(rawPath, bytesLike) {
@@ -1900,6 +2671,23 @@ function bootstrapSessionRuntime(globalScope) {
     };
     vfsEntriesRam.set(p, entry);
     persistVfsEntry(entry);
+    if (ipcBus && entry.size <= 16 * 1024 * 1024) {
+      try {
+        ipcBus.postMessage({
+          __olazType: 'vfs-sync',
+          sender: CONTEXT_ID,
+          op: 'put',
+          entry: {
+            path: entry.path,
+            isDir: false,
+            size: entry.size,
+            mtimeMs: entry.mtimeMs,
+            data: entry.data,
+            mime: entry.mime || '',
+          },
+        });
+      } catch {}
+    }
     return entry;
   }
 
@@ -1927,76 +2715,28 @@ function bootstrapSessionRuntime(globalScope) {
     return err;
   }
 
-  // ==========================================================================
-  // 6. Anti-Recall ("Xem tin thu hồi") Browser Guard
-  // ==========================================================================
-
-  const cachedMessagesById = new Map(); // msgId / cliMsgId -> original text/content
-
-  function extractMessageText(rec) {
-    if (!rec || typeof rec !== 'object') return '';
-    const c = rec.content !== undefined ? rec.content : rec.msg !== undefined ? rec.msg : rec.message;
-    if (typeof c === 'string') return c;
-    if (c && typeof c === 'object') {
-      return String(c.title || c.description || c.text || '');
-    }
-    return '';
-  }
-
-  function isRecalledMutation(rec) {
-    if (!rec || typeof rec !== 'object') return false;
-    if (rec.isUndo === true || rec.undo === true || rec.recalled === true) return true;
-    const mt = String(rec.msgType || rec.type || '').toLowerCase();
-    if (mt === 'chat.undo' || mt === 'undo') return true;
-    if (typeof rec.content === 'string' && rec.content === '' && rec.__olazProtectedText) return true;
-    return false;
-  }
-
-  if (rawIdbPut) {
-    IDBObjectStore.prototype.put = function (value, key) {
-      try {
-        if (value && typeof value === 'object') {
-          const msgKey = String(value.msgId || value.globalMsgId || value.cliMsgId || '');
-          if (msgKey) {
-            const txt = extractMessageText(value);
-            if (txt && !isRecalledMutation(value) && !txt.startsWith('[Đã thu hồi] ')) {
-              cachedMessagesById.set(msgKey, txt);
-              if (cachedMessagesById.size > 5000) {
-                const oldest = cachedMessagesById.keys().next().value;
-                cachedMessagesById.delete(oldest);
-              }
-            } else if (privacyState.antiRecall && isRecalledMutation(value)) {
-              const orig = cachedMessagesById.get(msgKey) || value.__olazProtectedText;
-              if (orig) {
-                const badgeText = orig.startsWith('[Đã thu hồi]') ? orig : '[Đã thu hồi] ' + orig;
-                value = Object.assign({}, value, {
-                  isUndo: false,
-                  undo: false,
-                  msgType: value.msgType === 'chat.undo' ? 'webchat' : value.msgType,
-                  content: badgeText,
-                  __olazProtectedText: orig,
-                });
-              }
-            }
-          }
-        }
-      } catch {}
-      return key !== undefined ? rawIdbPut.call(this, value, key) : rawIdbPut.call(this, value);
-    };
-  }
-
-  inspectIncomingFrameForAntiRecall = (frameData) => {
-    if (!privacyState.antiRecall) return undefined;
-    if (typeof frameData === 'string' && (frameData.includes('chat.undo') || frameData.includes('"cmd":551'))) {
-      try {
-        const parsed = JSON.parse(frameData);
-        if (parsed && (parsed.cmd === 551 || parsed.msgType === 'chat.undo')) {
-          return JSON.stringify(Object.assign({}, parsed, { __olazRecallIntercepted: true, cmd: 0 }));
-        }
-      } catch {}
-    }
-    return undefined;
-  };
+  Object.assign(olazHost, {
+    vfsEntriesRam,
+    vfsBlobUrlCache,
+    VFS_USER_DATA,
+    VFS_DOCUMENTS,
+    VFS_DOWNLOADS,
+    VFS_TEMP,
+    normPosixPath,
+    guessMimeFromExt,
+    ensureVfsDirsInRam,
+    openVfsIdb,
+    openHostIdb,
+    writeVfsFileSync,
+    removeVfsEntry,
+    persistVfsEntry,
+    formatStatEntry,
+    makeFsErr,
+    rewriteLocalZfileUrl,
+    shieldShadowRootEvents,
+    getPrivacyState: () => Object.assign({}, privacyState),
+    setAntiRecall: (val, opts) => setAntiRecallState(val, opts),
+  });
 
   // ==========================================================================
   // 7. Electron Preload Bridge (`$z*` Globals, Stores, SharedWorker, Downloads)
@@ -2056,16 +2796,241 @@ function bootstrapSessionRuntime(globalScope) {
     }
   }
 
-  // In-browser `SharedWorkerRouter` via hidden `<iframe src="/shared-worker.html?is_main=false&fail_sqlite3=true">`
+  // In-browser `ZaloMainProcess` cross-window state & `SharedWorkerRouter`
+  // (`crates/olaz-app/src/main_process.rs` parity across `login.html`, `index.html`, and `shared-worker.html`).
   const IS_SHARED_WORKER_FRAME =
     window.location.pathname.endsWith('/shared-worker.html') ||
     new URLSearchParams(window.location.search).get('is_main') === 'false';
+  const MP_STATE_SS_KEY = 'olaz:__mp_state:' + ACTIVE_SLOT;
+  const MP_PUSH_LOGIN_SS_KEY = 'olaz:__mp_push_login_success:' + ACTIVE_SLOT;
+
+  const mpState = {
+    session: null,
+    announcedSession: null,
+    viewerKey: '',
+    remoteConfig: null,
+  };
+
+  (function hydrateMpStateFromSession() {
+    try {
+      const savedRaw = rawSsGet(MP_STATE_SS_KEY);
+      if (savedRaw) {
+        const parsed = JSON.parse(savedRaw);
+        if (parsed && typeof parsed === 'object') {
+          if (parsed.session !== undefined) mpState.session = parsed.session;
+          if (parsed.announcedSession !== undefined) mpState.announcedSession = parsed.announcedSession;
+          if (typeof parsed.viewerKey === 'string') mpState.viewerKey = parsed.viewerKey;
+          if (parsed.remoteConfig !== undefined) mpState.remoteConfig = parsed.remoteConfig;
+        }
+      }
+    } catch {}
+    try {
+      if (window.parent && window.parent !== window && window.parent.__olazGetMainProcessState) {
+        const parentSt = window.parent.__olazGetMainProcessState(ACTIVE_SLOT);
+        if (parentSt && typeof parentSt === 'object') {
+          if (parentSt.session !== null && parentSt.session !== undefined) mpState.session = parentSt.session;
+          if (parentSt.announcedSession !== null && parentSt.announcedSession !== undefined) {
+            mpState.announcedSession = parentSt.announcedSession;
+          }
+          if (parentSt.viewerKey) mpState.viewerKey = parentSt.viewerKey;
+          if (parentSt.remoteConfig !== null && parentSt.remoteConfig !== undefined) {
+            mpState.remoteConfig = parentSt.remoteConfig;
+          }
+        }
+      }
+    } catch {}
+  })();
+
+  window.__olazGetMainProcessState = (slot) =>
+    slot === ACTIVE_SLOT ? Object.assign({}, mpState) : null;
+  window.__olazApplyMainProcessPatch = (slot, patch) => {
+    if (slot === ACTIVE_SLOT && patch && typeof patch === 'object') {
+      Object.assign(mpState, patch);
+    }
+  };
+
+  function saveMpState(patch, broadcast = true) {
+    if (patch && typeof patch === 'object') {
+      Object.assign(mpState, patch);
+    }
+    try {
+      rawSsSet(MP_STATE_SS_KEY, JSON.stringify(mpState));
+    } catch {}
+    try {
+      if (window.parent && window.parent !== window && window.parent.__olazApplyMainProcessPatch) {
+        window.parent.__olazApplyMainProcessPatch(ACTIVE_SLOT, patch);
+      }
+    } catch {}
+    if (broadcast && ipcBus) {
+      try {
+        ipcBus.postMessage({
+          __olazType: 'mp-state-sync',
+          sender: CONTEXT_ID,
+          state: Object.assign({}, mpState),
+        });
+      } catch {}
+    }
+  }
+
+  Object.assign(olazHost, {
+    emitLocalIpcEvent,
+    addIpcSub,
+    removeIpcSub,
+    ipcSubs,
+    mpState,
+    saveMpState,
+  });
+
   let sharedWorkerIframe = null;
-  let sharedWorkerReady = false;
-  const swHandlers = new Set();
-  const swPending = new Map(); // reqId -> true
-  let lastSessionAnnouncement = null;
-  let cachedViewerKey = '';
+  let sharedWorkerBootDone = false;
+  const swHandlers = new Map(); // taskType -> handlerContextId
+  const swLocalHandlers = new Set(); // taskTypes registered locally by this window
+  const swPending = new Map(); // routedKey -> { origId, taskType, handlerCtx }
+  const swQueuedRuns = []; // Array<{ task: object, timer: any }>
+  let closeDbsResolvers = [];
+
+  function valueIdStr(v) {
+    if (v === undefined || v === null) return 'null';
+    if (typeof v === 'string') return v;
+    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+    try {
+      return JSON.stringify(v);
+    } catch {
+      return String(v);
+    }
+  }
+
+  function respondSharedWorkerEntry(entry, hasResult, resultVal, hasError, errorVal) {
+    const out = { id: entry.origId };
+    if (hasResult) out.result = resultVal;
+    if (hasError) out.error = errorVal;
+    setTimeout(() => emitLocalIpcEvent('shared-worker-resp', [out]), 0);
+  }
+
+  function routeSharedWorkerTaskNow(task) {
+    const origId = task.id;
+    const taskType = typeof task.type === 'string' ? task.type : '';
+    const handlerCtx = swHandlers.get(taskType);
+    if (!handlerCtx) {
+      setTimeout(() => {
+        emitLocalIpcEvent('shared-worker-resp', [
+          { id: origId, error: 'Task type is not supported' },
+        ]);
+      }, 0);
+      return;
+    }
+    const routedKey = CONTEXT_ID + '_' + valueIdStr(origId);
+    swPending.set(routedKey, { origId, taskType, handlerCtx });
+    const routedTask = Object.assign({}, task, { id: routedKey });
+    if (handlerCtx === CONTEXT_ID) {
+      setTimeout(() => emitLocalIpcEvent('shared-worker-run', [routedTask]), 0);
+    } else if (ipcBus) {
+      ipcBus.postMessage({
+        __olazType: 'sw-run',
+        sender: CONTEXT_ID,
+        target: handlerCtx,
+        task: routedTask,
+      });
+    } else {
+      swPending.delete(routedKey);
+      setTimeout(() => {
+        emitLocalIpcEvent('shared-worker-resp', [{ id: origId, error: 'Worker is not ready' }]);
+      }, 0);
+    }
+  }
+
+  function flushQueuedSharedWorkerRuns() {
+    if (!swQueuedRuns.length) return;
+    const remaining = [];
+    while (swQueuedRuns.length > 0) {
+      const item = swQueuedRuns.shift();
+      const taskType = typeof item.task.type === 'string' ? item.task.type : '';
+      if (swHandlers.has(taskType)) {
+        clearTimeout(item.timer);
+        routeSharedWorkerTaskNow(item.task);
+      } else if (sharedWorkerBootDone) {
+        clearTimeout(item.timer);
+        // Give async post-load handler registration a brief 200ms grace window before failing
+        setTimeout(() => {
+          if (swHandlers.has(taskType)) {
+            routeSharedWorkerTaskNow(item.task);
+          } else {
+            emitLocalIpcEvent('shared-worker-resp', [
+              { id: item.task.id, error: 'Task type is not supported' },
+            ]);
+          }
+        }, 200);
+      } else {
+        remaining.push(item);
+      }
+    }
+    for (const r of remaining) swQueuedRuns.push(r);
+  }
+
+  function interruptStaleWorkerPending(newHandlerCtx) {
+    const beforeKeys = Array.from(swPending.keys());
+    if (!beforeKeys.length) return;
+    setTimeout(() => {
+      for (const k of beforeKeys) {
+        const entry = swPending.get(k);
+        if (entry && entry.handlerCtx !== newHandlerCtx) {
+          swPending.delete(k);
+          respondSharedWorkerEntry(entry, false, undefined, true, {
+            name: 'WorkerInterrupted',
+            message: 'Worker is interrupted',
+          });
+        }
+      }
+    }, 100);
+  }
+
+  function resetMpState(broadcast = true) {
+    mpState.session = null;
+    mpState.announcedSession = null;
+    mpState.viewerKey = '';
+    mpState.remoteConfig = null;
+    rawSsRemove(MP_STATE_SS_KEY);
+    rawSsRemove(MP_PUSH_LOGIN_SS_KEY);
+    swHandlers.clear();
+    swLocalHandlers.clear();
+    swPending.clear();
+    while (swQueuedRuns.length > 0) {
+      const it = swQueuedRuns.shift();
+      clearTimeout(it.timer);
+    }
+    sharedWorkerBootDone = false;
+    if (sharedWorkerIframe) {
+      try {
+        sharedWorkerIframe.remove();
+      } catch {}
+      sharedWorkerIframe = null;
+    }
+    if (broadcast && ipcBus) {
+      try {
+        ipcBus.postMessage({ __olazType: 'mp-state-reset', sender: CONTEXT_ID });
+      } catch {}
+    }
+  }
+
+  function notifySharedWorkerBootComplete() {
+    sharedWorkerBootDone = true;
+    if (mpState.remoteConfig !== null && mpState.remoteConfig !== undefined) {
+      emitLocalIpcEvent('shared-worker-remote-config-change', [mpState.remoteConfig]);
+    }
+    if (mpState.viewerKey) {
+      emitLocalIpcEvent('receive-viewerkey', [mpState.viewerKey]);
+    }
+    if (ipcBus) {
+      try {
+        ipcBus.postMessage({
+          __olazType: 'sw-worker-loaded',
+          sender: CONTEXT_ID,
+          handlers: Array.from(swLocalHandlers),
+        });
+      } catch {}
+    }
+    flushQueuedSharedWorkerRuns();
+  }
 
   function ensureSharedWorkerFrame() {
     if (IS_SHARED_WORKER_FRAME || sharedWorkerIframe) return;
@@ -2075,7 +3040,7 @@ function bootstrapSessionRuntime(globalScope) {
       const ifr = document.createElement('iframe');
       ifr.style.cssText = 'position:fixed;width:0;height:0;border:0;visibility:hidden;pointer-events:none;';
       ifr.setAttribute('aria-hidden', 'true');
-      const q = buildZaloPageQuery({ is_main: 'false' });
+      const q = buildZaloPageQuery({ is_main: 'false', already_login: 'y' });
       ifr.src = '/shared-worker.html?' + q.toString();
       document.body.appendChild(ifr);
       sharedWorkerIframe = ifr;
@@ -2099,32 +3064,182 @@ function bootstrapSessionRuntime(globalScope) {
             cookies: cookieJar.exportJson(),
           });
           break;
+        case 'mp-state-sync':
+          if (msg.state && typeof msg.state === 'object') {
+            Object.assign(mpState, msg.state);
+          }
+          break;
+        case 'mp-state-reset':
+          resetMpState(false);
+          break;
         case 'ipc-broadcast':
+          if (
+            msg.channel === 'shared-worker-remote-config-change' &&
+            !IS_SHARED_WORKER_FRAME
+          ) {
+            break;
+          }
           emitLocalIpcEvent(msg.channel, msg.args || []);
           break;
+        case 'sw-sync-req':
+          if (swLocalHandlers.size > 0 || (IS_SHARED_WORKER_FRAME && sharedWorkerBootDone)) {
+            ipcBus.postMessage({
+              __olazType: 'sw-sync-ack',
+              sender: CONTEXT_ID,
+              isWorkerLoaded: IS_SHARED_WORKER_FRAME && sharedWorkerBootDone,
+              handlers: Array.from(swLocalHandlers),
+            });
+          }
+          break;
+        case 'sw-sync-ack':
+          if (Array.isArray(msg.handlers)) {
+            for (const t of msg.handlers) {
+              if (typeof t === 'string') swHandlers.set(t, msg.sender);
+            }
+          }
+          if (msg.isWorkerLoaded) {
+            sharedWorkerBootDone = true;
+          }
+          flushQueuedSharedWorkerRuns();
+          break;
+        case 'sw-worker-loaded':
+          if (Array.isArray(msg.handlers)) {
+            for (const t of msg.handlers) {
+              if (typeof t === 'string') swHandlers.set(t, msg.sender);
+            }
+          }
+          sharedWorkerBootDone = true;
+          flushQueuedSharedWorkerRuns();
+          break;
         case 'sw-register':
-          sharedWorkerReady = true;
-          if (msg.taskType) swHandlers.add(msg.taskType);
+          if (typeof msg.taskType === 'string') {
+            swHandlers.set(msg.taskType, msg.sender);
+          }
+          if (msg.isWorkerFrame) {
+            sharedWorkerBootDone = true;
+          }
+          flushQueuedSharedWorkerRuns();
+          break;
+        case 'sw-start':
+          interruptStaleWorkerPending(msg.sender);
           break;
         case 'sw-run':
-          if (IS_SHARED_WORKER_FRAME) {
+          if ((!msg.target && IS_SHARED_WORKER_FRAME) || msg.target === CONTEXT_ID) {
             emitLocalIpcEvent('shared-worker-run', [msg.task]);
           }
           break;
-        case 'sw-resp':
-          if (swPending.has(String(msg.payload && msg.payload.id))) {
-            swPending.delete(String(msg.payload.id));
-            emitLocalIpcEvent('shared-worker-resp', [msg.payload]);
+        case 'sw-resp': {
+          const p = msg.payload;
+          const routedKey = p && p.id !== undefined ? valueIdStr(p.id) : '';
+          if (routedKey && swPending.has(routedKey)) {
+            const entry = swPending.get(routedKey);
+            swPending.delete(routedKey);
+            respondSharedWorkerEntry(
+              entry,
+              Object.prototype.hasOwnProperty.call(p, 'result'),
+              p.result,
+              Object.prototype.hasOwnProperty.call(p, 'error'),
+              p.error
+            );
           }
           break;
-        case 'sw-progress':
-          emitLocalIpcEvent('shared-worker-progress', [msg.payload]);
+        }
+        case 'sw-progress': {
+          const p = msg.payload;
+          const routedKey = p && p.id !== undefined ? valueIdStr(p.id) : '';
+          if (routedKey && swPending.has(routedKey)) {
+            const entry = swPending.get(routedKey);
+            const fwd = { id: entry.origId, type: entry.taskType };
+            if (Object.prototype.hasOwnProperty.call(p, 'progress')) fwd.progress = p.progress;
+            if (Object.prototype.hasOwnProperty.call(p, 'checkpoint')) fwd.checkpoint = p.checkpoint;
+            emitLocalIpcEvent('shared-worker-progress', [fwd]);
+          }
           break;
+        }
         case 'sw-abort':
-          if (IS_SHARED_WORKER_FRAME) emitLocalIpcEvent('shared-worker-abort', [msg.payload]);
+          if ((!msg.target && IS_SHARED_WORKER_FRAME) || msg.target === CONTEXT_ID) {
+            emitLocalIpcEvent('shared-worker-abort', [msg.payload]);
+          }
+          break;
+        case 'sw-update-params':
+          if ((!msg.target && IS_SHARED_WORKER_FRAME) || msg.target === CONTEXT_ID) {
+            emitLocalIpcEvent('shared-worker-update-params', [msg.payload]);
+          }
+          break;
+        case 'vfs-sync': {
+          if (msg.op === 'put' && msg.entry && typeof msg.entry.path === 'string') {
+            const e = msg.entry;
+            ensureVfsDirsInRam(e.path);
+            vfsEntriesRam.set(e.path, {
+              path: e.path,
+              isDir: Boolean(e.isDir),
+              size: e.size || 0,
+              mtimeMs: e.mtimeMs || Date.now(),
+              data: e.data instanceof Uint8Array ? e.data : e.data ? new Uint8Array(e.data) : null,
+              mime: e.mime || '',
+            });
+          } else if (msg.op === 'rm' && typeof msg.path === 'string') {
+            vfsEntriesRam.delete(msg.path);
+            const prevBlob = vfsBlobUrlCache.get(msg.path);
+            if (prevBlob) {
+              vfsBlobUrlCache.delete(msg.path);
+              if (typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
+                try {
+                  URL.revokeObjectURL(prevBlob.url);
+                } catch {}
+              }
+            }
+          }
+          break;
+        }
+        case 'privacy-sync':
+          if (msg.privacy && typeof msg.privacy === 'object') {
+            Object.assign(privacyState, msg.privacy);
+            notifyPrivacyListeners();
+            if (refreshDeckUiFn) refreshDeckUiFn();
+          }
+          break;
+        case 'vault-lock': {
+          activeVaultCryptoKey = null;
+          if (refreshDeckUiFn) refreshDeckUiFn();
+          const curMeta = getVaultMeta();
+          if (curMeta && !isAuxiliaryFrame) {
+            promptForVaultUnlockModal(curMeta).catch(() => {});
+          }
+          break;
+        }
+        case 'vault-unlocked':
+          if (msg.key) {
+            activeVaultCryptoKey = msg.key;
+            if (dismissUnlockOverlayFn) dismissUnlockOverlayFn(msg.key);
+            flushVaultDirtyAfterUnlock().catch(() => {});
+          }
+          if (refreshDeckUiFn) refreshDeckUiFn();
+          break;
+        case 'vault-pin-updated':
+          if (!msg.hasPin) {
+            activeVaultCryptoKey = null;
+            vaultDirtyWhileLocked = false;
+            if (dismissUnlockOverlayFn) dismissUnlockOverlayFn(null);
+          } else if (msg.key) {
+            activeVaultCryptoKey = msg.key;
+            if (dismissUnlockOverlayFn) dismissUnlockOverlayFn(msg.key);
+            flushVaultDirtyAfterUnlock().catch(() => {});
+          }
+          if (refreshDeckUiFn) refreshDeckUiFn();
+          break;
+        default:
+          for (const fn of olazHost.ipcBusListeners) {
+            try {
+              fn(msg);
+            } catch {}
+          }
           break;
       }
     });
+    try {
+      ipcBus.postMessage({ __olazType: 'sw-sync-req', sender: CONTEXT_ID });
+    } catch {}
   }
 
   async function handleDownloadRequest(reqObj) {
@@ -2188,6 +3303,9 @@ function bootstrapSessionRuntime(globalScope) {
   }
 
   function handleSyncIpc(channel, args = []) {
+    if (olazHost.syncIpcHandlers.has(channel)) {
+      return olazHost.syncIpcHandlers.get(channel)(args);
+    }
     switch (channel) {
       // Electron paths & version
       case '_electron_get-path-sync':
@@ -2326,6 +3444,9 @@ function bootstrapSessionRuntime(globalScope) {
   }
 
   async function handleAsyncIpc(channel, args = []) {
+    if (olazHost.asyncIpcHandlers.has(channel)) {
+      return olazHost.asyncIpcHandlers.get(channel)(args);
+    }
     switch (channel) {
       case 'zproto-encrypt-with-keychain': {
         const arr = keychainCipher.encryptWire(args);
@@ -2336,62 +3457,96 @@ function bootstrapSessionRuntime(globalScope) {
         return Array.isArray(arr) ? arr.map((w) => decodeBridgeWireResult(w)) : [];
       }
       case 'login-success': {
+        rawSsSet(MP_PUSH_LOGIN_SS_KEY, '1');
+        await flushAllPendingWrites();
         const q = buildZaloPageQuery({ is_main: 'true', already_login: 'y' });
         window.location.assign('/index.html?' + q.toString());
         return undefined;
       }
       case 'login': {
         cookieJar.clearCookies();
+        resetMpState();
+        await flushAllPendingWrites();
         const q = buildZaloPageQuery({ logout: '1' });
         window.location.assign('/login.html?' + q.toString());
         return undefined;
       }
       case 'new-session': {
-        lastSessionAnnouncement = args[0] || null;
-        if (ipcBus && lastSessionAnnouncement) {
-          ipcBus.postMessage({
-            __olazType: 'ipc-broadcast',
-            sender: CONTEXT_ID,
-            channel: 'new-session',
-            args: [lastSessionAnnouncement],
-          });
+        const payload = args[0];
+        const isEmpty =
+          payload === undefined ||
+          payload === null ||
+          (typeof payload === 'object' &&
+            !Array.isArray(payload) &&
+            Object.keys(payload).length === 0);
+        if (isEmpty) {
+          saveMpState({ session: payload || null, announcedSession: null });
+        } else {
+          saveMpState({ session: payload, announcedSession: payload });
+          if (ipcBus) {
+            ipcBus.postMessage({
+              __olazType: 'ipc-broadcast',
+              sender: CONTEXT_ID,
+              channel: 'new-session',
+              args: [payload],
+            });
+          }
         }
         return undefined;
       }
       case 'script-connected': {
-        if (lastSessionAnnouncement) {
-          setTimeout(() => emitLocalIpcEvent('new-session', [lastSessionAnnouncement]), 0);
+        const announced = mpState.announcedSession;
+        if (announced !== null && announced !== undefined) {
+          setTimeout(() => emitLocalIpcEvent('new-session', [announced]), 0);
         }
         return undefined;
       }
       case 'db-authenticated': {
-        lastSessionAnnouncement = args[0] || null;
-        emitLocalIpcEvent('db-authenticated', [args[0]]);
-        if (ipcBus) {
-          ipcBus.postMessage({
-            __olazType: 'ipc-broadcast',
-            sender: CONTEXT_ID,
-            channel: 'db-authenticated',
-            args: [args[0]],
-          });
+        const sess = args[0];
+        saveMpState({ session: sess !== undefined ? sess : null });
+        if (sess !== undefined && sess !== null) {
+          emitLocalIpcEvent('db-authenticated', [sess]);
+          if (ipcBus) {
+            ipcBus.postMessage({
+              __olazType: 'ipc-broadcast',
+              sender: CONTEXT_ID,
+              channel: 'db-authenticated',
+              args: [sess],
+            });
+          }
         }
         return undefined;
       }
       case 'db-client-connected': {
-        if (lastSessionAnnouncement) {
-          setTimeout(() => emitLocalIpcEvent('db-authenticated', [lastSessionAnnouncement]), 0);
+        const sess = mpState.session;
+        if (sess !== undefined && sess !== null) {
+          setTimeout(() => emitLocalIpcEvent('db-authenticated', [sess]), 0);
         }
         return undefined;
       }
       case 'shared-worker-handle': {
-        sharedWorkerReady = true;
-        if (typeof args[0] === 'string') swHandlers.add(args[0]);
+        if (typeof args[0] === 'string' && args[0]) {
+          swLocalHandlers.add(args[0]);
+          swHandlers.set(args[0], CONTEXT_ID);
+          if (IS_SHARED_WORKER_FRAME) {
+            sharedWorkerBootDone = true;
+          }
+          if (ipcBus) {
+            ipcBus.postMessage({
+              __olazType: 'sw-register',
+              sender: CONTEXT_ID,
+              taskType: args[0],
+              isWorkerFrame: IS_SHARED_WORKER_FRAME,
+            });
+          }
+          flushQueuedSharedWorkerRuns();
+        }
+        return undefined;
+      }
+      case 'shared-worker-start': {
+        interruptStaleWorkerPending(CONTEXT_ID);
         if (ipcBus) {
-          ipcBus.postMessage({
-            __olazType: 'sw-register',
-            sender: CONTEXT_ID,
-            taskType: args[0],
-          });
+          ipcBus.postMessage({ __olazType: 'sw-start', sender: CONTEXT_ID });
         }
         return undefined;
       }
@@ -2399,36 +3554,150 @@ function bootstrapSessionRuntime(globalScope) {
         ensureSharedWorkerFrame();
         const task = args[0];
         if (!task || typeof task !== 'object') return undefined;
-        if (!sharedWorkerReady && !IS_SHARED_WORKER_FRAME) {
-          setTimeout(() => {
-            emitLocalIpcEvent('shared-worker-resp', [{ id: task.id, error: 'Worker is not ready' }]);
-          }, 50);
+        const taskType = typeof task.type === 'string' ? task.type : '';
+        if (swHandlers.has(taskType)) {
+          routeSharedWorkerTaskNow(task);
           return undefined;
         }
-        swPending.set(String(task.id), true);
-        if (ipcBus) {
-          ipcBus.postMessage({ __olazType: 'sw-run', sender: CONTEXT_ID, task });
+        if (sharedWorkerBootDone) {
+          // Allow a brief 200ms async settle window before reporting unsupported task type
+          setTimeout(() => {
+            if (swHandlers.has(taskType)) {
+              routeSharedWorkerTaskNow(task);
+            } else {
+              emitLocalIpcEvent('shared-worker-resp', [
+                { id: task.id, error: 'Task type is not supported' },
+              ]);
+            }
+          }, 200);
+          return undefined;
         }
+        // Queue task while hidden `shared-worker.html` iframe downloads & executes its bundles
+        const entry = { task, timer: null };
+        entry.timer = setTimeout(() => {
+          const idx = swQueuedRuns.indexOf(entry);
+          if (idx >= 0) swQueuedRuns.splice(idx, 1);
+          if (swHandlers.has(taskType)) {
+            routeSharedWorkerTaskNow(task);
+          } else {
+            emitLocalIpcEvent('shared-worker-resp', [
+              { id: task.id, error: 'Worker is not ready' },
+            ]);
+          }
+        }, 20000);
+        swQueuedRuns.push(entry);
         return undefined;
       }
       case 'shared-worker-resp': {
-        if (ipcBus && args[0]) {
-          ipcBus.postMessage({ __olazType: 'sw-resp', sender: CONTEXT_ID, payload: args[0] });
+        const p = args[0];
+        if (p && typeof p === 'object') {
+          const routedKey = p.id !== undefined ? valueIdStr(p.id) : '';
+          if (routedKey && swPending.has(routedKey)) {
+            const entry = swPending.get(routedKey);
+            swPending.delete(routedKey);
+            respondSharedWorkerEntry(
+              entry,
+              Object.prototype.hasOwnProperty.call(p, 'result'),
+              p.result,
+              Object.prototype.hasOwnProperty.call(p, 'error'),
+              p.error
+            );
+          } else if (ipcBus) {
+            ipcBus.postMessage({ __olazType: 'sw-resp', sender: CONTEXT_ID, payload: p });
+          }
         }
         return undefined;
       }
       case 'shared-worker-progress': {
-        if (ipcBus && args[0]) {
-          ipcBus.postMessage({ __olazType: 'sw-progress', sender: CONTEXT_ID, payload: args[0] });
+        const p = args[0];
+        if (p && typeof p === 'object') {
+          const routedKey = p.id !== undefined ? valueIdStr(p.id) : '';
+          if (routedKey && swPending.has(routedKey)) {
+            const entry = swPending.get(routedKey);
+            const fwd = { id: entry.origId, type: entry.taskType };
+            if (Object.prototype.hasOwnProperty.call(p, 'progress')) fwd.progress = p.progress;
+            if (Object.prototype.hasOwnProperty.call(p, 'checkpoint')) fwd.checkpoint = p.checkpoint;
+            emitLocalIpcEvent('shared-worker-progress', [fwd]);
+          } else if (ipcBus) {
+            ipcBus.postMessage({ __olazType: 'sw-progress', sender: CONTEXT_ID, payload: p });
+          }
         }
         return undefined;
       }
       case 'shared-worker-abort': {
-        if (ipcBus && args[0]) {
-          ipcBus.postMessage({ __olazType: 'sw-abort', sender: CONTEXT_ID, payload: args[0] });
+        const p = args[0];
+        if (p && typeof p === 'object') {
+          const routedKey = CONTEXT_ID + '_' + valueIdStr(p.id);
+          if (swPending.has(routedKey)) {
+            const entry = swPending.get(routedKey);
+            swPending.delete(routedKey);
+            respondSharedWorkerEntry(entry, false, undefined, true, 'Aborted');
+          }
+          const taskType = typeof p.type === 'string' ? p.type : '';
+          const handlerCtx = swHandlers.get(taskType);
+          const abortPayload = { id: routedKey };
+          if (handlerCtx === CONTEXT_ID) {
+            emitLocalIpcEvent('shared-worker-abort', [abortPayload]);
+          } else if (ipcBus) {
+            ipcBus.postMessage({
+              __olazType: 'sw-abort',
+              sender: CONTEXT_ID,
+              target: handlerCtx || null,
+              payload: abortPayload,
+            });
+          }
         }
         return undefined;
       }
+      case 'shared-worker-update-params': {
+        const p = args[0];
+        if (p && typeof p === 'object' && typeof p.type === 'string') {
+          const routedKey = CONTEXT_ID + '_' + valueIdStr(p.id);
+          const handlerCtx = swHandlers.get(p.type);
+          const updPayload = {
+            id: routedKey,
+            type: p.type,
+            params: p.params !== undefined ? p.params : null,
+          };
+          if (handlerCtx === CONTEXT_ID) {
+            emitLocalIpcEvent('shared-worker-update-params', [updPayload]);
+          } else if (ipcBus && handlerCtx) {
+            ipcBus.postMessage({
+              __olazType: 'sw-update-params',
+              sender: CONTEXT_ID,
+              target: handlerCtx,
+              payload: updPayload,
+            });
+          }
+        }
+        return undefined;
+      }
+      case 'shared-worker-remote-config-change': {
+        const a0 = args[0];
+        const cfg =
+          a0 && typeof a0 === 'object' && Object.prototype.hasOwnProperty.call(a0, 'config')
+            ? a0.config
+            : a0;
+        if (cfg !== undefined) {
+          saveMpState({ remoteConfig: cfg });
+          if (IS_SHARED_WORKER_FRAME) {
+            emitLocalIpcEvent('shared-worker-remote-config-change', [cfg]);
+          } else if (ipcBus) {
+            ipcBus.postMessage({
+              __olazType: 'ipc-broadcast',
+              sender: CONTEXT_ID,
+              channel: 'shared-worker-remote-config-change',
+              args: [cfg],
+            });
+          }
+        }
+        return undefined;
+      }
+      case 'show-shared-worker':
+      case 'hide-shared-worker':
+      case 'shared-worker-ping':
+      case 'shared-worker-dispose':
+        return undefined;
       case 'new-download-channel': {
         handleDownloadRequest(args[0]);
         return undefined;
@@ -2520,6 +3789,7 @@ function bootstrapSessionRuntime(globalScope) {
       }
       case 'migratedb:signal_restart': {
         writeNamedStoreSync('database-config', readNamedStoreSync('database-config'));
+        await flushAllPendingWrites();
         if (cookieJar.hasZpwSek()) {
           const q = buildZaloPageQuery({ is_main: 'true', already_login: 'y' });
           window.location.assign('/index.html?' + q.toString());
@@ -2531,7 +3801,7 @@ function bootstrapSessionRuntime(globalScope) {
       }
       case 'receive-viewerkey': {
         if (args[0] !== undefined && args[0] !== null) {
-          cachedViewerKey = String(args[0]);
+          saveMpState({ viewerKey: String(args[0]) });
           if (ipcBus) {
             ipcBus.postMessage({
               __olazType: 'ipc-broadcast',
@@ -2543,9 +3813,31 @@ function bootstrapSessionRuntime(globalScope) {
         }
         return undefined;
       }
-      case 'db-start-close-dbs':
-      case 'db-finish-close-dbs':
+      case 'db-start-close-dbs': {
+        const subs = ipcSubs.get('db-start-close-dbs');
+        if (!subs || subs.size === 0) return undefined;
+        emitLocalIpcEvent('db-start-close-dbs', args);
+        await new Promise((resolve) => {
+          let done = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            resolve();
+          };
+          closeDbsResolvers.push(finish);
+          setTimeout(finish, 3000);
+        });
         return undefined;
+      }
+      case 'db-finish-close-dbs': {
+        const waiters = closeDbsResolvers.splice(0, closeDbsResolvers.length);
+        for (const fn of waiters) {
+          try {
+            fn();
+          } catch {}
+        }
+        return undefined;
+      }
       case 'get-clipboard': {
         const a0 = args[0];
         const reqId =
@@ -2568,18 +3860,6 @@ function bootstrapSessionRuntime(globalScope) {
       default:
         return handleSyncIpc(channel, args);
     }
-  }
-
-  function decodeBridgeWireResult(val) {
-    if (!val || typeof val !== 'object') return val;
-    if (val.__undefined === true) return undefined;
-    if (typeof val.__bytes === 'string') {
-      const u8 = core.decodeBase64Forgiving(val.__bytes);
-      return val.__arraybuffer
-        ? u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength)
-        : u8;
-    }
-    return val;
   }
 
   function generateVideoThumbnailBrowser(filePath, maxWidth = 480, maxHeight = 480) {
@@ -2725,176 +4005,10 @@ function bootstrapSessionRuntime(globalScope) {
 
     // `$znode.path`, `$znode.os`, `$znode.url`, `$znode.events`, `$znode.crypto`, `$znode.fs*`
     const znode = (window.$znode = window.$znode || {});
-    const posixPath = {
-      sep: '/',
-      delimiter: ':',
-      normalize: (p) => normPosixPath(p),
-      join: (...segs) => normPosixPath(segs.filter(Boolean).join('/')),
-      resolve: (...segs) => normPosixPath('/' + segs.filter(Boolean).join('/')),
-      dirname: (p) => {
-        const n = normPosixPath(p);
-        const i = n.lastIndexOf('/');
-        return i <= 0 ? '/' : n.slice(0, i);
-      },
-      basename: (p, ext) => {
-        const n = normPosixPath(p);
-        let b = n.slice(n.lastIndexOf('/') + 1);
-        if (ext && b.endsWith(ext)) b = b.slice(0, -ext.length);
-        return b;
-      },
-      extname: (p) => {
-        const b = posixPath.basename(p);
-        const i = b.lastIndexOf('.');
-        return i <= 0 ? '' : b.slice(i);
-      },
-      isAbsolute: (p) => String(p || '').startsWith('/'),
-      relative: (from, to) => {
-        const f = posixPath.resolve(from).split('/').filter(Boolean);
-        const t = posixPath.resolve(to).split('/').filter(Boolean);
-        let i = 0;
-        while (i < f.length && i < t.length && f[i] === t[i]) i++;
-        return [...Array(f.length - i).fill('..'), ...t.slice(i)].join('/');
-      },
-      parse: (p) => {
-        const dir = posixPath.dirname(p);
-        const base = posixPath.basename(p);
-        const ext = posixPath.extname(p);
-        return { root: '/', dir, base, ext, name: ext ? base.slice(0, -ext.length) : base };
-      },
-      format: (o) => {
-        const obj = o && typeof o === 'object' ? o : {};
-        const dir = obj.dir || obj.root || '';
-        const base = obj.base || (obj.name || '') + (obj.ext || '');
-        return dir ? (dir === obj.root ? dir + base : dir + '/' + base) : base;
-      },
-      toNamespacedPath: (p) => p,
-    };
-    posixPath.posix = posixPath;
     znode.path = posixPath;
-
-    const osInfo = (znode.os && znode.os.__info) || {
-      release: '22.6.0',
-      version: 'Darwin Kernel Version 22.6.0',
-      arch: 'x64',
-      hostname: 'OlazWeb',
-      homedir: '/Users/olaz',
-      tmpdir: VFS_TEMP,
-      totalmem: 8 * 1024 * 1024 * 1024,
-      freemem: 4 * 1024 * 1024 * 1024,
-      cpus: navigator.hardwareConcurrency || 4,
-      uptime: 3600,
-      username: 'olaz',
-    };
-    znode.os = {
-      platform: () => 'darwin',
-      type: () => 'Darwin',
-      release: () => osInfo.release || '22.6.0',
-      version: () => osInfo.version || 'Darwin Kernel Version 22.6.0',
-      arch: () => 'x64',
-      hostname: () => osInfo.hostname || 'OlazWeb',
-      homedir: () => '/Users/olaz',
-      tmpdir: () => VFS_TEMP,
-      endianness: () => 'LE',
-      EOL: '\n',
-      totalmem: () => osInfo.totalmem,
-      freemem: () => osInfo.freemem,
-      uptime: () => osInfo.uptime || 3600,
-      loadavg: () => [0, 0, 0],
-      cpus: () =>
-        Array.from({ length: osInfo.cpus || 4 }, () => ({
-          model: 'BrowserVCPU',
-          speed: 2400,
-          times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
-        })),
-      userInfo: () => ({ username: 'olaz', uid: 1000, gid: 1000, shell: '/bin/sh', homedir: '/Users/olaz' }),
-      networkInterfaces: () => ({}),
-    };
-
-    znode.url = {
-      URL,
-      URLSearchParams,
-      pathToFileURL: (p) => new URL('file://' + normPosixPath(p)),
-      fileURLToPath: (u) => normPosixPath(typeof u === 'string' ? u : u.pathname),
-    };
-
-    znode.crypto = {
-      encrypt: (...a) => decodeBridgeWireResult(cryptoBridge.dispatchSync('encrypt', a)),
-      decrypt: (...a) => decodeBridgeWireResult(cryptoBridge.dispatchSync('decrypt', a)),
-      hash: (...a) => decodeBridgeWireResult(cryptoBridge.dispatchSync('hash', a)),
-      randomBytes: (n) => core.csprngBytes(n),
-      createHash: (alg) => {
-        const h = cryptoBridge.hashCreate([alg]);
-        return {
-          update(data, enc) {
-            cryptoBridge.hashUpdate([h, data, enc]);
-            return this;
-          },
-          digest(enc) {
-            return decodeBridgeWireResult(cryptoBridge.hashDigest([h, enc]));
-          },
-        };
-      },
-      createHmac: (alg, key) => {
-        const chunks = [];
-        const keyBytes = core.decodeInput(key, 'utf8');
-        return {
-          update(data, enc) {
-            chunks.push(core.decodeInput(data, enc));
-            return this;
-          },
-          digest(enc) {
-            const mac = core.hmacBytes(alg, keyBytes, core.concatU8(chunks));
-            return decodeBridgeWireResult(core.encodeOutput(mac, enc));
-          },
-        };
-      },
-      createCipheriv: (alg, key, iv) => {
-        const h = cryptoBridge.cipherCreate(['cipher', alg, key, iv]);
-        return {
-          setAutoPadding(ap) {
-            cryptoBridge.cipherOption([h, 'autoPadding', ap]);
-            return this;
-          },
-          setAAD(aad) {
-            cryptoBridge.cipherSetAAD([h, aad]);
-            return this;
-          },
-          update(data, inEnc, outEnc) {
-            return decodeBridgeWireResult(cryptoBridge.cipherUpdate([h, data, inEnc, outEnc]));
-          },
-          final(outEnc) {
-            return decodeBridgeWireResult(cryptoBridge.cipherFinal([h, outEnc]));
-          },
-          getAuthTag() {
-            const w = cryptoBridge.cipherGetAuthTag([h]);
-            return w ? core.decodeBase64Forgiving(w.__bytes) : new Uint8Array(0);
-          },
-        };
-      },
-      createDecipheriv: (alg, key, iv) => {
-        const h = cryptoBridge.cipherCreate(['decipher', alg, key, iv]);
-        return {
-          setAutoPadding(ap) {
-            cryptoBridge.cipherOption([h, 'autoPadding', ap]);
-            return this;
-          },
-          setAAD(aad) {
-            cryptoBridge.cipherSetAAD([h, aad]);
-            return this;
-          },
-          setAuthTag(tag) {
-            cryptoBridge.cipherSetAuthTag([h, tag]);
-            return this;
-          },
-          update(data, inEnc, outEnc) {
-            return decodeBridgeWireResult(cryptoBridge.cipherUpdate([h, data, inEnc, outEnc]));
-          },
-          final(outEnc) {
-            return decodeBridgeWireResult(cryptoBridge.cipherFinal([h, outEnc]));
-          },
-        };
-      },
-    };
+    znode.os = createZnodeOs(znode.os && znode.os.__info);
+    znode.url = znodeUrl;
+    znode.crypto = znodeCrypto;
 
     const wrapStatObj = (st) => ({
       size: st.size,
@@ -3328,7 +4442,7 @@ function bootstrapSessionRuntime(globalScope) {
     window.$zFileManager = Object.assign(window.$zFileManager || {}, {
       getSentryConfig: () => null,
       saveSentryConfig: async () => {},
-      getViewerkey: async () => cachedViewerKey,
+      getViewerkey: async () => mpState.viewerKey || '',
       writeRecentId: async () => {},
       writeZLog: async () => {},
       writeZLogBetween: async () => {},
@@ -3779,14 +4893,21 @@ function bootstrapSessionRuntime(globalScope) {
       }
     }
 
-    // Rewrite DOM `<img>` / `<video>` / `<audio>` `zfile://` & cross-origin media URLs
+    // Rewrite DOM `<img>` / `<video>` / `<audio>` `zfile://`, bare VFS paths & cross-origin media URLs
     const rewriteMediaUrl = (u) => {
       if (typeof u !== 'string') return u;
-      if (/^(zfile:|file:)/i.test(u)) return rewriteLocalZfileUrl(u);
+      if (
+        /^(zfile:|file:)/i.test(u) ||
+        /^zalo-app:\/\/local\/__olaz\/zfile\//i.test(u) ||
+        /^\/(Users\/olaz|tmp\/olaz|olaz-vfs)(\/|$)/.test(u)
+      ) {
+        return rewriteLocalZfileUrl(u);
+      }
       const target = parseZaloTargetUrl(u);
       if (target) return '/__olaz/media?u=' + encodeURIComponent(target.href);
       return u;
     };
+    olazHost.rewriteMediaUrl = rewriteMediaUrl;
     for (const [Ctor, prop, fn] of [
       [window.HTMLImageElement, 'src', rewriteLocalZfileUrl],
       [window.HTMLMediaElement, 'src', rewriteMediaUrl],
@@ -3807,7 +4928,14 @@ function bootstrapSessionRuntime(globalScope) {
     if (typeof window.open === 'function') {
       const origOpen = window.open;
       window.open = function (url, target, features) {
-        return origOpen.call(this, appendProfileParam(url), target, features);
+        const finalUrl = appendProfileParam(url);
+        const childWin = origOpen.call(this, finalUrl, target, features);
+        for (const fn of olazHost.popupWindowHooks) {
+          try {
+            fn(childWin, finalUrl);
+          } catch {}
+        }
+        return childWin;
       };
     }
   }
@@ -3845,9 +4973,14 @@ function bootstrapSessionRuntime(globalScope) {
   }
   const KV_ZALO_LOGO_SVG = renderKvZaloLogoSvg('art');
 
-  const isAuxiliaryFrame =
-    IS_SHARED_WORKER_FRAME ||
-    /\/(child|popup-viewer|znotification|sqlite)\.html$/i.test(window.location.pathname);
+  function checkIsAuxiliaryFrame() {
+    return (
+      IS_SHARED_WORKER_FRAME ||
+      window.__ZaBUNDLENAME__ === 'popup-viewer-pc' ||
+      /\/(child|popup-viewer|znotification|sqlite)\.html$/i.test(window.location.pathname)
+    );
+  }
+  const isAuxiliaryFrame = checkIsAuxiliaryFrame();
 
   let deferredPwaPrompt = null;
   let refreshDeckUiFn = null;
@@ -3905,6 +5038,7 @@ function bootstrapSessionRuntime(globalScope) {
 
   async function wipeLocalSlotSession() {
     cookieJar.clearAll();
+    resetMpState();
     rawLsRemove(VAULT_META_KEY);
     if (ACTIVE_SLOT === 'default' && rawLocalStorage && rawStorageMethods) {
       const keep = new Map();
@@ -4638,7 +5772,7 @@ function bootstrapSessionRuntime(globalScope) {
   }
 
   function installMobilePaneController() {
-    if (isAuxiliaryFrame || window.__olazMobileController) return;
+    if (checkIsAuxiliaryFrame() || window.__olazMobileController) return;
     const isMainChatRoute =
       window.location.pathname.endsWith('/index.html') ||
       window.location.pathname === '/' ||
@@ -4732,6 +5866,8 @@ function bootstrapSessionRuntime(globalScope) {
   // 8C. Floating KV Zalo Account Pill, Vault Panel & Now-Playing Media Card
   // --------------------------------------------------------------------------
 
+  const PILL_POS_KEY = 'olaz:__pill_pos_v1';
+
   function mountAccountAndPrivacyPill() {
     try {
       syncSlotWebManifest();
@@ -4739,7 +5875,7 @@ function bootstrapSessionRuntime(globalScope) {
     const mediaCtrl = installMediaSessionController();
     installMobilePaneController();
 
-    if (isAuxiliaryFrame) return;
+    if (checkIsAuxiliaryFrame()) return;
     if (typeof document.getElementById === 'function' && document.getElementById('__olaz-privacy-pill-host')) return;
 
     const host = document.createElement('div');
@@ -4756,8 +5892,10 @@ function bootstrapSessionRuntime(globalScope) {
       'data-is-mobile',
       mobileViewportMql && mobileViewportMql.matches ? 'true' : 'false'
     );
+    host.setAttribute('data-dragging', 'false');
 
     const shadow = host.attachShadow({ mode: 'open' });
+    shieldShadowRootEvents(shadow);
     shadow.innerHTML = `
       <style>
         :host {
@@ -4783,16 +5921,26 @@ function bootstrapSessionRuntime(globalScope) {
         .wrap {
           position: fixed;
           right: 16px;
-          bottom: calc(16px + var(--kvz-vv-offset, 0px) + env(safe-area-inset-bottom, 0px));
+          bottom: 112px;
           z-index: 2147483640;
-          display: flex;
-          flex-direction: column;
-          align-items: flex-end;
-          gap: 10px;
+          display: inline-block;
           font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
           color: #f8fafc;
           user-select: none;
           -webkit-user-select: none;
+        }
+        .float-stack {
+          position: absolute;
+          bottom: 48px;
+          right: 0;
+          display: flex;
+          flex-direction: column;
+          align-items: flex-end;
+          gap: 10px;
+          pointer-events: none;
+        }
+        .float-stack > * {
+          pointer-events: auto;
         }
         .pill {
           display: inline-flex;
@@ -4804,22 +5952,31 @@ function bootstrapSessionRuntime(globalScope) {
           background: rgba(15, 23, 42, 0.92);
           border: 1px solid rgba(56, 189, 248, 0.36);
           box-shadow: 0 10px 26px rgba(2, 6, 23, 0.42);
-          cursor: pointer;
+          cursor: grab;
+          touch-action: none;
           font-size: 12px;
           font-weight: 600;
           color: #f8fafc;
           backdrop-filter: blur(12px);
           -webkit-backdrop-filter: blur(12px);
-          transition: transform 0.14s ease, border-color 0.14s ease;
+          transition: border-color 0.14s ease;
+        }
+        :host([data-dragging="true"]) .pill,
+        :host([data-dragging="true"]) .brand-hdr,
+        :host([data-dragging="true"]) .mc-top,
+        :host([data-dragging="true"]) .call-rec-bar {
+          cursor: grabbing !important;
         }
         .pill:hover {
           border-color: rgba(96, 165, 250, 0.72);
         }
         .pill:focus-visible,
         .btn:focus-visible,
+        .hdr-icon-btn:focus-visible,
         .acct:focus-visible,
         .mc-btn:focus-visible,
-        .mc-seek:focus-visible {
+        .mc-seek:focus-visible,
+        .pin-input:focus-visible {
           outline: 2px solid #38bdf8;
           outline-offset: 2px;
         }
@@ -4847,9 +6004,9 @@ function bootstrapSessionRuntime(globalScope) {
         }
         .panel {
           display: none;
-          width: 312px;
-          max-width: calc(100vw - 24px);
-          max-width: calc(100dvw - 24px);
+          width: 320px;
+          max-width: calc(100vw - 16px);
+          max-width: calc(100dvw - 16px);
           max-height: calc(var(--kvz-vv-height, 100dvh) - 96px);
           overflow-y: auto;
           overscroll-behavior: contain;
@@ -4867,18 +6024,56 @@ function bootstrapSessionRuntime(globalScope) {
         .brand-hdr {
           display: flex;
           align-items: center;
-          gap: 10px;
+          gap: 8px;
           margin-bottom: 8px;
+          cursor: grab;
+          touch-action: none;
+        }
+        .drag-grip {
+          color: #64748b;
+          font-size: 13px;
+          line-height: 1;
+          flex: none;
+          letter-spacing: -1px;
         }
         .brand-hdr-icon {
-          width: 32px;
-          height: 32px;
+          width: 30px;
+          height: 30px;
           flex: none;
         }
         .brand-hdr-icon svg {
           width: 100%;
           height: 100%;
           display: block;
+        }
+        .brand-hdr-txt {
+          flex: 1 1 auto;
+          min-width: 0;
+        }
+        .hdr-actions {
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+          flex: none;
+        }
+        .hdr-icon-btn {
+          width: 26px;
+          height: 26px;
+          border-radius: 7px;
+          border: 1px solid rgba(148, 163, 184, 0.2);
+          background: rgba(30, 41, 59, 0.8);
+          color: #cbd5e1;
+          font-size: 14px;
+          line-height: 1;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          cursor: pointer;
+          padding: 0;
+        }
+        .hdr-icon-btn:hover {
+          background: rgba(51, 65, 85, 0.95);
+          color: #ffffff;
         }
         .hdr {
           font-size: 12.5px;
@@ -4933,6 +6128,15 @@ function bootstrapSessionRuntime(globalScope) {
           margin: 7px 0;
           cursor: pointer;
         }
+        .btn-row {
+          display: flex;
+          gap: 6px;
+          margin-top: 6px;
+        }
+        .btn-row .btn {
+          margin-top: 0;
+          flex: 1 1 0;
+        }
         .btn {
           width: 100%;
           min-height: 36px;
@@ -4967,10 +6171,62 @@ function bootstrapSessionRuntime(globalScope) {
           color: #fca5a5;
           background: rgba(127, 29, 29, 0.3);
         }
+        .btn.danger-solid {
+          border-color: rgba(248, 113, 113, 0.6);
+          color: #ffffff;
+          background: #dc2626;
+        }
         .btn svg {
           width: 15px;
           height: 15px;
           flex: none;
+        }
+        .pin-form {
+          margin-top: 8px;
+          padding: 10px;
+          border-radius: 11px;
+          background: rgba(2, 6, 23, 0.55);
+          border: 1px solid rgba(148, 163, 184, 0.18);
+        }
+        .pin-input {
+          width: 100%;
+          padding: 8px 10px;
+          margin-bottom: 6px;
+          border-radius: 8px;
+          border: 1px solid #334155;
+          background: #0f172a;
+          color: #f8fafc;
+          font-size: 16px;
+          outline: none;
+          user-select: text;
+          -webkit-user-select: text;
+        }
+        .pin-input:focus {
+          border-color: #38bdf8;
+        }
+        .pin-feedback {
+          font-size: 11.5px;
+          line-height: 1.35;
+          margin-top: 6px;
+          min-height: 0;
+        }
+        .pin-feedback.err {
+          color: #f87171;
+        }
+        .pin-feedback.ok {
+          color: #34d399;
+        }
+        .wipe-confirm-box {
+          margin-top: 6px;
+          padding: 9px;
+          border-radius: 10px;
+          background: rgba(127, 29, 29, 0.25);
+          border: 1px solid rgba(239, 68, 68, 0.35);
+        }
+        .wipe-confirm-lbl {
+          font-size: 11.5px;
+          color: #fecaca;
+          margin-bottom: 6px;
         }
         .hidden {
           display: none !important;
@@ -4986,8 +6242,8 @@ function bootstrapSessionRuntime(globalScope) {
         /* Now-Playing Media Card & Transport Bar */
         .media-card {
           display: none;
-          width: min(340px, calc(100vw - 24px));
-          width: min(340px, calc(100dvw - 24px));
+          width: min(340px, calc(100vw - 16px));
+          width: min(340px, calc(100dvw - 16px));
           padding: 12px 13px;
           border-radius: 16px;
           background: rgba(15, 23, 42, 0.96);
@@ -5004,6 +6260,8 @@ function bootstrapSessionRuntime(globalScope) {
           display: flex;
           align-items: center;
           gap: 10px;
+          cursor: grab;
+          touch-action: none;
         }
         .mc-art {
           width: 40px;
@@ -5144,25 +6402,10 @@ function bootstrapSessionRuntime(globalScope) {
         }
 
         @media (max-width: 767.98px) {
-          .wrap {
-            right: 12px;
-            bottom: calc(14px + var(--kvz-vv-offset, 0px) + env(safe-area-inset-bottom, 0px));
-          }
-          :host([data-has-bottom-nav="true"]) .wrap {
-            bottom: calc(64px + var(--kvz-vv-offset, 0px) + env(safe-area-inset-bottom, 0px));
-          }
           .panel {
-            width: calc(100vw - 24px);
-            width: calc(100dvw - 24px);
+            width: calc(100vw - 16px);
+            width: calc(100dvw - 16px);
             max-width: 340px;
-            max-height: calc(var(--kvz-vv-height, 100dvh) - 82px);
-          }
-          /* Lift pill out of the bottom composer area when inside an active mobile chat */
-          :host([data-mobile-pane="chat"]) .wrap {
-            top: max(10px, env(safe-area-inset-top, 0px));
-            right: 10px;
-            bottom: auto;
-            flex-direction: column-reverse;
           }
           :host([data-mobile-pane="chat"]) .pill {
             min-height: 34px;
@@ -5176,121 +6419,149 @@ function bootstrapSessionRuntime(globalScope) {
       </style>
       <div class="vv-probe" id="vvProbe" aria-hidden="true"></div>
       <div class="wrap" id="wrap">
-        <div class="panel" id="panel" role="region" aria-label="KV Zalo Vault and Accounts">
-          <div class="brand-hdr">
-            <span class="brand-hdr-icon">${renderKvZaloLogoSvg('panel')}</span>
-            <div>
-              <div class="hdr">KV Zalo Vault &amp; Accounts</div>
-              <div class="sub">100% Browser IndexedDB · 0 Bytes on Server</div>
+        <div class="float-stack" id="floatStack">
+          <div class="panel" id="panel" role="region" aria-label="KV Zalo Vault and Accounts">
+            <div class="brand-hdr" id="brandHdr">
+              <span class="drag-grip" aria-hidden="true">⋮⋮</span>
+              <span class="brand-hdr-icon">${renderKvZaloLogoSvg('panel')}</span>
+              <div class="brand-hdr-txt">
+                <div class="hdr">KV Zalo Vault &amp; Accounts</div>
+                <div class="sub">100% Browser IndexedDB · 0 Bytes on Server</div>
+              </div>
+              <div class="hdr-actions">
+                <button type="button" class="hdr-icon-btn" id="resetPosBtn" title="Reset floating position" aria-label="Reset floating position">↺</button>
+                <button type="button" class="hdr-icon-btn" id="closePanelBtn" title="Close panel" aria-label="Close panel">×</button>
+              </div>
+            </div>
+
+            <div class="sec hidden" id="pwaSec">
+              <button type="button" class="btn primary" id="installPwaBtn">
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/>
+                </svg>
+                <span>Install KV Zalo App</span>
+              </button>
+            </div>
+
+            <div class="sec hidden" id="mobileNavSec">
+              <button type="button" class="btn" id="mobilePaneBtn">
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>
+                </svg>
+                <span id="mobilePaneLabel">Mobile View: Chats</span>
+              </button>
+            </div>
+
+            <div class="sec">
+              <div class="sec-lbl">Accounts (Isolated Browser DBs)</div>
+              <div class="acct-list" id="accts"></div>
+              <button type="button" class="btn" id="addAcct">+ Add Account</button>
+            </div>
+
+            <div class="sec">
+              <label class="row" for="antiRecall">
+                <span>Xem tin thu hồi (Anti-Recall)</span>
+                <input type="checkbox" id="antiRecall" />
+              </label>
+              <div class="row">
+                <span>Vault PIN Lock: <strong id="pinState">Off</strong></span>
+              </div>
+              <button type="button" class="btn" id="pinBtn">Set Local PIN</button>
+              <div class="btn-row hidden" id="pinActiveRow">
+                <button type="button" class="btn" id="lockVaultBtn">Lock Now</button>
+                <button type="button" class="btn danger" id="clearPinBtn">Remove PIN</button>
+              </div>
+              <form class="pin-form hidden" id="pinForm">
+                <input type="password" class="pin-input hidden" id="pinCurrentInput" placeholder="Current PIN" autocomplete="current-password" />
+                <input type="password" class="pin-input hidden" id="pinNewInput" placeholder="New PIN (min 4 chars)" autocomplete="new-password" />
+                <input type="password" class="pin-input hidden" id="pinConfirmInput" placeholder="Confirm PIN" autocomplete="new-password" />
+                <div class="btn-row">
+                  <button type="submit" class="btn primary" id="pinSubmitBtn">Save PIN</button>
+                  <button type="button" class="btn" id="pinCancelBtn">Cancel</button>
+                </div>
+              </form>
+              <div class="pin-feedback hidden" id="pinFeedback"></div>
+            </div>
+
+            <div class="sec">
+              <button type="button" class="btn danger" id="wipeBtn">Wipe Local Session (${ACTIVE_SLOT})</button>
+              <div class="wipe-confirm-box hidden" id="wipeConfirmBox">
+                <div class="wipe-confirm-lbl">Wipe all local IndexedDB, cookies &amp; keys for "${ACTIVE_SLOT}"?</div>
+                <div class="btn-row">
+                  <button type="button" class="btn danger-solid" id="wipeConfirmYes">Yes, Wipe</button>
+                  <button type="button" class="btn" id="wipeConfirmCancel">Cancel</button>
+                </div>
+              </div>
             </div>
           </div>
 
-          <div class="sec hidden" id="pwaSec">
-            <button type="button" class="btn primary" id="installPwaBtn">
-              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/>
-              </svg>
-              <span>Install KV Zalo App</span>
-            </button>
-          </div>
-
-          <div class="sec hidden" id="mobileNavSec">
-            <button type="button" class="btn" id="mobilePaneBtn">
-              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>
-              </svg>
-              <span id="mobilePaneLabel">Mobile View: Chats</span>
-            </button>
-          </div>
-
-          <div class="sec">
-            <div class="sec-lbl">Accounts (Isolated Browser DBs)</div>
-            <div class="acct-list" id="accts"></div>
-            <button type="button" class="btn" id="addAcct">+ Add Account</button>
-          </div>
-
-          <div class="sec">
-            <label class="row" for="antiRecall">
-              <span>Xem tin thu hồi (Anti-Recall)</span>
-              <input type="checkbox" id="antiRecall" />
-            </label>
-            <div class="row">
-              <span>Vault PIN Lock: <strong id="pinState">Off</strong></span>
+          <section class="media-card" id="mediaCard" aria-label="Now Playing Media Controls">
+            <div class="mc-top" id="mcTop">
+              <div class="mc-art" id="mcArt">${renderKvZaloLogoSvg('media')}</div>
+              <div class="mc-meta">
+                <div class="mc-title" id="mcTitle">Voice Message</div>
+                <div class="mc-artist" id="mcArtist">KV Zalo</div>
+              </div>
+              <button type="button" class="mc-btn mc-close" id="mcClose" aria-label="Stop and close media player">
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M18 6L6 18"/><path d="M6 6l12 12"/>
+                </svg>
+              </button>
             </div>
-            <button type="button" class="btn" id="pinBtn">Set / Clear Local PIN</button>
-          </div>
 
-          <div class="sec">
-            <button type="button" class="btn danger" id="wipeBtn">Wipe Local Session (${ACTIVE_SLOT})</button>
-          </div>
+            <div class="mc-progress">
+              <input type="range" class="mc-seek" id="mcSeek" min="0" max="1000" value="0" step="1" aria-label="Seek media" />
+              <span class="mc-time" id="mcTime">0:00 / 0:00</span>
+            </div>
+
+            <div class="mc-controls">
+              <button type="button" class="mc-btn" id="mcPrev" aria-label="Previous media">
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+                  <path d="M6 6h2v12H6V6zm3.5 6 8.5 6V6l-8.5 6z"/>
+                </svg>
+              </button>
+              <button type="button" class="mc-btn" id="mcRew" aria-label="Rewind 10 seconds">
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M11 17l-5-5 5-5"/><path d="M18 17l-5-5 5-5"/>
+                </svg>
+              </button>
+              <button type="button" class="mc-btn mc-play" id="mcPlayPause" aria-label="Play">
+                <svg id="mcPlayIcon" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+                  <path d="M8 5.14v13.72a1 1 0 0 0 1.52.85l11-6.86a1 1 0 0 0 0-1.7l-11-6.86A1 1 0 0 0 8 5.14z"/>
+                </svg>
+                <svg id="mcPauseIcon" class="hidden" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+                  <rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>
+                </svg>
+              </button>
+              <button type="button" class="mc-btn" id="mcFwd" aria-label="Forward 10 seconds">
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M13 17l5-5-5-5"/><path d="M6 17l5-5-5-5"/>
+                </svg>
+              </button>
+              <button type="button" class="mc-btn" id="mcNext" aria-label="Next media">
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+                  <path d="M16 6h2v12h-2V6zM6 18l8.5-6L6 6v12z"/>
+                </svg>
+              </button>
+              <button type="button" class="mc-btn mc-rate" id="mcRate" aria-label="Playback speed">1×</button>
+              <button type="button" class="mc-btn" id="mcMute" aria-label="Mute">
+                <svg id="mcVolOn" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+                </svg>
+                <svg id="mcVolOff" class="hidden" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                  <line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>
+                </svg>
+              </button>
+              <button type="button" class="mc-btn hidden" id="mcPip" aria-label="Picture in Picture">
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="2" y="4" width="20" height="15" rx="2"/><rect x="11" y="10" width="9" height="7" rx="1" fill="currentColor"/>
+                </svg>
+              </button>
+            </div>
+          </section>
         </div>
-
-        <section class="media-card" id="mediaCard" aria-label="Now Playing Media Controls">
-          <div class="mc-top">
-            <div class="mc-art" id="mcArt">${renderKvZaloLogoSvg('media')}</div>
-            <div class="mc-meta">
-              <div class="mc-title" id="mcTitle">Voice Message</div>
-              <div class="mc-artist" id="mcArtist">KV Zalo</div>
-            </div>
-            <button type="button" class="mc-btn mc-close" id="mcClose" aria-label="Stop and close media player">
-              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M18 6L6 18"/><path d="M6 6l12 12"/>
-              </svg>
-            </button>
-          </div>
-
-          <div class="mc-progress">
-            <input type="range" class="mc-seek" id="mcSeek" min="0" max="1000" value="0" step="1" aria-label="Seek media" />
-            <span class="mc-time" id="mcTime">0:00 / 0:00</span>
-          </div>
-
-          <div class="mc-controls">
-            <button type="button" class="mc-btn" id="mcPrev" aria-label="Previous media">
-              <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
-                <path d="M6 6h2v12H6V6zm3.5 6 8.5 6V6l-8.5 6z"/>
-              </svg>
-            </button>
-            <button type="button" class="mc-btn" id="mcRew" aria-label="Rewind 10 seconds">
-              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M11 17l-5-5 5-5"/><path d="M18 17l-5-5 5-5"/>
-              </svg>
-            </button>
-            <button type="button" class="mc-btn mc-play" id="mcPlayPause" aria-label="Play">
-              <svg id="mcPlayIcon" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
-                <path d="M8 5.14v13.72a1 1 0 0 0 1.52.85l11-6.86a1 1 0 0 0 0-1.7l-11-6.86A1 1 0 0 0 8 5.14z"/>
-              </svg>
-              <svg id="mcPauseIcon" class="hidden" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
-                <rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>
-              </svg>
-            </button>
-            <button type="button" class="mc-btn" id="mcFwd" aria-label="Forward 10 seconds">
-              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M13 17l5-5-5-5"/><path d="M6 17l5-5-5-5"/>
-              </svg>
-            </button>
-            <button type="button" class="mc-btn" id="mcNext" aria-label="Next media">
-              <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
-                <path d="M16 6h2v12h-2V6zM6 18l8.5-6L6 6v12z"/>
-              </svg>
-            </button>
-            <button type="button" class="mc-btn mc-rate" id="mcRate" aria-label="Playback speed">1×</button>
-            <button type="button" class="mc-btn" id="mcMute" aria-label="Mute">
-              <svg id="mcVolOn" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
-                <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
-              </svg>
-              <svg id="mcVolOff" class="hidden" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
-                <line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>
-              </svg>
-            </button>
-            <button type="button" class="mc-btn hidden" id="mcPip" aria-label="Picture in Picture">
-              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="2" y="4" width="20" height="15" rx="2"/><rect x="11" y="10" width="9" height="7" rx="1" fill="currentColor"/>
-              </svg>
-            </button>
-          </div>
-        </section>
 
         <button type="button" class="pill" id="pill" aria-expanded="false" aria-controls="panel" aria-label="KV Zalo Multi-Account and Vault">
           <span class="brand-logo">${renderKvZaloLogoSvg('pill')}</span>
@@ -5304,8 +6575,12 @@ function bootstrapSessionRuntime(globalScope) {
 
     const vvProbe = shadow.getElementById('vvProbe');
     const wrapEl = shadow.getElementById('wrap');
+    const floatStack = shadow.getElementById('floatStack');
     const pill = shadow.getElementById('pill');
     const panel = shadow.getElementById('panel');
+    const brandHdr = shadow.getElementById('brandHdr');
+    const resetPosBtn = shadow.getElementById('resetPosBtn');
+    const closePanelBtn = shadow.getElementById('closePanelBtn');
     const pwaSec = shadow.getElementById('pwaSec');
     const installPwaBtn = shadow.getElementById('installPwaBtn');
     const mobileNavSec = shadow.getElementById('mobileNavSec');
@@ -5316,64 +6591,23 @@ function bootstrapSessionRuntime(globalScope) {
     const antiRecallCb = shadow.getElementById('antiRecall');
     const pinStateEl = shadow.getElementById('pinState');
     const pinBtn = shadow.getElementById('pinBtn');
+    const pinActiveRow = shadow.getElementById('pinActiveRow');
+    const lockVaultBtn = shadow.getElementById('lockVaultBtn');
+    const clearPinBtn = shadow.getElementById('clearPinBtn');
+    const pinForm = shadow.getElementById('pinForm');
+    const pinCurrentInput = shadow.getElementById('pinCurrentInput');
+    const pinNewInput = shadow.getElementById('pinNewInput');
+    const pinConfirmInput = shadow.getElementById('pinConfirmInput');
+    const pinSubmitBtn = shadow.getElementById('pinSubmitBtn');
+    const pinCancelBtn = shadow.getElementById('pinCancelBtn');
+    const pinFeedback = shadow.getElementById('pinFeedback');
     const wipeBtn = shadow.getElementById('wipeBtn');
-
-    const syncViewportOffset = () => {
-      if (!vvProbe || !wrapEl || typeof vvProbe.getBoundingClientRect !== 'function') return;
-      const vv = window.visualViewport;
-      const visibleTop = vv && Number.isFinite(vv.offsetTop) ? Math.max(0, vv.offsetTop) : 0;
-      const visibleHeight =
-        vv && Number.isFinite(vv.height) && vv.height > 0
-          ? vv.height
-          : Number(window.innerHeight) || 0;
-      if (visibleHeight <= 0) return;
-      const visibleBottom = visibleTop + visibleHeight;
-      const probeRect = vvProbe.getBoundingClientRect();
-      const probeBottom =
-        probeRect && Number.isFinite(probeRect.bottom) && probeRect.bottom > 0
-          ? probeRect.bottom
-          : visibleBottom;
-      const extraBottom = Math.max(0, Math.ceil(probeBottom - visibleBottom));
-      const clampedHeight = Math.max(240, Math.floor(visibleHeight));
-      if (wrapEl.style && typeof wrapEl.style.setProperty === 'function') {
-        wrapEl.style.setProperty('--kvz-vv-offset', extraBottom + 'px');
-        wrapEl.style.setProperty('--kvz-vv-height', clampedHeight + 'px');
-      }
-      const docEl = document && document.documentElement;
-      if (docEl && docEl.style && typeof docEl.style.setProperty === 'function') {
-        docEl.style.setProperty('--kvzalo-vv-offset', extraBottom + 'px');
-        docEl.style.setProperty('--kvzalo-vv-height', clampedHeight + 'px');
-      }
-    };
-
-    syncViewportOffset();
-    window.addEventListener('resize', syncViewportOffset, { passive: true });
-    window.addEventListener('orientationchange', syncViewportOffset, { passive: true });
-    if (window.visualViewport && typeof window.visualViewport.addEventListener === 'function') {
-      window.visualViewport.addEventListener('resize', syncViewportOffset, { passive: true });
-      window.visualViewport.addEventListener('scroll', syncViewportOffset, { passive: true });
-    }
-    if (typeof window.ResizeObserver === 'function') {
-      try {
-        const ro = new window.ResizeObserver(() => syncViewportOffset());
-        if (document.documentElement) ro.observe(document.documentElement);
-        if (document.body) ro.observe(document.body);
-      } catch {}
-    }
-    if (typeof window.MutationObserver === 'function' && typeof window.requestAnimationFrame === 'function' && document.body) {
-      let vvRaf = false;
-      const mo = new window.MutationObserver(() => {
-        if (vvRaf) return;
-        vvRaf = true;
-        window.requestAnimationFrame(() => {
-          vvRaf = false;
-          syncViewportOffset();
-        });
-      });
-      mo.observe(document.body, { childList: true, subtree: true });
-    }
+    const wipeConfirmBox = shadow.getElementById('wipeConfirmBox');
+    const wipeConfirmYes = shadow.getElementById('wipeConfirmYes');
+    const wipeConfirmCancel = shadow.getElementById('wipeConfirmCancel');
 
     const mediaCard = shadow.getElementById('mediaCard');
+    const mcTop = shadow.getElementById('mcTop');
     const mcArt = shadow.getElementById('mcArt');
     const mcTitle = shadow.getElementById('mcTitle');
     const mcArtist = shadow.getElementById('mcArtist');
@@ -5393,14 +6627,366 @@ function bootstrapSessionRuntime(globalScope) {
     const mcVolOff = shadow.getElementById('mcVolOff');
     const mcPip = shadow.getElementById('mcPip');
 
+    let isPanelOpen = false;
+    let pinFormMode = null; // null | 'set' | 'change' | 'clear'
+    let isWipeConfirmOpen = false;
+    let suppressNextPillClick = false;
+    let currentStackDir = 'above'; // 'above' | 'below'
+
+    const EDGE_PAD = 8;
+    const STACK_GAP = 10;
+    const DRAG_SLOP_PX = 5;
+
+    const loadSavedPillAnchor = () => {
+      try {
+        const raw = rawLsGet(PILL_POS_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (
+          parsed &&
+          (parsed.edgeX === 'left' || parsed.edgeX === 'right') &&
+          (parsed.edgeY === 'top' || parsed.edgeY === 'bottom') &&
+          Number.isFinite(Number(parsed.offsetX)) &&
+          Number.isFinite(Number(parsed.offsetY))
+        ) {
+          return {
+            edgeX: parsed.edgeX,
+            offsetX: Math.max(4, Math.round(Number(parsed.offsetX))),
+            edgeY: parsed.edgeY,
+            offsetY: Math.max(4, Math.round(Number(parsed.offsetY))),
+          };
+        }
+      } catch {}
+      return null;
+    };
+
+    let customAnchor = loadSavedPillAnchor();
+
+    const getViewportMetrics = () => {
+      const vv = window.visualViewport;
+      const vw =
+        vv && Number(vv.width) > 0
+          ? Number(vv.width)
+          : Number(window.innerWidth) > 0
+            ? Number(window.innerWidth)
+            : 0;
+      const vh =
+        vv && Number(vv.height) > 0
+          ? Number(vv.height)
+          : Number(window.innerHeight) > 0
+            ? Number(window.innerHeight)
+            : 0;
+      const left = vv && Number.isFinite(Number(vv.offsetLeft)) ? Math.max(0, Number(vv.offsetLeft)) : 0;
+      const top = vv && Number.isFinite(Number(vv.offsetTop)) ? Math.max(0, Number(vv.offsetTop)) : 0;
+      return { vw, vh, left, top, right: left + vw, bottom: top + vh };
+    };
+
+    const getDefaultPillAnchor = (vwHint) => {
+      const isMobile =
+        Boolean(mobileViewportMql && mobileViewportMql.matches) ||
+        (vwHint > 0 && vwHint < 768);
+      const isLogin = /\/login\.html$/i.test(window.location.pathname || '');
+      if (isMobile) {
+        if (!isLogin && (getRootMobilePane() || 'list') === 'chat') {
+          return { edgeX: 'right', offsetX: 10, edgeY: 'top', offsetY: 58 };
+        }
+        return { edgeX: 'right', offsetX: 12, edgeY: 'bottom', offsetY: isLogin ? 18 : 66 };
+      }
+      if (isLogin) {
+        return { edgeX: 'right', offsetX: 16, edgeY: 'bottom', offsetY: 18 };
+      }
+      return { edgeX: 'right', offsetX: 16, edgeY: 'bottom', offsetY: 112 };
+    };
+
+    const syncViewportCssVars = (vp) => {
+      if (!vvProbe || !wrapEl || typeof vvProbe.getBoundingClientRect !== 'function') return;
+      if (vp.vh <= 0) return;
+      const probeRect = vvProbe.getBoundingClientRect();
+      const probeBottom =
+        probeRect && Number.isFinite(probeRect.bottom) && probeRect.bottom > 0
+          ? probeRect.bottom
+          : vp.bottom;
+      const extraBottom = Math.max(0, Math.ceil(probeBottom - vp.bottom));
+      const clampedHeight = Math.max(240, Math.floor(vp.vh));
+      if (wrapEl.style && typeof wrapEl.style.setProperty === 'function') {
+        wrapEl.style.setProperty('--kvz-vv-offset', extraBottom + 'px');
+        wrapEl.style.setProperty('--kvz-vv-height', clampedHeight + 'px');
+      }
+      const docEl = document && document.documentElement;
+      if (docEl && docEl.style && typeof docEl.style.setProperty === 'function') {
+        docEl.style.setProperty('--kvzalo-vv-offset', extraBottom + 'px');
+        docEl.style.setProperty('--kvzalo-vv-height', clampedHeight + 'px');
+      }
+    };
+
+    const layoutFloatingDeck = (lockedOrientation) => {
+      const vp = getViewportMetrics();
+      syncViewportCssVars(vp);
+      const anchor = customAnchor || getDefaultPillAnchor(vp.vw);
+
+      if (vp.vw <= 0 || vp.vh <= 0) {
+        if (anchor.edgeX === 'left') {
+          wrapEl.style.left = anchor.offsetX + 'px';
+          wrapEl.style.right = 'auto';
+        } else {
+          wrapEl.style.right = anchor.offsetX + 'px';
+          wrapEl.style.left = 'auto';
+        }
+        if (anchor.edgeY === 'top') {
+          wrapEl.style.top = anchor.offsetY + 'px';
+          wrapEl.style.bottom = 'auto';
+        } else {
+          wrapEl.style.bottom = anchor.offsetY + 'px';
+          wrapEl.style.top = 'auto';
+        }
+        return;
+      }
+
+      const pillRect = typeof pill.getBoundingClientRect === 'function' ? pill.getBoundingClientRect() : null;
+      const pillW = pillRect && pillRect.width > 0 ? pillRect.width : 148;
+      const pillH = pillRect && pillRect.height > 0 ? pillRect.height : 38;
+
+      const rawX =
+        anchor.edgeX === 'left'
+          ? vp.left + anchor.offsetX
+          : vp.right - pillW - anchor.offsetX;
+      const rawY =
+        anchor.edgeY === 'top'
+          ? vp.top + anchor.offsetY
+          : vp.bottom - pillH - anchor.offsetY;
+
+      const maxLeft = Math.max(vp.left + EDGE_PAD, vp.right - pillW - EDGE_PAD);
+      const maxTop = Math.max(vp.top + EDGE_PAD, vp.bottom - pillH - EDGE_PAD);
+      const pillLeft = Math.min(maxLeft, Math.max(vp.left + EDGE_PAD, rawX));
+      const pillTop = Math.min(maxTop, Math.max(vp.top + EDGE_PAD, rawY));
+
+      wrapEl.style.left = Math.round(pillLeft) + 'px';
+      wrapEl.style.top = Math.round(pillTop) + 'px';
+      wrapEl.style.right = 'auto';
+      wrapEl.style.bottom = 'auto';
+
+      const spaceAbove = pillTop - vp.top - EDGE_PAD - STACK_GAP;
+      const spaceBelow = vp.bottom - (pillTop + pillH) - EDGE_PAD - STACK_GAP;
+      const placeBelow = lockedOrientation
+        ? lockedOrientation === 'below'
+        : spaceBelow > spaceAbove && spaceAbove < 340;
+      currentStackDir = placeBelow ? 'below' : 'above';
+
+      if (placeBelow) {
+        floatStack.style.top = Math.round(pillH + STACK_GAP) + 'px';
+        floatStack.style.bottom = 'auto';
+        floatStack.style.flexDirection = 'column-reverse';
+      } else {
+        floatStack.style.bottom = Math.round(pillH + STACK_GAP) + 'px';
+        floatStack.style.top = 'auto';
+        floatStack.style.flexDirection = 'column';
+      }
+
+      const availStackH = Math.max(160, Math.floor(placeBelow ? spaceBelow : spaceAbove));
+      let siblingHeight = 0;
+      if (floatStack.children && floatStack.children.length) {
+        for (let i = 0; i < floatStack.children.length; i++) {
+          const ch = floatStack.children[i];
+          if (!ch || ch === panel) continue;
+          if (typeof ch.getBoundingClientRect === 'function') {
+            const cr = ch.getBoundingClientRect();
+            if (cr && cr.height > 0) siblingHeight += cr.height + STACK_GAP;
+          }
+        }
+      }
+      panel.style.maxHeight = Math.max(150, Math.floor(availStackH - siblingHeight)) + 'px';
+
+      const stackRect =
+        typeof floatStack.getBoundingClientRect === 'function'
+          ? floatStack.getBoundingClientRect()
+          : null;
+      const fallbackStackW = Math.min(isPanelOpen ? 320 : 340, Math.max(200, vp.vw - EDGE_PAD * 2));
+      const stackW = stackRect && stackRect.width > 0 ? stackRect.width : fallbackStackW;
+
+      const isLeftHalf = pillLeft + pillW / 2 <= vp.left + vp.vw / 2;
+      floatStack.style.alignItems = isLeftHalf ? 'flex-start' : 'flex-end';
+      const desiredScreenLeft = isLeftHalf ? pillLeft : pillLeft + pillW - stackW;
+      const maxStackScreenLeft = Math.max(vp.left + EDGE_PAD, vp.right - stackW - EDGE_PAD);
+      const clampedScreenLeft = Math.min(
+        maxStackScreenLeft,
+        Math.max(vp.left + EDGE_PAD, desiredScreenLeft)
+      );
+      floatStack.style.left = Math.round(clampedScreenLeft - pillLeft) + 'px';
+      floatStack.style.right = 'auto';
+    };
+
+    const attachDragHandle = (handleEl, opts) => {
+      if (!handleEl || typeof handleEl.addEventListener !== 'function') return;
+      const lockOrientationOnDrag = Boolean(opts && opts.lockOrientationOnDrag);
+
+      handleEl.addEventListener('pointerdown', (ev) => {
+        if (!ev || (ev.button !== undefined && ev.button !== 0)) return;
+        const t = ev.target;
+        if (
+          t &&
+          t !== handleEl &&
+          typeof t.closest === 'function' &&
+          t.closest('button, input, select, textarea, a, label')
+        ) {
+          return;
+        }
+        const vpStart = getViewportMetrics();
+        if (vpStart.vw <= 0 || vpStart.vh <= 0) return;
+
+        const wrapRect =
+          typeof wrapEl.getBoundingClientRect === 'function' ? wrapEl.getBoundingClientRect() : null;
+        const pillRect =
+          typeof pill.getBoundingClientRect === 'function' ? pill.getBoundingClientRect() : null;
+        const pillW = pillRect && pillRect.width > 0 ? pillRect.width : 148;
+        const pillH = pillRect && pillRect.height > 0 ? pillRect.height : 38;
+        const startLeft = wrapRect ? wrapRect.left : parseFloat(wrapEl.style.left) || 0;
+        const startTop = wrapRect ? wrapRect.top : parseFloat(wrapEl.style.top) || 0;
+        const startClientX = Number(ev.clientX) || 0;
+        const startClientY = Number(ev.clientY) || 0;
+        const lockedDir = lockOrientationOnDrag ? currentStackDir : null;
+        let dragging = false;
+
+        const onMove = (moveEv) => {
+          const dx = (Number(moveEv.clientX) || 0) - startClientX;
+          const dy = (Number(moveEv.clientY) || 0) - startClientY;
+          if (!dragging) {
+            if (Math.hypot(dx, dy) < DRAG_SLOP_PX) return;
+            dragging = true;
+            suppressNextPillClick = true;
+            host.setAttribute('data-dragging', 'true');
+            if (typeof handleEl.setPointerCapture === 'function' && ev.pointerId !== undefined) {
+              try {
+                handleEl.setPointerCapture(ev.pointerId);
+              } catch {}
+            }
+          }
+          if (typeof moveEv.preventDefault === 'function') moveEv.preventDefault();
+          const vp = getViewportMetrics();
+          if (vp.vw <= 0 || vp.vh <= 0) return;
+          const maxL = Math.max(vp.left + EDGE_PAD, vp.right - pillW - EDGE_PAD);
+          const maxT = Math.max(vp.top + EDGE_PAD, vp.bottom - pillH - EDGE_PAD);
+          const nextL = Math.min(maxL, Math.max(vp.left + EDGE_PAD, startLeft + dx));
+          const nextT = Math.min(maxT, Math.max(vp.top + EDGE_PAD, startTop + dy));
+          const edgeX = nextL + pillW / 2 < vp.left + vp.vw / 2 ? 'left' : 'right';
+          const edgeY = nextT + pillH / 2 < vp.top + vp.vh / 2 ? 'top' : 'bottom';
+          const offsetX = Math.max(
+            EDGE_PAD,
+            Math.round(edgeX === 'left' ? nextL - vp.left : vp.right - (nextL + pillW))
+          );
+          const offsetY = Math.max(
+            EDGE_PAD,
+            Math.round(edgeY === 'top' ? nextT - vp.top : vp.bottom - (nextT + pillH))
+          );
+          customAnchor = { edgeX, offsetX, edgeY, offsetY };
+          layoutFloatingDeck(lockedDir);
+        };
+        onMove.__olazInternal = true;
+
+        const onUp = () => {
+          if (typeof window.removeEventListener === 'function') {
+            window.removeEventListener('pointermove', onMove, true);
+            window.removeEventListener('pointerup', onUp, true);
+            window.removeEventListener('pointercancel', onUp, true);
+          }
+          host.setAttribute('data-dragging', 'false');
+          if (dragging && customAnchor) {
+            rawLsSet(PILL_POS_KEY, JSON.stringify(customAnchor));
+            layoutFloatingDeck(null);
+            const clearClickGuard = setTimeout(() => {
+              suppressNextPillClick = false;
+            }, 120);
+            if (clearClickGuard && typeof clearClickGuard.unref === 'function') {
+              clearClickGuard.unref();
+            }
+          }
+        };
+        onUp.__olazInternal = true;
+
+        if (typeof window.addEventListener === 'function') {
+          window.addEventListener('pointermove', onMove, true);
+          window.addEventListener('pointerup', onUp, true);
+          window.addEventListener('pointercancel', onUp, true);
+        }
+      });
+    };
+
+    attachDragHandle(pill, { lockOrientationOnDrag: false });
+    attachDragHandle(brandHdr, { lockOrientationOnDrag: true });
+    attachDragHandle(mcTop, { lockOrientationOnDrag: true });
+
+    const onViewportResize = () => layoutFloatingDeck(null);
+    onViewportResize.__olazInternal = true;
+    window.addEventListener('resize', onViewportResize, { passive: true });
+    window.addEventListener('orientationchange', onViewportResize, { passive: true });
+    if (window.visualViewport && typeof window.visualViewport.addEventListener === 'function') {
+      window.visualViewport.addEventListener('resize', onViewportResize, { passive: true });
+      window.visualViewport.addEventListener('scroll', onViewportResize, { passive: true });
+    }
+    if (typeof window.ResizeObserver === 'function') {
+      try {
+        const ro = new window.ResizeObserver(() => layoutFloatingDeck(null));
+        if (document.documentElement) ro.observe(document.documentElement);
+        if (document.body) ro.observe(document.body);
+      } catch {}
+    }
+
     let isDraggingSeek = false;
     let lastRenderedArtwork = '';
 
+    const setPinFeedback = (text, kind) => {
+      pinFeedback.textContent = text || '';
+      pinFeedback.className =
+        'pin-feedback' + (text ? (kind === 'ok' ? ' ok' : ' err') : ' hidden');
+    };
+
+    const setPinFormMode = (mode) => {
+      pinFormMode = mode;
+      pinCurrentInput.value = '';
+      pinNewInput.value = '';
+      pinConfirmInput.value = '';
+      if (!mode) {
+        pinForm.classList.toggle('hidden', true);
+        layoutFloatingDeck(null);
+        return;
+      }
+      pinForm.classList.toggle('hidden', false);
+      const needCurrent = mode === 'change' || mode === 'clear';
+      const needNew = mode === 'set' || mode === 'change';
+      pinCurrentInput.classList.toggle('hidden', !needCurrent);
+      pinNewInput.classList.toggle('hidden', !needNew);
+      pinConfirmInput.classList.toggle('hidden', !needNew);
+      pinNewInput.placeholder = mode === 'change' ? 'New PIN (min 4 chars)' : 'New PIN (min 4 chars)';
+      pinConfirmInput.placeholder = mode === 'change' ? 'Confirm New PIN' : 'Confirm PIN';
+      pinSubmitBtn.textContent =
+        mode === 'set' ? 'Save PIN' : mode === 'change' ? 'Update PIN' : 'Remove PIN';
+      setPinFeedback('', '');
+      layoutFloatingDeck(null);
+      const firstInput = needCurrent ? pinCurrentInput : pinNewInput;
+      const ft = setTimeout(() => {
+        if (firstInput && typeof firstInput.focus === 'function') firstInput.focus();
+      }, 15);
+      if (ft && typeof ft.unref === 'function') ft.unref();
+    };
+
+    const setPanelOpen = (open) => {
+      isPanelOpen = Boolean(open);
+      panel.classList.toggle('open', isPanelOpen);
+      pill.setAttribute('aria-expanded', isPanelOpen ? 'true' : 'false');
+      if (!isPanelOpen) {
+        setPinFormMode(null);
+        isWipeConfirmOpen = false;
+        wipeConfirmBox.classList.toggle('hidden', true);
+      }
+      layoutFloatingDeck(null);
+    };
+
     const renderMediaCard = () => {
-      syncViewportOffset();
       const st = mediaCtrl.getState();
       mediaCard.classList.toggle('visible', Boolean(st.visible));
-      if (!st.visible) return;
+      if (!st.visible) {
+        layoutFloatingDeck(null);
+        return;
+      }
 
       const meta = st.metadata || { title: 'Voice Message', artist: 'KV Zalo', artworkUrl: '' };
       mcTitle.textContent = meta.title || 'Voice Message';
@@ -5449,11 +7035,11 @@ function bootstrapSessionRuntime(globalScope) {
       mcVolOn.classList.toggle('hidden', Boolean(st.muted));
       mcVolOff.classList.toggle('hidden', !st.muted);
       mcPip.classList.toggle('hidden', !st.pipAvailable);
+      layoutFloatingDeck(null);
     };
     renderMediaCardUiFn = renderMediaCard;
 
     const render = () => {
-      syncViewportOffset();
       acctsEl.innerHTML = '';
       for (const item of loadKnownProfiles()) {
         const b = document.createElement('button');
@@ -5468,14 +7054,17 @@ function bootstrapSessionRuntime(globalScope) {
         acctsEl.appendChild(b);
       }
       antiRecallCb.checked = Boolean(privacyState.antiRecall);
-      pinStateEl.textContent = getVaultMeta() ? 'AES-256-GCM' : 'Off';
+      const hasPin = Boolean(getVaultMeta());
+      pinStateEl.textContent = hasPin ? 'AES-256-GCM' : 'Off';
+      pinBtn.textContent = hasPin ? 'Change PIN' : 'Set Local PIN';
+      pinActiveRow.classList.toggle('hidden', !hasPin);
 
       pwaSec.classList.toggle('hidden', !deferredPwaPrompt);
 
       const isMobileNow = Boolean(mobileViewportMql && mobileViewportMql.matches);
       const hasMainChat =
         window.location.pathname.endsWith('/index.html') ||
-        Boolean(document.getElementById('container'));
+        Boolean(typeof document.getElementById === 'function' && document.getElementById('container'));
       mobileNavSec.classList.toggle('hidden', !(isMobileNow && hasMainChat));
       if (isMobileNow && hasMainChat) {
         const curPane = getRootMobilePane() || 'list';
@@ -5486,10 +7075,25 @@ function bootstrapSessionRuntime(globalScope) {
     };
     refreshDeckUiFn = render;
 
-    pill.addEventListener('click', () => {
+    pill.addEventListener('click', (ev) => {
+      if (suppressNextPillClick) {
+        suppressNextPillClick = false;
+        if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+        if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation();
+        return;
+      }
       render();
-      const isOpen = panel.classList.toggle('open');
-      pill.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+      setPanelOpen(!isPanelOpen);
+    });
+
+    resetPosBtn.addEventListener('click', () => {
+      customAnchor = null;
+      rawLsRemove(PILL_POS_KEY);
+      layoutFloatingDeck(null);
+    });
+
+    closePanelBtn.addEventListener('click', () => {
+      setPanelOpen(false);
     });
 
     installPwaBtn.addEventListener('click', async () => {
@@ -5510,8 +7114,7 @@ function bootstrapSessionRuntime(globalScope) {
     mobilePaneBtn.addEventListener('click', () => {
       const curPane = getRootMobilePane() || 'list';
       setMobilePane(curPane === 'chat' ? 'list' : 'chat');
-      panel.classList.remove('open');
-      pill.setAttribute('aria-expanded', 'false');
+      setPanelOpen(false);
     });
 
     addBtn.addEventListener('click', () => {
@@ -5526,25 +7129,94 @@ function bootstrapSessionRuntime(globalScope) {
     });
 
     antiRecallCb.addEventListener('change', () => {
-      privacyState.antiRecall = antiRecallCb.checked;
-      persistPrivacySettings();
+      setAntiRecallState(antiRecallCb.checked);
     });
 
-    pinBtn.addEventListener('click', async () => {
+    pinBtn.addEventListener('click', () => {
       const hasPin = Boolean(getVaultMeta());
-      const promptText = hasPin
-        ? 'Enter a new Local Vault PIN (or leave empty to remove PIN encryption):'
-        : 'Set a Local Browser Vault PIN (encrypts zpw_sek & E2EE keys with SubtleCrypto AES-256-GCM):';
-      const entered = window.prompt(promptText, '');
-      if (entered === null) return;
-      await configureVaultPin(entered.trim());
-      render();
+      const targetMode = hasPin ? 'change' : 'set';
+      setPinFormMode(pinFormMode === targetMode ? null : targetMode);
     });
 
-    wipeBtn.addEventListener('click', async () => {
-      if (window.confirm('Wipe all local browser IndexedDB/cookies/keys for "' + ACTIVE_SLOT + '"?')) {
-        await wipeLocalSlotSession();
+    clearPinBtn.addEventListener('click', () => {
+      setPinFormMode(pinFormMode === 'clear' ? null : 'clear');
+    });
+
+    lockVaultBtn.addEventListener('click', () => {
+      setPanelOpen(false);
+      lockVaultNow().catch(() => {});
+    });
+
+    pinCancelBtn.addEventListener('click', () => {
+      setPinFormMode(null);
+    });
+
+    pinForm.addEventListener('submit', async (ev) => {
+      if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+      if (!pinFormMode) return;
+      const mode = pinFormMode;
+      const curPin = String(pinCurrentInput.value || '');
+      const nextPin = String(pinNewInput.value || '').trim();
+      const confPin = String(pinConfirmInput.value || '').trim();
+
+      if (mode === 'set' || mode === 'change') {
+        if (nextPin.length < 4) {
+          setPinFeedback('PIN must be at least 4 characters', 'err');
+          return;
+        }
+        if (nextPin !== confPin) {
+          setPinFeedback('PINs do not match', 'err');
+          return;
+        }
       }
+      if ((mode === 'change' || mode === 'clear') && !curPin.length) {
+        setPinFeedback('Incorrect current PIN', 'err');
+        return;
+      }
+
+      pinSubmitBtn.disabled = true;
+      try {
+        if (mode === 'clear') {
+          await configureVaultPin('', curPin);
+          setPinFormMode(null);
+          setPinFeedback('Vault PIN removed', 'ok');
+        } else if (mode === 'change') {
+          await configureVaultPin(nextPin, curPin);
+          setPinFormMode(null);
+          setPinFeedback('Vault PIN updated (AES-256-GCM)', 'ok');
+        } else {
+          await configureVaultPin(nextPin);
+          setPinFormMode(null);
+          setPinFeedback('Vault PIN enabled (AES-256-GCM)', 'ok');
+        }
+        render();
+      } catch (err) {
+        const msg = String((err && err.message) || err);
+        setPinFeedback(
+          /Invalid PIN/i.test(msg) ? 'Incorrect current PIN' : msg,
+          'err'
+        );
+      } finally {
+        pinSubmitBtn.disabled = false;
+      }
+    });
+
+    wipeBtn.addEventListener('click', () => {
+      isWipeConfirmOpen = !isWipeConfirmOpen;
+      wipeConfirmBox.classList.toggle('hidden', !isWipeConfirmOpen);
+      layoutFloatingDeck(null);
+    });
+
+    wipeConfirmCancel.addEventListener('click', () => {
+      isWipeConfirmOpen = false;
+      wipeConfirmBox.classList.toggle('hidden', true);
+      layoutFloatingDeck(null);
+    });
+
+    wipeConfirmYes.addEventListener('click', async () => {
+      wipeConfirmYes.disabled = true;
+      wipeConfirmCancel.disabled = true;
+      await wipeLocalSlotSession();
     });
 
     // Media Card interactive transport bindings
@@ -5581,6 +7253,39 @@ function bootstrapSessionRuntime(globalScope) {
     });
 
     render();
+
+    const deckContext = {
+      host,
+      shadow,
+      wrapEl,
+      floatStack,
+      panel,
+      pill,
+      mediaCard,
+      refreshDeck: render,
+      requestLayout: () => layoutFloatingDeck(null),
+      attachDragHandle,
+    };
+    olazHost.deckContext = deckContext;
+    for (const fn of olazHost.deckMountHooks) {
+      try {
+        fn(deckContext);
+      } catch {}
+    }
+    const origDeckPush = olazHost.deckMountHooks.push.bind(olazHost.deckMountHooks);
+    olazHost.deckMountHooks.push = function (...fns) {
+      const res = origDeckPush(...fns);
+      for (const fn of fns) {
+        if (typeof fn === 'function') {
+          try {
+            fn(deckContext);
+          } catch {}
+        }
+      }
+      layoutFloatingDeck(null);
+      return res;
+    };
+    layoutFloatingDeck(null);
   }
 
   // ==========================================================================
@@ -5616,6 +7321,12 @@ function bootstrapSessionRuntime(globalScope) {
             hostImei = row.v;
           } else if (row.k === 'privacy' && row.v && typeof row.v === 'object') {
             Object.assign(privacyState, row.v);
+            const lsAnti = rawLsGet(ANTI_RECALL_LS_KEY);
+            if (lsAnti !== null) {
+              privacyState.antiRecall = lsAnti !== '0' && lsAnti !== 'false';
+            } else {
+              rawLsSet(ANTI_RECALL_LS_KEY, privacyState.antiRecall ? '1' : '0');
+            }
           } else if (row.k.startsWith('store:')) {
             const name = row.k.slice('store:'.length);
             const opened =
@@ -5623,10 +7334,7 @@ function bootstrapSessionRuntime(globalScope) {
                 ? await openWithVaultKey(activeVaultCryptoKey, row.v)
                 : row.v;
             if (opened && typeof opened === 'object') {
-              hostStoresRam.set(
-                name,
-                name === 'database-config' ? core.normalizeDatabaseConfig(opened) : opened
-              );
+              hostStoresRam.set(name, opened);
             }
           }
         } catch {}
@@ -5654,10 +7362,69 @@ function bootstrapSessionRuntime(globalScope) {
       }
     }
 
+    if (hostStoresRam.has('database-config')) {
+      const prevDbCfg = hostStoresRam.get('database-config');
+      const nextDbCfg = readNamedStoreSync('database-config');
+      let dbCfgChanged = false;
+      try {
+        dbCfgChanged = JSON.stringify(prevDbCfg) !== JSON.stringify(nextDbCfg);
+      } catch {
+        dbCfgChanged = true;
+      }
+      if (dbCfgChanged) {
+        writeNamedStoreSync('database-config', nextDbCfg);
+      } else {
+        hostStoresRam.set('database-config', nextDbCfg);
+      }
+    }
+
+    if (IS_WINDOW && rawLocalStorage && rawStorageMethods) {
+      try {
+        const lsKeys = [];
+        for (let i = 0; i < rawLocalStorage.length; i++) {
+          const k = rawStorageMethods.key.call(rawLocalStorage, i);
+          if (typeof k === 'string') lsKeys.push(k);
+        }
+        const staleSuffixes = ['db4-ftu-required', 'sf-mg-gate', 'ismigtin', 'sqlite_m_d'];
+        for (const k of lsKeys) {
+          if (k.startsWith('olaz:__')) continue;
+          const kl = k.toLowerCase();
+          if (staleSuffixes.some((s) => kl === s || kl.endsWith(s))) {
+            rawLsRemove(k);
+          } else if (kl.endsWith('adp-st')) {
+            const rawVal = rawLsGet(k);
+            if (typeof rawVal === 'string') {
+              try {
+                const parsed = JSON.parse(rawVal);
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                  let mutated = false;
+                  for (const innerK of Object.keys(parsed)) {
+                    if (parsed[innerK] !== 0) {
+                      parsed[innerK] = 0;
+                      mutated = true;
+                    }
+                  }
+                  if (mutated) {
+                    rawLsSet(k, JSON.stringify(parsed));
+                  }
+                  continue;
+                }
+              } catch {}
+              if (rawVal !== '0') {
+                rawLsSet(k, '0');
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+
     if (!hostImei) {
       hostImei = generateDefaultImei();
       idbPutKv('imei', hostImei);
     }
+
+    notifyPrivacyListeners();
 
     try {
       const vfsDb = await openVfsIdb();
@@ -5685,7 +7452,361 @@ function bootstrapSessionRuntime(globalScope) {
     } catch {}
   }
 
-  async function runDeferredZaloScripts() {
+  let tryApplyWebpackRuntimePatchesNow = null;
+
+  function installBrowserWebpackRuntimePatches() {
+    if (window.__olazWebpackPatchesInstalled) return;
+    window.__olazWebpackPatchesInstalled = true;
+
+    const eachExport = (req, visit) => {
+      if (!req || !req.c) return;
+      for (const [id, mod] of Object.entries(req.c)) {
+        const ex = mod && mod.exports;
+        if (!ex) continue;
+        try {
+          visit(ex, id);
+        } catch {}
+        if (typeof ex === 'object') {
+          for (const k of Object.keys(ex)) {
+            try {
+              if (ex[k]) visit(ex[k], id);
+            } catch {}
+          }
+        }
+      }
+    };
+
+    const diRegistrations = (req) => {
+      const out = [];
+      const seen = new Set();
+      eachExport(req, (ex) => {
+        if (!ex || typeof ex !== 'object' || seen.has(ex)) return;
+        const registry = ex._registry && ex._registry._registryMap;
+        if (typeof ex.resolve !== 'function' || !(registry instanceof Map)) return;
+        seen.add(ex);
+        for (const regs of registry.values()) {
+          for (const r of regs || []) out.push(r);
+        }
+      });
+      return out;
+    };
+
+    window.__zaloEachExport = eachExport;
+    window.__zaloDI = diRegistrations;
+
+    let gidSvc = null;
+    const findGidSvc = () => {
+      if (gidSvc) return gidSvc;
+      const req = window.__zaloRequire;
+      if (!req) return null;
+      eachExport(req, (ex) => {
+        if (gidSvc || !ex || typeof ex !== 'object') return;
+        try {
+          if (
+            ex._userIdMap instanceof Map &&
+            ex._globalIdMap instanceof Map &&
+            typeof ex.getGlobalId === 'function' &&
+            typeof ex.getGlobalIdFromServer === 'function'
+          ) {
+            gidSvc = ex;
+          }
+        } catch {}
+      });
+      return gidSvc;
+    };
+
+    if (typeof window.__swzGlobalIdFallback !== 'function') {
+      window.__swzGlobalIdFallback = async (uids) => {
+        const svc = findGidSvc();
+        const ids = Array.isArray(uids)
+          ? [...new Set(uids.filter((u) => typeof u === 'string' && u && !u.startsWith('g')))]
+          : [];
+        const out = {};
+        if (!svc || !ids.length) return out;
+        for (let i = 0; i < ids.length; i += 100) {
+          const part = ids.slice(i, i + 100);
+          const m = await svc.getGlobalId(part);
+          for (const id of part) {
+            if (m && typeof m[id] === 'string' && m[id]) out[id] = m[id];
+          }
+        }
+        return out;
+      };
+    }
+
+    const patchSingleRegistration = (reg) => {
+      if (!reg || typeof reg !== 'object') return false;
+      let done = false;
+      for (const c of [reg.instance, reg.provider && reg.provider.useClass, reg.provider]) {
+        const proto =
+          typeof c === 'function'
+            ? c.prototype
+            : c && typeof c === 'object'
+              ? Object.getPrototypeOf(c)
+              : null;
+        if (!proto || typeof proto.waitForDBMigrate !== 'function' || proto.waitForDBMigrate.__olaz) {
+          continue;
+        }
+        const original = proto.waitForDBMigrate;
+        proto.waitForDBMigrate = function (session, config, diskConfig) {
+          return original.call(
+            this,
+            session,
+            Object.assign({}, config || {}, { enable: false }),
+            diskConfig
+          );
+        };
+        proto.waitForDBMigrate.__olaz = true;
+        done = true;
+      }
+      return done;
+    };
+
+    let migratePatched = false;
+    let resizerPinned = false;
+    let resizerMicrotaskQueued = false;
+
+    const queueResizerPinCheck = () => {
+      if (resizerPinned || resizerMicrotaskQueued) return;
+      resizerMicrotaskQueued = true;
+      Promise.resolve().then(() => {
+        resizerMicrotaskQueued = false;
+        if (!resizerPinned && window.__zaloRequire && pinResizer(window.__zaloRequire)) {
+          resizerPinned = true;
+        }
+      });
+    };
+
+    const seenDiRegs = typeof WeakSet === 'function' ? new WeakSet() : new Set();
+    const notifyExternalDiHooks = (reg) => {
+      if (!reg || typeof reg !== 'object' || seenDiRegs.has(reg)) return;
+      seenDiRegs.add(reg);
+      for (const fn of olazHost.diRegistrationHooks) {
+        try {
+          fn(reg);
+        } catch {}
+      }
+    };
+
+    const runExternalWebpackHooks = (req) => {
+      if (!req || !olazHost.webpackModuleHooks.length) return;
+      for (const fn of olazHost.webpackModuleHooks) {
+        try {
+          fn(req);
+        } catch {}
+      }
+    };
+
+    const hookDiRegistries = (req) => {
+      eachExport(req, (ex) => {
+        if (!ex || typeof ex !== 'object') return;
+        const regObj = ex._registry;
+        if (
+          !regObj ||
+          typeof regObj !== 'object' ||
+          !(regObj._registryMap instanceof Map) ||
+          typeof ex.resolve !== 'function'
+        ) {
+          return;
+        }
+        for (const regs of regObj._registryMap.values()) {
+          for (const r of regs || []) {
+            notifyExternalDiHooks(r);
+          }
+        }
+        if (regObj.__olazHooked) return;
+        try {
+          Object.defineProperty(regObj, '__olazHooked', { value: true });
+          if (typeof regObj.set === 'function') {
+            const origSet = regObj.set;
+            regObj.set = function (token, registration) {
+              const r = origSet.apply(this, arguments);
+              try {
+                if (patchSingleRegistration(registration)) {
+                  migratePatched = true;
+                }
+                if (!resizerPinned) {
+                  queueResizerPinCheck();
+                }
+                notifyExternalDiHooks(registration);
+              } catch {}
+              return r;
+            };
+          }
+        } catch {}
+      });
+    };
+
+    const patchWaitForDbMigrate = (req) => {
+      hookDiRegistries(req);
+      let done = false;
+      for (const reg of diRegistrations(req)) {
+        if (patchSingleRegistration(reg)) {
+          done = true;
+        }
+      }
+      return done;
+    };
+
+    const pinResizer = (req) => {
+      let pinned = false;
+      eachExport(req, (ex) => {
+        if (pinned || !ex || typeof ex !== 'object' || ex === window.$capp) return;
+        try {
+          if (
+            Object.prototype.hasOwnProperty.call(ex, 'stickerUrl') &&
+            Object.prototype.hasOwnProperty.call(ex, 'sendToMeId')
+          ) {
+            if (!ex.__olazResizer) {
+              let value = ex.image_resizer;
+              const patched = (v) =>
+                v && typeof v === 'object' && !Array.isArray(v)
+                  ? Object.assign({}, v, { enable_libvips_macos: 0 })
+                  : v;
+              Object.defineProperty(ex, 'image_resizer', {
+                configurable: true,
+                enumerable: true,
+                get: () => patched(value),
+                set: (v) => {
+                  value = v;
+                },
+              });
+              Object.defineProperty(ex, '__olazResizer', { value: true });
+            }
+            pinned = true;
+          }
+        } catch {}
+      });
+      return pinned;
+    };
+
+    let inStep = false;
+    const step = () => {
+      if (inStep) return false;
+      inStep = true;
+      try {
+        if (!window.__zaloRequire) {
+          const jsonp = window.webpackJsonp;
+          if (!jsonp || jsonp.push === Array.prototype.push) return false;
+          const probeId = '__olaz_web_probe_' + Date.now();
+          try {
+            jsonp.push([
+              [probeId],
+              {
+                [probeId]: (_m, _e, r) => {
+                  window.__zaloRequire = r;
+                },
+              },
+              [[probeId]],
+            ]);
+          } catch {}
+        }
+        const req = window.__zaloRequire;
+        if (!req) return false;
+        hookDiRegistries(req);
+        if (!migratePatched && patchWaitForDbMigrate(req)) {
+          migratePatched = true;
+        }
+        if (!resizerPinned && pinResizer(req)) {
+          resizerPinned = true;
+        }
+        runExternalWebpackHooks(req);
+        return migratePatched && resizerPinned;
+      } finally {
+        inStep = false;
+      }
+    };
+
+    const makeWrappedPush = (origPush) => {
+      if (
+        typeof origPush !== 'function' ||
+        origPush === Array.prototype.push ||
+        origPush.__olazWrapped
+      ) {
+        return origPush;
+      }
+      const wrapped = function (...args) {
+        const res = origPush.apply(this, args);
+        try {
+          step();
+        } catch {}
+        if (!(migratePatched && resizerPinned) || olazHost.webpackModuleHooks.length > 0) {
+          Promise.resolve()
+            .then(() => Promise.resolve())
+            .then(() => Promise.resolve())
+            .then(() => {
+              try {
+                step();
+              } catch {}
+            });
+        }
+        return res;
+      };
+      Object.defineProperty(wrapped, '__olazWrapped', { value: true });
+      return wrapped;
+    };
+
+    const wrapJsonpArray = (arr) => {
+      if (!Array.isArray(arr)) return;
+      if (arr.push !== Array.prototype.push && !arr.push.__olazWrapped) {
+        try {
+          arr.push = makeWrappedPush(arr.push);
+        } catch {}
+      }
+      if (!arr.__olazPushWatched) {
+        try {
+          let currentPush = arr.push;
+          Object.defineProperty(arr, '__olazPushWatched', { value: true });
+          Object.defineProperty(arr, 'push', {
+            configurable: true,
+            enumerable: false,
+            get() {
+              return currentPush;
+            },
+            set(fn) {
+              currentPush = makeWrappedPush(fn);
+            },
+          });
+        } catch {}
+      }
+    };
+
+    if (window.webpackJsonp) {
+      wrapJsonpArray(window.webpackJsonp);
+    }
+    try {
+      const desc = Object.getOwnPropertyDescriptor(window, 'webpackJsonp');
+      if (!desc || desc.configurable) {
+        let jsonpVal = window.webpackJsonp;
+        Object.defineProperty(window, 'webpackJsonp', {
+          configurable: true,
+          enumerable: true,
+          get() {
+            return jsonpVal;
+          },
+          set(v) {
+            jsonpVal = v;
+            wrapJsonpArray(v);
+          },
+        });
+      }
+    } catch {}
+
+    tryApplyWebpackRuntimePatchesNow = () => {
+      if (window.webpackJsonp) wrapJsonpArray(window.webpackJsonp);
+      return step();
+    };
+    if (!tryApplyWebpackRuntimePatchesNow()) {
+      const timer = setInterval(() => {
+        if (tryApplyWebpackRuntimePatchesNow()) clearInterval(timer);
+      }, 200);
+      if (timer && typeof timer.unref === 'function') timer.unref();
+      const stopTimer = setTimeout(() => clearInterval(timer), 60000);
+      if (stopTimer && typeof stopTimer.unref === 'function') stopTimer.unref();
+    }
+  }
+
+  async function runDeferredZaloScripts(onEachScriptLoaded) {
     const placeholders = Array.from(document.querySelectorAll('script[data-olaz-defer-src]'));
     for (const ph of placeholders) {
       const src = ph.getAttribute('data-olaz-defer-src');
@@ -5698,7 +7819,14 @@ function bootstrapSessionRuntime(globalScope) {
         }
         s.src = appendProfileParam(src);
         s.async = false;
-        s.onload = () => resolve();
+        s.onload = () => {
+          if (typeof onEachScriptLoaded === 'function') {
+            try {
+              onEachScriptLoaded();
+            } catch {}
+          }
+          resolve();
+        };
         s.onerror = () => resolve();
         ph.replaceWith(s);
       });
@@ -5744,9 +7872,27 @@ function bootstrapSessionRuntime(globalScope) {
       if (pathname.endsWith('/index.html')) {
         ensureSharedWorkerFrame();
       }
-      await runDeferredZaloScripts();
-      emitLocalIpcEvent('visibility-change', ['show']);
-      emitLocalIpcEvent('visibility-change', ['focus', '1']);
+      if (
+        pathname.endsWith('/index.html') ||
+        IS_SHARED_WORKER_FRAME ||
+        /\/popup-viewer\.html$/i.test(pathname) ||
+        window.__ZaBUNDLENAME__ === 'popup-viewer-pc'
+      ) {
+        installBrowserWebpackRuntimePatches();
+      }
+      await runDeferredZaloScripts(() => {
+        if (tryApplyWebpackRuntimePatchesNow) tryApplyWebpackRuntimePatchesNow();
+      });
+      if (IS_SHARED_WORKER_FRAME) {
+        notifySharedWorkerBootComplete();
+      } else {
+        emitLocalIpcEvent('visibility-change', ['show']);
+        emitLocalIpcEvent('visibility-change', ['focus', '1']);
+        if (pathname.endsWith('/index.html') && rawSsGet(MP_PUSH_LOGIN_SS_KEY) === '1') {
+          rawSsRemove(MP_PUSH_LOGIN_SS_KEY);
+          emitLocalIpcEvent('login-success', []);
+        }
+      }
     };
 
     if (document.readyState === 'loading') {

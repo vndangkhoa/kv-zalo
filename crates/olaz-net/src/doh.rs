@@ -28,14 +28,28 @@ use thiserror::Error;
 use tracing::warn;
 
 /// Strict allowlist of Zalo domains eligible for DoH fallback (`MediaLoader.dohHostSuffixes`).
-pub const ZALO_CDN_SUFFIXES: [&str; 7] = [
+pub const ZALO_CDN_SUFFIXES: [&str; 21] = [
+    "zalo.me",
+    "zalo.vn",
+    "zalo.ai",
+    "zaloapp.com",
     "zadn.vn",
     "zdn.vn",
-    "zalo.me",
-    "zaloapp.com",
-    "zingcdn.me",
-    "zalo.vn",
+    "z-cdn.me",
+    "dlfl.vn",
+    "dlfl.me",
+    "dlfl.info",
+    "flchat.vn",
+    "pchat.vn",
+    "dlmd.me",
+    "mdchat.me",
+    "zavi.me",
+    "zapps.vn",
     "zing.vn",
+    "zingcdn.me",
+    "zingmp3.vn",
+    "zingmp3.com",
+    "zingtv.vn",
 ];
 
 /// TTL for authoritative NXDOMAIN entries (`MediaLoader.deadHostTTL` = 300s).
@@ -578,4 +592,53 @@ fn normalize_host(host: &str) -> String {
         .trim_end_matches(']')
         .trim_end_matches('.')
         .to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zalo_cdn_allowlist_covers_media_file_video_and_ws_hosts_while_rejecting_non_zalo() {
+        for suffix in ZALO_CDN_SUFFIXES {
+            assert!(is_zalo_cdn(suffix), "exact suffix {suffix} must match");
+            assert!(
+                is_zalo_cdn(&format!("sub.{suffix}.")),
+                "subdomain with trailing dot for {suffix} must match"
+            );
+        }
+
+        for allowed in [
+            "f12-zpcloud.zdn.vn",
+            "b2.dlfl.vn",
+            "b2.dlfl.me",
+            "b2.dlfl.info",
+            "v1.dlmd.me",
+            "p1.flchat.vn",
+            "c1.pchat.vn",
+            "m1.mdchat.me",
+            "media-ten.z-cdn.me",
+            "ws.zavi.me",
+            "F12-ZPCLOUD.ZDN.VN",
+        ] {
+            assert!(is_zalo_cdn(allowed), "expected {allowed} to be allowed");
+        }
+
+        for rejected in [
+            "",
+            "evil.com",
+            "dlfl.vn.evil.com",
+            "zdn.vn.evil.com",
+            "evilzadn.vn",
+            "notdlfl.vn",
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+        ] {
+            assert!(
+                !is_zalo_cdn(rejected),
+                "expected {rejected} to be rejected by is_zalo_cdn"
+            );
+        }
+    }
 }

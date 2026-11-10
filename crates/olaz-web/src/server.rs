@@ -22,6 +22,7 @@ use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -83,6 +84,18 @@ struct SharedState {
     bundle: BundleProvider,
     auth: AuthGate,
     relay: StatelessRelay,
+    runtime_tag: String,
+}
+
+fn compute_runtime_tag() -> String {
+    let mut h = Sha256::new();
+    h.update(env!("CARGO_PKG_VERSION").as_bytes());
+    h.update(PRELOAD_JS.as_bytes());
+    h.update(CRYPTO_SYNC_JS.as_bytes());
+    h.update(SW_JS.as_bytes());
+    h.update(MOBILE_CSS.as_bytes());
+    let digest = h.finalize();
+    hex::encode(&digest[..8])
 }
 
 /// Binds `config.listen_addr` and spawns the stateless `olaz-web` edge server.
@@ -102,6 +115,7 @@ pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle
         bundle: config.bundle,
         auth,
         relay,
+        runtime_tag: compute_runtime_tag(),
     });
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -673,16 +687,54 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> Re
     // 9. Static Zalo bundle assets from read-only `BundleProvider`.
     if head.method == "GET" || head.method == "HEAD" {
         if let Some(asset) = state.bundle.get_asset(&head.raw_target) {
-            write_static_response(
-                &mut stream,
-                200,
-                "OK",
-                &asset.content_type,
-                &asset.bytes,
-                &[],
-                head.method == "HEAD",
-            )
-            .await?;
+            let lower_path = head.path.to_ascii_lowercase();
+            let is_html = lower_path.ends_with(".html") || lower_path.ends_with(".htm");
+            if !is_html {
+                let etag = format!("W/\"{}-{:x}\"", state.runtime_tag, asset.bytes.len());
+                if head
+                    .header("if-none-match")
+                    .is_some_and(|inm| inm.split(',').any(|t| t.trim() == etag))
+                {
+                    let resp_304 = format!(
+                        concat!(
+                            "HTTP/1.1 304 Not Modified\r\n",
+                            "ETag: {etag}\r\n",
+                            "Cache-Control: private, max-age=300\r\n",
+                            "Content-Length: 0\r\n",
+                            "Connection: close\r\n",
+                            "\r\n"
+                        ),
+                        etag = etag,
+                    );
+                    stream.write_all(resp_304.as_bytes()).await?;
+                    stream.flush().await?;
+                    return Ok(());
+                }
+                write_static_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &asset.content_type,
+                    &asset.bytes,
+                    &[
+                        ("Cache-Control", "private, max-age=300"),
+                        ("ETag", etag.as_str()),
+                    ],
+                    head.method == "HEAD",
+                )
+                .await?;
+            } else {
+                write_static_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &asset.content_type,
+                    &asset.bytes,
+                    &[],
+                    head.method == "HEAD",
+                )
+                .await?;
+            }
             return Ok(());
         }
         write_json_response(&mut stream, 404, "Not Found", &json!({ "error": "not_found" }))
