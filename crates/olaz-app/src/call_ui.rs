@@ -374,7 +374,9 @@ impl CallUiController {
 
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
         window.set_title(title);
+        window.set_resizable(true);
         window.set_default_size(width, height);
+        window.set_size_request(320, 320);
         window.set_decorated(false);
         window.set_position(gtk::WindowPosition::Center);
         if always_on_top {
@@ -383,8 +385,16 @@ impl CallUiController {
 
         let ucm = UserContentManager::new();
         ucm.register_script_message_handler("zcallUi");
+        ucm.register_script_message_handler("__olaz_win_drag");
         ucm.add_script(&UserScript::new(
             PRELOAD_BRIDGE_JS,
+            UserContentInjectedFrames::TopFrame,
+            UserScriptInjectionTime::Start,
+            &[],
+            &[],
+        ));
+        ucm.add_script(&UserScript::new(
+            olaz_core::LINUX_FRAMELESS_WIN_DRAG_SCRIPT,
             UserContentInjectedFrames::TopFrame,
             UserScriptInjectionTime::Start,
             &[],
@@ -407,7 +417,7 @@ impl CallUiController {
             .build();
         webview.set_hexpand(true);
         webview.set_vexpand(true);
-        let last_press = crate::client_host::track_last_button_press(&webview);
+        let last_press = crate::client_host::install_win_drag_handler(&ucm, &webview);
         window.add(&webview);
 
         let managed = Rc::new(ManagedCallWindow {

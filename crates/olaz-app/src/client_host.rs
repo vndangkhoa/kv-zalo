@@ -1770,15 +1770,35 @@ pub(crate) fn track_last_button_press<W: IsA<gtk::Widget>>(
 ) -> std::rc::Rc<std::cell::Cell<Option<LastButtonPress>>> {
     let cell = std::rc::Rc::new(std::cell::Cell::new(None));
     let cell_ref = std::rc::Rc::clone(&cell);
-    widget.connect_button_press_event(move |_, ev| {
+    widget.connect_button_press_event(move |w, ev| {
         let (rx, ry) = ev.root();
+        let rx_i = rx.round() as i32;
+        let ry_i = ry.round() as i32;
         cell_ref.set(Some(LastButtonPress {
             button: ev.button(),
-            root_x: rx.round() as i32,
-            root_y: ry.round() as i32,
+            root_x: rx_i,
+            root_y: ry_i,
             time: ev.time(),
             captured_at: std::time::Instant::now(),
         }));
+        if ev.button() == 1 && ev.event_type() == gdk::EventType::ButtonPress {
+            if let Some(win) = w
+                .toplevel()
+                .and_then(|top| top.downcast::<gtk::Window>().ok())
+            {
+                if !win.is_decorated() && win.is_resizable() && !win.is_maximized() {
+                    let (lx, ly) = ev.position();
+                    let (wx, wy) = w
+                        .translate_coordinates(&win, lx.round() as i32, ly.round() as i32)
+                        .unwrap_or((lx.round() as i32, ly.round() as i32));
+                    let (ww, wh) = win.size();
+                    if let Some(edge) = detect_outer_rim_edge_for_coords(wx, wy, ww, wh) {
+                        win.begin_resize_drag(edge, 1, rx_i, ry_i, ev.time());
+                        return glib::Propagation::Stop;
+                    }
+                }
+            }
+        }
         glib::Propagation::Proceed
     });
     cell
@@ -1838,34 +1858,137 @@ pub(crate) fn execute_win_drag_command(
     }
 }
 
+pub(crate) fn detect_win_edge_for_coords_with_margins(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    border: i32,
+    corner: i32,
+) -> Option<gdk::WindowEdge> {
+    if width < 120 || height < 120 || x < 0 || x > width || y < 0 || y > height {
+        return None;
+    }
+    let left = x < border;
+    let right = x >= width - border;
+    let top = y < border;
+    let bottom = y >= height - border;
+    if (top && x < corner) || (left && y < corner) {
+        return Some(gdk::WindowEdge::NorthWest);
+    }
+    if (top && x >= width - corner) || (right && y < corner) {
+        return Some(gdk::WindowEdge::NorthEast);
+    }
+    if (bottom && x < corner) || (left && y >= height - corner) {
+        return Some(gdk::WindowEdge::SouthWest);
+    }
+    if (bottom && x >= width - corner) || (right && y >= height - corner) {
+        return Some(gdk::WindowEdge::SouthEast);
+    }
+    if top {
+        Some(gdk::WindowEdge::North)
+    } else if bottom {
+        Some(gdk::WindowEdge::South)
+    } else if left {
+        Some(gdk::WindowEdge::West)
+    } else if right {
+        Some(gdk::WindowEdge::East)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn detect_win_edge_for_coords(
     x: i32,
     y: i32,
     width: i32,
     height: i32,
 ) -> Option<gdk::WindowEdge> {
-    const BORDER: i32 = 5;
-    if width < 120 || height < 120 {
+    detect_win_edge_for_coords_with_margins(x, y, width, height, 8, 16)
+}
+
+pub(crate) fn detect_outer_rim_edge_for_coords(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Option<gdk::WindowEdge> {
+    const RIM: i32 = 4;
+    if x >= width - 148 && y < 36 && !(x >= width - RIM && y < RIM) {
         return None;
     }
-    let left = x >= 0 && x < BORDER;
-    let right = x <= width && x > width - BORDER;
-    let top = y >= 0 && y < BORDER;
-    let bottom = y <= height && y > height - BORDER;
-    match (top, bottom, left, right) {
-        (true, _, true, _) => Some(gdk::WindowEdge::NorthWest),
-        (true, _, _, true) => Some(gdk::WindowEdge::NorthEast),
-        (_, true, true, _) => Some(gdk::WindowEdge::SouthWest),
-        (_, true, _, true) => Some(gdk::WindowEdge::SouthEast),
-        (true, _, _, _) => Some(gdk::WindowEdge::North),
-        (_, true, _, _) => Some(gdk::WindowEdge::South),
-        (_, _, true, _) => Some(gdk::WindowEdge::West),
-        (_, _, _, true) => Some(gdk::WindowEdge::East),
-        _ => None,
+    detect_win_edge_for_coords_with_margins(x, y, width, height, RIM, RIM)
+}
+
+pub(crate) fn resize_edge_cursor_name(edge: gdk::WindowEdge) -> &'static str {
+    match edge {
+        gdk::WindowEdge::North | gdk::WindowEdge::South => "ns-resize",
+        gdk::WindowEdge::East | gdk::WindowEdge::West => "ew-resize",
+        gdk::WindowEdge::NorthWest | gdk::WindowEdge::SouthEast => "nwse-resize",
+        gdk::WindowEdge::NorthEast | gdk::WindowEdge::SouthWest => "nesw-resize",
+        _ => "default",
+    }
+}
+
+fn update_widget_resize_cursor(
+    widget: &gtk::Widget,
+    win: &gtk::Window,
+    edge: Option<gdk::WindowEdge>,
+) {
+    let cursor = edge.and_then(|e| {
+        let display = widget.display();
+        gdk::Cursor::from_name(&display, resize_edge_cursor_name(e))
+    });
+    if let Some(gdk_win) = widget.window() {
+        gdk_win.set_cursor(cursor.as_ref());
+    }
+    if let Some(top_win) = win.window() {
+        top_win.set_cursor(cursor.as_ref());
     }
 }
 
 pub(crate) fn install_widget_win_drag<W: IsA<gtk::Widget>>(widget: &W) {
+    widget.add_events(
+        gdk::EventMask::BUTTON_PRESS_MASK
+            | gdk::EventMask::POINTER_MOTION_MASK
+            | gdk::EventMask::LEAVE_NOTIFY_MASK,
+    );
+
+    widget.connect_motion_notify_event(move |w, ev| {
+        if let Some(win) = w
+            .toplevel()
+            .and_then(|top| top.downcast::<gtk::Window>().ok())
+        {
+            let edge = if !win.is_decorated() && win.is_resizable() && !win.is_maximized() {
+                let (lx, ly) = ev.position();
+                let (wx, wy) = w
+                    .translate_coordinates(&win, lx.round() as i32, ly.round() as i32)
+                    .unwrap_or((lx.round() as i32, ly.round() as i32));
+                let (ww, wh) = win.size();
+                detect_win_edge_for_coords(wx, wy, ww, wh)
+            } else {
+                None
+            };
+            update_widget_resize_cursor(w.upcast_ref::<gtk::Widget>(), &win, edge);
+        }
+        glib::Propagation::Proceed
+    });
+
+    widget.connect_leave_notify_event(move |w, _| {
+        if let Some(gdk_win) = w.window() {
+            gdk_win.set_cursor(None);
+        }
+        if let Some(win) = w
+            .toplevel()
+            .and_then(|top| top.downcast::<gtk::Window>().ok())
+        {
+            if let Some(top_win) = win.window() {
+                top_win.set_cursor(None);
+            }
+        }
+        glib::Propagation::Proceed
+    });
+
     widget.connect_button_press_event(move |w, ev| {
         if ev.button() != 1 {
             return glib::Propagation::Proceed;
@@ -1893,6 +2016,7 @@ pub(crate) fn install_widget_win_drag<W: IsA<gtk::Widget>>(widget: &W) {
                     let ry_i = ry.round() as i32;
                     if win.is_resizable() && !win.is_maximized() {
                         if let Some(edge) = detect_win_edge_for_coords(wx, wy, ww, wh) {
+                            update_widget_resize_cursor(w.upcast_ref::<gtk::Widget>(), &win, None);
                             win.begin_resize_drag(edge, 1, rx_i, ry_i, ev.time());
                             return glib::Propagation::Stop;
                         }
@@ -1907,8 +2031,12 @@ pub(crate) fn install_widget_win_drag<W: IsA<gtk::Widget>>(widget: &W) {
     });
 }
 
-pub(crate) fn install_win_drag_handler(ucm: &UserContentManager, webview: &WebView) {
+pub(crate) fn install_win_drag_handler(
+    ucm: &UserContentManager,
+    webview: &WebView,
+) -> std::rc::Rc<std::cell::Cell<Option<LastButtonPress>>> {
     let last_press = track_last_button_press(webview);
+    let last_press_for_ucm = std::rc::Rc::clone(&last_press);
     let wv_weak = {
         let w = glib::WeakRef::new();
         w.set(Some(webview));
@@ -1937,8 +2065,9 @@ pub(crate) fn install_win_drag_handler(ucm: &UserContentManager, webview: &WebVi
         let Some(cmd) = parse_win_drag_command(&payload) else {
             return;
         };
-        execute_win_drag_command(&win, Some(last_press.as_ref()), cmd);
+        execute_win_drag_command(&win, Some(last_press_for_ucm.as_ref()), cmd);
     });
+    last_press
 }
 
 fn wire_ucm_znet_and_zbridge(
@@ -2440,8 +2569,9 @@ impl OfficialClientHost {
                 let popup_win = gtk::Window::new(gtk::WindowType::Toplevel);
                 popup_win.set_title("Zalo — Media Viewer");
                 popup_win.set_decorated(false);
+                popup_win.set_resizable(true);
                 popup_win.set_default_size(default_w, default_h);
-                popup_win.set_size_request(520, 400);
+                popup_win.set_size_request(420, 360);
                 popup_win.set_position(gtk::WindowPosition::Center);
 
                 let child_ucm = UserContentManager::new();
@@ -3197,14 +3327,49 @@ mod win_drag_tests {
             Some(gdk::WindowEdge::NorthWest)
         );
         assert_eq!(
+            detect_win_edge_for_coords(12, 5, 1200, 800),
+            Some(gdk::WindowEdge::NorthWest)
+        );
+        assert_eq!(
             detect_win_edge_for_coords(1198, 798, 1200, 800),
             Some(gdk::WindowEdge::SouthEast)
         );
         assert_eq!(
-            detect_win_edge_for_coords(3, 400, 1200, 800),
+            detect_win_edge_for_coords(1188, 795, 1200, 800),
+            Some(gdk::WindowEdge::SouthEast)
+        );
+        assert_eq!(
+            detect_win_edge_for_coords(7, 400, 1200, 800),
             Some(gdk::WindowEdge::West)
+        );
+        assert_eq!(
+            detect_win_edge_for_coords(1194, 400, 1200, 800),
+            Some(gdk::WindowEdge::East)
         );
         assert_eq!(detect_win_edge_for_coords(100, 100, 1200, 800), None);
         assert_eq!(detect_win_edge_for_coords(2, 2, 80, 80), None);
+
+        // Outer GTK rim preserves top-right window controls while allowing literal NE corner & side rims.
+        assert_eq!(detect_outer_rim_edge_for_coords(1180, 2, 1200, 800), None);
+        assert_eq!(
+            detect_outer_rim_edge_for_coords(1198, 2, 1200, 800),
+            Some(gdk::WindowEdge::NorthEast)
+        );
+        assert_eq!(
+            detect_outer_rim_edge_for_coords(1198, 200, 1200, 800),
+            Some(gdk::WindowEdge::East)
+        );
+        assert_eq!(detect_outer_rim_edge_for_coords(6, 200, 1200, 800), None);
+
+        assert_eq!(resize_edge_cursor_name(gdk::WindowEdge::North), "ns-resize");
+        assert_eq!(resize_edge_cursor_name(gdk::WindowEdge::West), "ew-resize");
+        assert_eq!(
+            resize_edge_cursor_name(gdk::WindowEdge::SouthEast),
+            "nwse-resize"
+        );
+        assert_eq!(
+            resize_edge_cursor_name(gdk::WindowEdge::NorthEast),
+            "nesw-resize"
+        );
     }
 }

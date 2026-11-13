@@ -71,7 +71,7 @@ pub const PRELOAD_BRIDGE_JS: &str = r#"(function () {
   };
 
   document.addEventListener('mousedown', function (ev) {
-    if (ev.button !== 0) return;
+    if (ev.defaultPrevented || ev.button !== 0) return;
     var t = ev.target;
     if (!t || !t.closest) return;
     if (t.closest('button, select, input, option, .no-drag, .wc, .dock-btn, .rbtn, #actions, #dock, .controls-bar, #rec-toast')) return;

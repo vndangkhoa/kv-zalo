@@ -5076,6 +5076,30 @@ function makeEl({{ id = '', tag = 'div', classes = [], role = '', dataId = '', c
   return el;
 }}
 
+let cursorStyles = [];
+let mockMaximized = false;
+const docEl = {{
+  dataset: {{}},
+  setAttribute(k, v) {{ if (k === 'data-olaz-resize-cursor') this.dataset.olazResizeCursor = v; }},
+  removeAttribute(k) {{ if (k === 'data-olaz-resize-cursor') delete this.dataset.olazResizeCursor; }},
+}};
+globalThis.document = {{
+  documentElement: docEl,
+  head: {{
+    appendChild(node) {{ cursorStyles.push(node); }},
+  }},
+  getElementById(id) {{
+    return cursorStyles.find((n) => n.id === id) || null;
+  }},
+  createElement(tag) {{
+    return {{ tag, id: '', textContent: '' }};
+  }},
+  querySelector(sel) {{
+    if (sel === '.titlebar__btns.is-maximized') return mockMaximized ? {{}} : null;
+    return null;
+  }},
+}};
+
 globalThis.window = {{
   innerWidth: 1200,
   innerHeight: 800,
@@ -5174,10 +5198,35 @@ const moveMainTabTop = fireMousedown(navTop, {{ clientX: 20, clientY: 10, dragDe
 const tabBlocked = fireMousedown(tabIcon, {{ dragDelta: [10, 0] }});
 const accountBlocked = fireMousedown(accountPill, {{ dragDelta: [10, 0] }});
 const resizeNW = fireMousedown(lifecycleScreen, {{ clientX: 2, clientY: 2 }});
+const resizeNWLCorner = fireMousedown(lifecycleScreen, {{ clientX: 12, clientY: 5 }});
 const resizeE = fireMousedown(titleBar, {{ clientX: 1198, clientY: 400 }});
+const resizeSECorner = fireMousedown(lifecycleScreen, {{ clientX: 1188, clientY: 795 }});
+const resizeRimTab = fireMousedown(tabIcon, {{ clientX: 2, clientY: 200 }});
+const innerTabBlocked = fireMousedown(tabIcon, {{ clientX: 6, clientY: 200 }});
+
+const winCtrlGroup = makeEl({{ classes: ['titlebar__btns'], parent: titleBar }});
+const winCtrlClose = makeEl({{ classes: ['close-icon'], parent: winCtrlGroup }});
+const closeEdgeClickable = fireMousedown(winCtrlClose, {{ clientX: 1185, clientY: 2 }});
+const resizeNEVertex = fireMousedown(winCtrlClose, {{ clientX: 1198, clientY: 2 }});
+
+fireEvent('mousemove', {{ clientX: 6, clientY: 400, target: lifecycleScreen }});
+const hoverWestCursor = docEl.dataset.olazResizeCursor || '';
+fireEvent('mousemove', {{ clientX: 12, clientY: 5, target: lifecycleScreen }});
+const hoverNWCursor = docEl.dataset.olazResizeCursor || '';
+fireEvent('mousemove', {{ clientX: 600, clientY: 400, target: lifecycleScreen }});
+const hoverCenterCursor = docEl.dataset.olazResizeCursor || '';
+fireEvent('mousemove', {{ clientX: 1194, clientY: 400, target: lifecycleScreen }});
+const hoverEastCursor = docEl.dataset.olazResizeCursor || '';
+fireEvent('mouseleave', {{}});
+const leaveCursor = docEl.dataset.olazResizeCursor || '';
+
+mockMaximized = true;
+const maximizedNoResize = fireMousedown(lifecycleScreen, {{ clientX: 2, clientY: 2 }});
+mockMaximized = false;
 
 console.log(JSON.stringify({{
   captureRegistered: Object.values(listeners).flat().every((l) => l.capture === true),
+  cursorStyleCount: cursorStyles.length,
   clickOnlyCount: clickOnlyTitle.messages.length,
   tinyMoveCount: tinyMoveTitle.messages.length,
   moveTitle,
@@ -5194,7 +5243,19 @@ console.log(JSON.stringify({{
   tabBlockedCount: tabBlocked.messages.length,
   accountBlockedCount: accountBlocked.messages.length,
   resizeNW,
+  resizeNWLCorner,
   resizeE,
+  resizeSECorner,
+  resizeRimTab,
+  innerTabBlockedCount: innerTabBlocked.messages.length,
+  closeEdgeClickableCount: closeEdgeClickable.messages.length,
+  resizeNEVertex,
+  hoverWestCursor,
+  hoverNWCursor,
+  hoverCenterCursor,
+  hoverEastCursor,
+  leaveCursor,
+  maximizedNoResizeCount: maximizedNoResize.messages.length,
 }}));
 "#,
         drag_script = olaz_core::LINUX_FRAMELESS_WIN_DRAG_SCRIPT,
@@ -5202,6 +5263,7 @@ console.log(JSON.stringify({{
 
     let res = run_node_json(&script);
     assert_eq!(res["captureRegistered"], json!(true));
+    assert_eq!(res["cursorStyleCount"], json!(1));
     assert_eq!(res["clickOnlyCount"], json!(0));
     assert_eq!(res["tinyMoveCount"], json!(0));
 
@@ -5228,15 +5290,25 @@ console.log(JSON.stringify({{
         json!("toggle-maximize")
     );
 
-    let nw_raw = res["resizeNW"]["messages"][0].as_str().unwrap();
-    let nw: Value = serde_json::from_str(nw_raw).unwrap();
-    assert_eq!(nw["action"], json!("resize"));
-    assert_eq!(nw["edge"], json!("north-west"));
+    for (key, expected_edge) in [
+        ("resizeNW", "north-west"),
+        ("resizeNWLCorner", "north-west"),
+        ("resizeE", "east"),
+        ("resizeSECorner", "south-east"),
+        ("resizeRimTab", "west"),
+        ("resizeNEVertex", "north-east"),
+    ] {
+        let raw = res[key]["messages"][0].as_str().expect(key);
+        let parsed: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed["action"], json!("resize"), "{key}");
+        assert_eq!(parsed["edge"], json!(expected_edge), "{key}");
+    }
 
-    let e_raw = res["resizeE"]["messages"][0].as_str().unwrap();
-    let e: Value = serde_json::from_str(e_raw).unwrap();
-    assert_eq!(e["action"], json!("resize"));
-    assert_eq!(e["edge"], json!("east"));
+    assert_eq!(res["hoverWestCursor"], json!("ew-resize"));
+    assert_eq!(res["hoverNWCursor"], json!("nwse-resize"));
+    assert_eq!(res["hoverCenterCursor"], json!(""));
+    assert_eq!(res["hoverEastCursor"], json!("ew-resize"));
+    assert_eq!(res["leaveCursor"], json!(""));
 
     assert_eq!(res["searchBlockedCount"], json!(0));
     assert_eq!(res["closeBlockedCount"], json!(0));
@@ -5244,6 +5316,9 @@ console.log(JSON.stringify({{
     assert_eq!(res["panelTextBlockedCount"], json!(0));
     assert_eq!(res["tabBlockedCount"], json!(0));
     assert_eq!(res["accountBlockedCount"], json!(0));
+    assert_eq!(res["innerTabBlockedCount"], json!(0));
+    assert_eq!(res["closeEdgeClickableCount"], json!(0));
+    assert_eq!(res["maximizedNoResizeCount"], json!(0));
 }
 
 

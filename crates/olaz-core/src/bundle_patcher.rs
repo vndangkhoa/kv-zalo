@@ -1015,25 +1015,110 @@ pub const LINUX_FRAMELESS_WIN_DRAG_SCRIPT: &str = r#"(() => {
   ].join(', ');
 
   const DRAG_SEL =
-    '.title-drag, #titleBar, .login-title-bar, .zlogin-titlebar, .titlebar, .draggable, .lifecycle-topbar';
+    '.title-drag, #titleBar, #titlebar, .drag-region, .login-title-bar, .zlogin-titlebar, .titlebar, .draggable, .lifecycle-topbar';
+
+  const WIN_CTRL_SEL = [
+    '.titlebar__btns',
+    '.wc',
+    '.close-icon',
+    '.hide-icon',
+    '.lifecycle-settings-btn',
+    '[data-olaz-no-resize]',
+  ].join(',');
+
+  const EDGE_TO_CURSOR = {
+    north: 'ns-resize',
+    south: 'ns-resize',
+    east: 'ew-resize',
+    west: 'ew-resize',
+    'north-west': 'nwse-resize',
+    'south-east': 'nwse-resize',
+    'north-east': 'nesw-resize',
+    'south-west': 'nesw-resize',
+  };
+
+  let cursorStyleInstalled = false;
+  let activeCursor = '';
+  const ensureResizeCursorStyle = () => {
+    if (cursorStyleInstalled || typeof document === 'undefined' || !document.createElement) return;
+    const host = document.head || document.documentElement;
+    if (!host || typeof host.appendChild !== 'function') return;
+    if (typeof document.getElementById === 'function' && document.getElementById('__olaz_win_drag_cursor_style')) {
+      cursorStyleInstalled = true;
+      return;
+    }
+    const style = document.createElement('style');
+    style.id = '__olaz_win_drag_cursor_style';
+    style.textContent = [
+      'html[data-olaz-resize-cursor="ns-resize"],html[data-olaz-resize-cursor="ns-resize"] *{cursor:ns-resize!important}',
+      'html[data-olaz-resize-cursor="ew-resize"],html[data-olaz-resize-cursor="ew-resize"] *{cursor:ew-resize!important}',
+      'html[data-olaz-resize-cursor="nwse-resize"],html[data-olaz-resize-cursor="nwse-resize"] *{cursor:nwse-resize!important}',
+      'html[data-olaz-resize-cursor="nesw-resize"],html[data-olaz-resize-cursor="nesw-resize"] *{cursor:nesw-resize!important}',
+    ].join('\n');
+    host.appendChild(style);
+    cursorStyleInstalled = true;
+  };
+
+  const setResizeCursor = (edge) => {
+    const next = (edge && EDGE_TO_CURSOR[edge]) || '';
+    if (next === activeCursor) return;
+    activeCursor = next;
+    const root = typeof document !== 'undefined' ? document.documentElement : null;
+    if (!root) return;
+    if (next) {
+      ensureResizeCursorStyle();
+      if (root.dataset) root.dataset.olazResizeCursor = next;
+      else if (typeof root.setAttribute === 'function') root.setAttribute('data-olaz-resize-cursor', next);
+    } else {
+      if (root.dataset) delete root.dataset.olazResizeCursor;
+      if (typeof root.removeAttribute === 'function') root.removeAttribute('data-olaz-resize-cursor');
+    }
+  };
+
+  const isMaximizedState = () => (
+    typeof document !== 'undefined' &&
+    typeof document.querySelector === 'function' &&
+    Boolean(document.querySelector('.titlebar__btns.is-maximized'))
+  );
 
   const detectResizeEdge = (e) => {
-    const b = 5;
+    if (!e || isMaximizedState()) return null;
     const w = window.innerWidth, h = window.innerHeight;
     if (w < 120 || h < 120) return null;
     const x = e.clientX, y = e.clientY;
-    const left = x >= 0 && x < b, right = x <= w && x > w - b;
-    const top = y >= 0 && y < b, bottom = y <= h && y > h - b;
-    if (top && left) return 'north-west';
-    if (top && right) return 'north-east';
-    if (bottom && left) return 'south-west';
-    if (bottom && right) return 'south-east';
-    if (top) return 'north';
-    if (bottom) return 'south';
-    if (left) return 'west';
-    if (right) return 'east';
-    if (e.target && e.target.closest && e.target.closest('.titlebar__resize')) return 'north';
-    return null;
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > w || y < 0 || y > h) return null;
+
+    const rim = 4;
+    const b = 8;
+    const corner = 16;
+    const t = e.target;
+    const onWinCtrl = Boolean(t && t.closest && t.closest(WIN_CTRL_SEL));
+    if (onWinCtrl) {
+      return (x >= w - rim && y < rim) ? 'north-east' : null;
+    }
+
+    const inRim = x < rim || x >= w - rim || y < rim || y >= h - rim;
+    if (!inRim && t && t.closest && t.closest(INTERACTIVE_SEL)) {
+      return null;
+    }
+
+    const left = x < b, right = x >= w - b;
+    const top = y < b, bottom = y >= h - b;
+    let edge = null;
+    if ((top && x < corner) || (left && y < corner)) edge = 'north-west';
+    else if ((top && x >= w - corner) || (right && y < corner)) edge = 'north-east';
+    else if ((bottom && x < corner) || (left && y >= h - corner)) edge = 'south-west';
+    else if ((bottom && x >= w - corner) || (right && y >= h - corner)) edge = 'south-east';
+    else if (top) edge = 'north';
+    else if (bottom) edge = 'south';
+    else if (left) edge = 'west';
+    else if (right) edge = 'east';
+    else if (t && t.closest && t.closest('.titlebar__resize')) edge = 'north';
+
+    if (!edge) return null;
+    const overTitleResize = Boolean(t && t.closest && t.closest('.titlebar__resize'));
+    if (!inRim && !overTitleResize && t && t.closest && t.closest(INTERACTIVE_SEL)) return null;
+    return edge;
   };
 
   const isDragTarget = (t, e) => {
@@ -1067,7 +1152,10 @@ pub const LINUX_FRAMELESS_WIN_DRAG_SCRIPT: &str = r#"(() => {
     if (pendingMove) e.preventDefault();
   }, true);
   window.addEventListener('mousemove', (e) => {
-    if (!pendingMove) return;
+    if (!pendingMove) {
+      setResizeCursor(detectResizeEdge(e));
+      return;
+    }
     if (typeof e.buttons === 'number' && (e.buttons & 1) === 0) {
       pendingMove = null;
       return;
@@ -1080,6 +1168,15 @@ pub const LINUX_FRAMELESS_WIN_DRAG_SCRIPT: &str = r#"(() => {
     postDrag(payload);
   }, true);
 
+  window.addEventListener('mouseleave', () => {
+    setResizeCursor(null);
+  }, true);
+
+  window.addEventListener('blur', () => {
+    pendingMove = null;
+    setResizeCursor(null);
+  }, true);
+
   window.addEventListener('mousedown', (e) => {
     pendingMove = null;
     if (e.button !== 0) return;
@@ -1089,8 +1186,11 @@ pub const LINUX_FRAMELESS_WIN_DRAG_SCRIPT: &str = r#"(() => {
     const t = e.target;
     if (!t || typeof t.closest !== 'function') return;
     const edge = detectResizeEdge(e);
-    if (edge && !t.closest(INTERACTIVE_SEL)) {
+    if (edge) {
+      setResizeCursor(null);
       e.preventDefault();
+      if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+      else if (e.stopPropagation) e.stopPropagation();
       postDrag({
         action: 'resize',
         edge,

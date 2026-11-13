@@ -751,10 +751,11 @@ impl OlazAppWindow {
         root_overlay.set_overlay_pass_through(&toast_label, true);
 
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
+        window.set_resizable(true);
         if demo_mode {
             window.set_title("KV Zalo");
             window.set_default_size(1180, 760);
-            window.set_size_request(960, 620);
+            window.set_size_request(MIN_MAIN_WINDOW_DIM, MIN_MAIN_WINDOW_DIM);
         } else {
             if primary_slug == "default" {
                 window.set_title("Zalo");
@@ -764,7 +765,7 @@ impl OlazAppWindow {
             // Frameless window so Zalo's patched Windows-style `#titleBar` and login bar are the sole chrome!
             window.set_decorated(false);
             window.set_default_size(saved_win_state.width, saved_win_state.height);
-            window.set_size_request(400, 560);
+            window.set_size_request(360, MIN_MAIN_WINDOW_DIM);
         }
         window.add(&root_overlay);
 
@@ -2072,11 +2073,12 @@ impl OlazAppWindow {
                         }
                     }
                     WindowCommand::SetResizable(resizable) => {
-                        if app.session_count() == 1 {
-                            app.window.set_resizable(resizable);
-                        } else {
-                            app.window.set_resizable(true);
+                        if !resizable {
+                            tracing::debug!(
+                                "ignoring renderer SetResizable(false) so frameless GTK window stays user-resizable"
+                            );
                         }
+                        app.window.set_resizable(true);
                     }
                 }
             }
@@ -3445,7 +3447,7 @@ impl OlazAppWindow {
             self.window.unmaximize();
         }
         self.window.set_resizable(true);
-        self.window.set_size_request(400, 560);
+        self.window.set_size_request(360, MIN_MAIN_WINDOW_DIM);
         self.window.set_default_size(400, 580);
         self.window.resize(400, 580);
     }
@@ -3455,8 +3457,8 @@ impl OlazAppWindow {
             return;
         }
         let multi = self.session_count() >= 2;
-        let min_w = if multi { 1040 } else { MIN_MAIN_WINDOW_DIM };
-        let min_h = if multi { 700 } else { MIN_MAIN_WINDOW_DIM };
+        let min_w = if multi { 520 } else { MIN_MAIN_WINDOW_DIM };
+        let min_h = MIN_MAIN_WINDOW_DIM;
         self.in_login_mode.set(false);
         if self.window_size_restored.replace(true) {
             self.window.set_size_request(min_w, min_h);

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST_DIR="$ROOT_DIR/target/deb"
 PKG_NAME="kv-zalo"
-PKG_VER="0.2.1"
+PKG_VER="0.2.2"
 PKG_REL="1"
 ARCH="amd64"
 DEB_DIR="$DIST_DIR/${PKG_NAME}_${PKG_VER}-${PKG_REL}_${ARCH}"
