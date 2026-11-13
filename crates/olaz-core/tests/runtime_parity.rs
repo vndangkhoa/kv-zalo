@@ -5006,5 +5006,246 @@ const vm = require('node:vm');
     assert_eq!(res["afterStatusNeg27"]["__olazRecalled"], true);
 }
 
+#[test]
+fn linux_frameless_win_drag_script_posts_json_strings_for_drag_and_resize_targets() {
+    let tmp = TempDir::new().unwrap();
+    let platform = ZaloPlatform::with_root(tmp.path(), "26.10.20");
+
+    let direct_ui = olaz_core::direct_ui_user_scripts(&platform, false)
+        .into_iter()
+        .find(|(name, _)| name == "linux-direct-ui")
+        .expect("linux-direct-ui present in direct_ui_user_scripts")
+        .1;
+    let popup_ui = olaz_core::popup_user_scripts(&platform)
+        .into_iter()
+        .find(|(name, _)| name == "linux-direct-ui")
+        .expect("linux-direct-ui present in popup_user_scripts")
+        .1;
+    assert!(direct_ui.contains(olaz_core::LINUX_FRAMELESS_WIN_DRAG_SCRIPT));
+    assert!(popup_ui.contains(olaz_core::LINUX_FRAMELESS_WIN_DRAG_SCRIPT));
+
+    let script = format!(
+        r#"
+const posted = [];
+const listeners = {{}};
+
+function matchesToken(el, rawToken) {{
+  let tok = rawToken.trim();
+  if (!tok) return false;
+  if (tok.includes('>')) {{
+    const parts = tok.split('>').map((s) => s.trim());
+    if (parts.length === 2 && parts[1] === '*') {{
+      return !!el.parent && matchesToken(el.parent, parts[0]);
+    }}
+  }}
+  if (tok === '[contenteditable="true"]') return el.contentEditable === 'true';
+  if (tok === '[role="button"]') return el.role === 'button';
+  if (tok === '[role="tab"]') return el.role === 'tab';
+  if (tok === '[role="menuitem"]') return el.role === 'menuitem';
+  if (tok.startsWith('[data-id^="div_Main_"]')) return (el.dataId || '').startsWith('div_Main_');
+  if (tok.startsWith('.')) return el.classes.includes(tok.slice(1));
+  if (tok.startsWith('#')) return el.id === tok.slice(1);
+  if (tok.includes('.')) {{
+    const [tag, cls] = tok.split('.');
+    return el.tag === tag && el.classes.includes(cls);
+  }}
+  return el.tag === tok;
+}}
+
+function makeEl({{ id = '', tag = 'div', classes = [], role = '', dataId = '', contentEditable = '', parent = null }} = {{}}) {{
+  const el = {{
+    id,
+    tag,
+    classes,
+    role,
+    dataId,
+    contentEditable,
+    parent,
+    matches(sel) {{
+      return sel.split(',').some((part) => matchesToken(this, part));
+    }},
+    closest(sel) {{
+      let cur = this;
+      while (cur) {{
+        if (cur.matches(sel)) return cur;
+        cur = cur.parent;
+      }}
+      return null;
+    }},
+  }};
+  return el;
+}}
+
+globalThis.window = {{
+  innerWidth: 1200,
+  innerHeight: 800,
+  addEventListener(type, fn, capture) {{
+    (listeners[type] ||= []).push({{ fn, capture: !!capture }});
+  }},
+  webkit: {{
+    messageHandlers: {{
+      __olaz_win_drag: {{
+        postMessage(msg) {{
+          posted.push(msg);
+        }},
+      }},
+    }},
+  }},
+}};
+
+{drag_script}
+
+function fireEvent(type, extra = {{}}) {{
+  const ev = Object.assign({{
+    defaultPrevented: false,
+    preventDefault() {{ this.defaultPrevented = true; }},
+  }}, extra);
+  for (const l of (listeners[type] || [])) {{
+    l.fn(ev);
+  }}
+  return ev;
+}}
+
+function fireMousedown(target, opts = {{}}) {{
+  const before = posted.length;
+  const cx = opts.clientX ?? 200;
+  const cy = opts.clientY ?? 12;
+  const ev = fireEvent('mousedown', {{
+    button: opts.button ?? 0,
+    detail: opts.detail ?? 1,
+    clientX: cx,
+    clientY: cy,
+    screenX: opts.screenX ?? 420,
+    screenY: opts.screenY ?? 112,
+    timeStamp: opts.timeStamp ?? 555,
+    target,
+  }});
+  if (opts.dragDelta) {{
+    fireEvent('mousemove', {{
+      buttons: 1,
+      clientX: cx + opts.dragDelta[0],
+      clientY: cy + opts.dragDelta[1],
+    }});
+    fireEvent('mouseup', {{ button: 0 }});
+  }} else {{
+    fireEvent('mouseup', {{ button: 0 }});
+  }}
+  return {{
+    defaultPrevented: ev.defaultPrevented,
+    messages: posted.slice(before),
+  }};
+}}
+
+const titleBar = makeEl({{ id: 'titleBar', classes: ['titlebar'] }});
+const titleSpan = makeEl({{ tag: 'span', parent: titleBar }});
+const searchInput = makeEl({{ id: 'contact-search-input', tag: 'input', parent: titleBar }});
+
+const loginBar = makeEl({{ classes: ['login-title-bar'] }});
+const loginClose = makeEl({{ classes: ['close-icon'], parent: loginBar }});
+const loginBtnChild = makeEl({{ tag: 'svg', parent: loginClose }});
+
+const lifecycleScreen = makeEl({{ classes: ['lifecycle-screen'] }});
+const lifecycleTopbar = makeEl({{ tag: 'header', classes: ['lifecycle-topbar'], parent: lifecycleScreen }});
+const settingsBtn = makeEl({{ tag: 'button', classes: ['lifecycle-settings-btn'], parent: lifecycleTopbar }});
+const lifecycleCenter = makeEl({{ classes: ['lifecycle-center'], parent: lifecycleScreen }});
+const lifecyclePanel = makeEl({{ classes: ['lifecycle-panel'], parent: lifecycleCenter }});
+const panelHeading = makeEl({{ tag: 'h1', parent: lifecyclePanel }});
+
+const mainTab = makeEl({{ id: 'main-tab' }});
+const navTop = makeEl({{ classes: ['nav__tabs__top'], parent: mainTab }});
+const tabBtn = makeEl({{ classes: ['leftbar-tab'], dataId: 'div_Main_TabMsg', parent: navTop }});
+const tabIcon = makeEl({{ tag: 'i', parent: tabBtn }});
+const sidebarAccounts = makeEl({{ id: 'olaz-sidebar-accounts', parent: mainTab }});
+const accountPill = makeEl({{ classes: ['olaz-account-item'], parent: sidebarAccounts }});
+
+const clickOnlyTitle = fireMousedown(titleSpan);
+const tinyMoveTitle = fireMousedown(titleSpan, {{ dragDelta: [2, 1] }});
+const moveTitle = fireMousedown(titleSpan, {{ dragDelta: [6, 0] }});
+const dblMaxTitle = fireMousedown(titleSpan, {{ detail: 2 }});
+const searchBlocked = fireMousedown(searchInput, {{ dragDelta: [10, 0] }});
+const moveLogin = fireMousedown(loginBar, {{ dragDelta: [0, 8] }});
+const closeBlocked = fireMousedown(loginBtnChild, {{ dragDelta: [8, 0] }});
+const moveTopbar = fireMousedown(lifecycleTopbar, {{ dragDelta: [5, 5] }});
+const settingsBlocked = fireMousedown(settingsBtn, {{ dragDelta: [5, 5] }});
+const moveBackdrop = fireMousedown(lifecycleCenter, {{ dragDelta: [10, 10] }});
+const panelTextBlocked = fireMousedown(panelHeading, {{ dragDelta: [10, 10] }});
+const moveMainTabBg = fireMousedown(mainTab, {{ clientX: 20, clientY: 300, dragDelta: [6, 2] }});
+const moveMainTabTop = fireMousedown(navTop, {{ clientX: 20, clientY: 10, dragDelta: [6, 2] }});
+const tabBlocked = fireMousedown(tabIcon, {{ dragDelta: [10, 0] }});
+const accountBlocked = fireMousedown(accountPill, {{ dragDelta: [10, 0] }});
+const resizeNW = fireMousedown(lifecycleScreen, {{ clientX: 2, clientY: 2 }});
+const resizeE = fireMousedown(titleBar, {{ clientX: 1198, clientY: 400 }});
+
+console.log(JSON.stringify({{
+  captureRegistered: Object.values(listeners).flat().every((l) => l.capture === true),
+  clickOnlyCount: clickOnlyTitle.messages.length,
+  tinyMoveCount: tinyMoveTitle.messages.length,
+  moveTitle,
+  dblMaxTitle,
+  searchBlockedCount: searchBlocked.messages.length,
+  moveLogin,
+  closeBlockedCount: closeBlocked.messages.length,
+  moveTopbar,
+  settingsBlockedCount: settingsBlocked.messages.length,
+  moveBackdrop,
+  panelTextBlockedCount: panelTextBlocked.messages.length,
+  moveMainTabBg,
+  moveMainTabTop,
+  tabBlockedCount: tabBlocked.messages.length,
+  accountBlockedCount: accountBlocked.messages.length,
+  resizeNW,
+  resizeE,
+}}));
+"#,
+        drag_script = olaz_core::LINUX_FRAMELESS_WIN_DRAG_SCRIPT,
+    );
+
+    let res = run_node_json(&script);
+    assert_eq!(res["captureRegistered"], json!(true));
+    assert_eq!(res["clickOnlyCount"], json!(0));
+    assert_eq!(res["tinyMoveCount"], json!(0));
+
+    for key in [
+        "moveTitle",
+        "moveLogin",
+        "moveTopbar",
+        "moveBackdrop",
+        "moveMainTabBg",
+        "moveMainTabTop",
+    ] {
+        assert_eq!(res[key]["defaultPrevented"], json!(true), "{key}");
+        let msgs = res[key]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "{key}");
+        let raw = msgs[0].as_str().expect("must post JSON string");
+        let parsed: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed["action"], json!("move"), "{key}");
+        assert_eq!(parsed["button"], json!(1), "{key}");
+    }
+
+    let max_raw = res["dblMaxTitle"]["messages"][0].as_str().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(max_raw).unwrap()["action"],
+        json!("toggle-maximize")
+    );
+
+    let nw_raw = res["resizeNW"]["messages"][0].as_str().unwrap();
+    let nw: Value = serde_json::from_str(nw_raw).unwrap();
+    assert_eq!(nw["action"], json!("resize"));
+    assert_eq!(nw["edge"], json!("north-west"));
+
+    let e_raw = res["resizeE"]["messages"][0].as_str().unwrap();
+    let e: Value = serde_json::from_str(e_raw).unwrap();
+    assert_eq!(e["action"], json!("resize"));
+    assert_eq!(e["edge"], json!("east"));
+
+    assert_eq!(res["searchBlockedCount"], json!(0));
+    assert_eq!(res["closeBlockedCount"], json!(0));
+    assert_eq!(res["settingsBlockedCount"], json!(0));
+    assert_eq!(res["panelTextBlockedCount"], json!(0));
+    assert_eq!(res["tabBlockedCount"], json!(0));
+    assert_eq!(res["accountBlockedCount"], json!(0));
+}
+
+
 
 

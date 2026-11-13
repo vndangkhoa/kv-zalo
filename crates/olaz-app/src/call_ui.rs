@@ -6,7 +6,6 @@
 
 use base64::Engine as _;
 use gtk::prelude::*;
-use javascriptcore::ValueExt as JscValueExt;
 use olaz_linux::call::{
     default_recordings_dir, get_ui_asset, AudioDeviceList, CallPartnerInfo, CallUiEvent,
     OlazCallEngine, CALL_UI_CALL_URL, CALL_UI_DEVICES_URL, CALL_UI_INCOMING_URL, CALL_UI_SCHEME,
@@ -55,6 +54,7 @@ struct ManagedCallWindow {
     ready: Cell<bool>,
     pending_js: RefCell<Vec<String>>,
     suppress_delete_action: Cell<bool>,
+    last_press: Rc<Cell<Option<crate::client_host::LastButtonPress>>>,
 }
 
 impl ManagedCallWindow {
@@ -407,6 +407,7 @@ impl CallUiController {
             .build();
         webview.set_hexpand(true);
         webview.set_vexpand(true);
+        let last_press = crate::client_host::track_last_button_press(&webview);
         window.add(&webview);
 
         let managed = Rc::new(ManagedCallWindow {
@@ -415,6 +416,7 @@ impl CallUiController {
             ready: Cell::new(false),
             pending_js: RefCell::new(Vec::new()),
             suppress_delete_action: Cell::new(false),
+            last_press,
         });
 
         // Flush queued JS AND re-deliver `last_partner`, `last_state`, and `last_devices` on load finish
@@ -467,8 +469,7 @@ impl CallUiController {
             let Some(val) = js_res.js_value() else {
                 return;
             };
-            let raw = val.to_str();
-            let Ok(parsed) = serde_json::from_str::<Value>(raw.as_str()) else {
+            let Some(parsed) = crate::client_host::decode_jsc_json_value(&val) else {
                 return;
             };
             let action = parsed.get("action").and_then(Value::as_str).unwrap_or("");
@@ -521,11 +522,18 @@ impl CallUiController {
         match action {
             "windowDrag" => {
                 if let Some(mw) = win_opt {
-                    let button = value.get("button").and_then(Value::as_i64).unwrap_or(1) as i32;
-                    let sx = value.get("screenX").and_then(Value::as_i64).unwrap_or(0) as i32;
-                    let sy = value.get("screenY").and_then(Value::as_i64).unwrap_or(0) as i32;
-                    mw.window
-                        .begin_move_drag(button, sx, sy, gtk::current_event_time());
+                    let cmd = crate::client_host::parse_win_drag_command(&value).unwrap_or(
+                        crate::client_host::WinDragCommand::Move {
+                            button: 1,
+                            screen_x: 0,
+                            screen_y: 0,
+                        },
+                    );
+                    crate::client_host::execute_win_drag_command(
+                        &mw.window,
+                        Some(mw.last_press.as_ref()),
+                        cmd,
+                    );
                 }
             }
             "win" => {

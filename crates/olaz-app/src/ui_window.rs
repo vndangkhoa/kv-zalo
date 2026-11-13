@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use gtk::prelude::*;
 use javascriptcore::ValueExt as JscValueExt;
-use olaz_core::{AsarArchive, InstallProgress, ProfileRegistry, ZaloPlatform, ZaloRuntimeManager};
+use olaz_core::{
+    AsarArchive, InstallProgress, ProfileRegistry, ZaloPlatform, ZaloRuntimeManager,
+    LINUX_FRAMELESS_WIN_DRAG_SCRIPT,
+};
 use olaz_linux::api_mcp::MultiAccountControlBackend;
 use olaz_linux::{
     capture_interactive_screenshot, has_gstreamer_audio_sink, load_omarchy_theme, pick_open_dialog,
@@ -44,7 +47,9 @@ use crate::account_session::{
     tray_privacy_from_config, AccountOutboundCall, AccountOutboundSend, AccountPrivacyEvent,
     AccountSession, WindowPageMode,
 };
-use crate::client_host::{HostPage, OfficialClientHost, PageEvent};
+use crate::client_host::{
+    install_widget_win_drag, install_win_drag_handler, HostPage, OfficialClientHost, PageEvent,
+};
 use crate::main_process::{MainProcessEvent, NotificationContext, WindowCommand, ZaloMainProcess};
 
 /// Custom URI scheme serving the embedded Liquid Glass frontend (`crates/olaz-app/ui/*`).
@@ -433,7 +438,7 @@ pub struct OlazAppWindow {
     toast_source: RefCell<Option<glib::SourceId>>,
     stack: gtk::Stack,
     workspace_hbox: gtk::Box,
-    account_rail: gtk::Box,
+    account_rail: gtk::EventBox,
     rail_accounts_box: gtk::Box,
     rail_widgets: RefCell<HashMap<String, AccountRailWidgets>>,
     accounts_stack: gtk::Stack,
@@ -627,6 +632,16 @@ impl OlazAppWindow {
 
         let ucm = UserContentManager::new();
         ucm.register_script_message_handler("__olaz_ui_raw");
+        if !demo_mode {
+            ucm.register_script_message_handler("__olaz_win_drag");
+            ucm.add_script(&UserScript::new(
+                LINUX_FRAMELESS_WIN_DRAG_SCRIPT,
+                UserContentInjectedFrames::TopFrame,
+                UserScriptInjectionTime::Start,
+                &[],
+                &[],
+            ));
+        }
         ucm.add_script(&UserScript::new(
             OLAZ_UI_BRIDGE_PREAMBLE,
             UserContentInjectedFrames::TopFrame,
@@ -653,6 +668,9 @@ impl OlazAppWindow {
         ui_webview.set_vexpand(true);
 
         configure_ui_navigation_policy(&ui_webview);
+        if !demo_mode {
+            install_win_drag_handler(&ucm, &ui_webview);
+        }
 
         let stack = gtk::Stack::new();
         stack.set_transition_type(gtk::StackTransitionType::None);
@@ -663,10 +681,13 @@ impl OlazAppWindow {
         workspace_hbox.set_hexpand(true);
         workspace_hbox.set_vexpand(true);
 
-        let account_rail = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        account_rail.set_width_request(64);
-        account_rail.set_vexpand(true);
-        account_rail.style_context().add_class("olaz-account-rail");
+        let account_rail_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        account_rail_box.set_width_request(64);
+        account_rail_box.set_vexpand(true);
+        account_rail_box.style_context().add_class("olaz-account-rail");
+        let account_rail = gtk::EventBox::new();
+        account_rail.set_visible_window(false);
+        account_rail.set_above_child(false);
         account_rail.set_no_show_all(true);
         account_rail.hide();
 
@@ -691,9 +712,14 @@ impl OlazAppWindow {
         add_btn_row.pack_start(&add_account_btn, false, false, 0);
         add_btn_row.show();
 
-        account_rail.pack_start(&rail_accounts_box, false, false, 0);
-        account_rail.pack_start(&rail_spacer, true, true, 0);
-        account_rail.pack_end(&add_btn_row, false, false, 0);
+        account_rail_box.pack_start(&rail_accounts_box, false, false, 0);
+        account_rail_box.pack_start(&rail_spacer, true, true, 0);
+        account_rail_box.pack_end(&add_btn_row, false, false, 0);
+        account_rail_box.show();
+        account_rail.add(&account_rail_box);
+        if !demo_mode {
+            install_widget_win_drag(&account_rail);
+        }
 
         let accounts_stack = gtk::Stack::new();
         accounts_stack.set_transition_type(gtk::StackTransitionType::None);

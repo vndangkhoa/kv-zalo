@@ -21,7 +21,7 @@ pub use bundle_patcher::{
     bridge_ipc_table, bridge_spec_script, direct_ui_user_scripts, expose_webpack_require,
     host_script, ordered_user_scripts, patch_asar_bundle, patch_sync_global_id_resolver,
     patch_zalo_html_csp, patch_zalo_linux_renderer_bundle, popup_user_scripts, worker_prelude,
-    IpcSpecEntry,
+    IpcSpecEntry, LINUX_FRAMELESS_WIN_DRAG_SCRIPT,
 };
 pub use crypto::CryptoBridge;
 pub use db_cross::{

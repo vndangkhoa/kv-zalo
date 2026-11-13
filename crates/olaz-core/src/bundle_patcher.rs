@@ -965,6 +965,177 @@ pub fn ordered_user_scripts(platform: &ZaloPlatform, trace_workers: bool) -> Vec
     scripts
 }
 
+/// Frameless window drag, 5px resize edges, and double-click maximize (`__olaz_win_drag`).
+/// Shared across Zalo main/login/popup WebViews and the Olaz setup/lifecycle WebView.
+pub const LINUX_FRAMELESS_WIN_DRAG_SCRIPT: &str = r#"(() => {
+  'use strict';
+  if (window.__olazFramelessWinDrag) return;
+  window.__olazFramelessWinDrag = true;
+
+  const postDrag = (msg) => {
+    try {
+      const h =
+        window.webkit &&
+        window.webkit.messageHandlers &&
+        window.webkit.messageHandlers.__olaz_win_drag;
+      if (!h) return;
+      h.postMessage(typeof msg === 'string' ? msg : JSON.stringify(msg));
+    } catch {}
+  };
+
+  const INTERACTIVE_SEL = [
+    'button',
+    'input',
+    'textarea',
+    'select',
+    'a',
+    'label',
+    '[role="button"]',
+    '[role="tab"]',
+    '[role="menuitem"]',
+    '[contenteditable="true"]',
+    '.no-drag',
+    '.clickable',
+    '.titlebar__btns',
+    '.titlebar__menu__btn',
+    '.titlebar__menu__btnPreviewPhoto',
+    'i.btn',
+    '.z--btn',
+    '.z--btn--v2',
+    '#contact-search-input',
+    '.leftbar-tab',
+    '#olaz-sidebar-accounts',
+    '.zavatar',
+    '.zavatar-container',
+    '.nav__tabs__img',
+    '.login-title-bar__setting-button',
+    '.hide-icon',
+    '.close-icon',
+    '.window-control-btn',
+  ].join(', ');
+
+  const DRAG_SEL =
+    '.title-drag, #titleBar, .login-title-bar, .zlogin-titlebar, .titlebar, .draggable, .lifecycle-topbar';
+
+  const detectResizeEdge = (e) => {
+    const b = 5;
+    const w = window.innerWidth, h = window.innerHeight;
+    if (w < 120 || h < 120) return null;
+    const x = e.clientX, y = e.clientY;
+    const left = x >= 0 && x < b, right = x <= w && x > w - b;
+    const top = y >= 0 && y < b, bottom = y <= h && y > h - b;
+    if (top && left) return 'north-west';
+    if (top && right) return 'north-east';
+    if (bottom && left) return 'south-west';
+    if (bottom && right) return 'south-east';
+    if (top) return 'north';
+    if (bottom) return 'south';
+    if (left) return 'west';
+    if (right) return 'east';
+    if (e.target && e.target.closest && e.target.closest('.titlebar__resize')) return 'north';
+    return null;
+  };
+
+  const isDragTarget = (t, e) => {
+    if (t.closest(DRAG_SEL)) return true;
+    // Empty backdrop / top padding of Olaz lifecycle/setup screens (never inside .lifecycle-panel or modals).
+    if (typeof t.matches === 'function' && t.matches('.lifecycle-screen, .lifecycle-center')) {
+      return true;
+    }
+    // Left navigation rail (`#main-tab`) overlaps the top 24px header where `.titlebar` has `left: 64px`.
+    const mainTab = t.closest('#main-tab');
+    if (mainTab && !t.closest('.nav__tabs__top > *, .nav__tabs__bottom > *, [data-id^="div_Main_"]')) {
+      if (
+        t === mainTab ||
+        (typeof t.matches === 'function' &&
+          t.matches('.nav__tabs__zalo, .nav__tabs__top, .nav__tabs__bottom'))
+      ) {
+        return true;
+      }
+      if (e.clientY >= 0 && e.clientY < 28) return true;
+    }
+    return false;
+  };
+
+  let pendingMove = null;
+  const clearPendingMove = () => {
+    pendingMove = null;
+  };
+  window.addEventListener('mouseup', clearPendingMove, true);
+  window.addEventListener('blur', clearPendingMove, true);
+  window.addEventListener('dragstart', (e) => {
+    if (pendingMove) e.preventDefault();
+  }, true);
+  window.addEventListener('mousemove', (e) => {
+    if (!pendingMove) return;
+    if (typeof e.buttons === 'number' && (e.buttons & 1) === 0) {
+      pendingMove = null;
+      return;
+    }
+    const dx = e.clientX - pendingMove.clientX;
+    const dy = e.clientY - pendingMove.clientY;
+    if (dx * dx + dy * dy < 16) return;
+    const payload = pendingMove.payload;
+    pendingMove = null;
+    postDrag(payload);
+  }, true);
+
+  window.addEventListener('mousedown', (e) => {
+    pendingMove = null;
+    if (e.button !== 0) return;
+    if (!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.__olaz_win_drag)) {
+      return;
+    }
+    const t = e.target;
+    if (!t || typeof t.closest !== 'function') return;
+    const edge = detectResizeEdge(e);
+    if (edge && !t.closest(INTERACTIVE_SEL)) {
+      e.preventDefault();
+      postDrag({
+        action: 'resize',
+        edge,
+        button: 1,
+        screenX: Math.round(e.screenX),
+        screenY: Math.round(e.screenY),
+        time: Math.round(e.timeStamp || 0),
+      });
+      return;
+    }
+    if (t.closest(INTERACTIVE_SEL)) return;
+    if (!isDragTarget(t, e)) return;
+    e.preventDefault();
+    if (
+      typeof document !== 'undefined' &&
+      document.activeElement &&
+      document.activeElement !== document.body &&
+      typeof document.activeElement.blur === 'function'
+    ) {
+      document.activeElement.blur();
+    }
+    if (e.detail === 2) {
+      postDrag({ action: 'toggle-maximize' });
+      return;
+    }
+    if (e.detail === 1) {
+      pendingMove = {
+        clientX: e.clientX,
+        clientY: e.clientY,
+        payload: {
+          action: 'move',
+          button: 1,
+          screenX: Math.round(e.screenX),
+          screenY: Math.round(e.screenY),
+          time: Math.round(e.timeStamp || 0),
+        },
+      };
+    }
+  }, true);
+})();"#;
+
+fn linux_direct_ui_script() -> String {
+    format!("{LINUX_DIRECT_UI_SCRIPT}\n{LINUX_FRAMELESS_WIN_DRAG_SCRIPT}")
+}
+
 /// Linux direct-UI host extension injected between `local-modules` and `bridge` when
 /// mounting `OfficialClientHost` (`login.html` / `index.html` / `popup-viewer.html`) directly.
 pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
@@ -1033,9 +1204,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
   const postState = (state) => {
     try { window.webkit.messageHandlers.zstate.postMessage(state); } catch {}
   };
-  const postDrag = (msg) => {
-    try { window.webkit.messageHandlers.__olaz_win_drag.postMessage(msg); } catch {}
-  };
+  // window drag & resize handled via shared `LINUX_FRAMELESS_WIN_DRAG_SCRIPT`
   const diag = (s) => {
     try { window.webkit.messageHandlers.zlog.postMessage('[direct-ui] ' + s); } catch {}
   };
@@ -3941,60 +4110,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     }
   }, true);
 
-  // 7. Frameless window drag, resize edges, and double-click maximize (`__olaz_win_drag`)
-  const INTERACTIVE_SEL = 'button, input, textarea, select, a, label, [role="button"], .no-drag, .clickable, .titlebar__btns, .titlebar__menu__btn, .titlebar__menu__btnPreviewPhoto, i.btn, .z--btn, .z--btn--v2, #contact-search-input';
-  const DRAG_SEL = '.title-drag, #titleBar, .login-title-bar, .zlogin-titlebar, .titlebar, .draggable';
-  const detectResizeEdge = (e) => {
-    const b = 5;
-    const w = window.innerWidth, h = window.innerHeight;
-    if (w < 120 || h < 120) return null;
-    const x = e.clientX, y = e.clientY;
-    const left = x >= 0 && x < b, right = x <= w && x > w - b;
-    const top = y >= 0 && y < b, bottom = y <= h && y > h - b;
-    if (top && left) return 'north-west';
-    if (top && right) return 'north-east';
-    if (bottom && left) return 'south-west';
-    if (bottom && right) return 'south-east';
-    if (top) return 'north';
-    if (bottom) return 'south';
-    if (left) return 'west';
-    if (right) return 'east';
-    if (e.target && e.target.closest && e.target.closest('.titlebar__resize')) return 'north';
-    return null;
-  };
-  window.addEventListener('mousedown', (e) => {
-    if (e.button !== 0) return;
-    const t = e.target;
-    if (!t || typeof t.closest !== 'function') return;
-    const edge = detectResizeEdge(e);
-    if (edge && !t.closest(INTERACTIVE_SEL)) {
-      e.preventDefault();
-      postDrag({
-        action: 'resize',
-        edge,
-        button: 1,
-        screenX: Math.round(e.screenX),
-        screenY: Math.round(e.screenY),
-        time: Math.round(e.timeStamp || 0),
-      });
-      return;
-    }
-    if (t.closest(INTERACTIVE_SEL)) return;
-    if (!t.closest(DRAG_SEL)) return;
-    if (e.detail === 2) {
-      postDrag({ action: 'toggle-maximize' });
-      return;
-    }
-    if (e.detail === 1) {
-      postDrag({
-        action: 'move',
-        button: 1,
-        screenX: Math.round(e.screenX),
-        screenY: Math.round(e.screenY),
-        time: Math.round(e.timeStamp || 0),
-      });
-    }
-  }, false);
+  // 7. Frameless window drag, resize edges, and double-click maximize live in `LINUX_FRAMELESS_WIN_DRAG_SCRIPT`.
 
   // 8. Page lifecycle & webpack module hooks (`login.html` vs `index.html` / `popup-viewer.html`)
   const page = location.pathname.split('/').pop();
@@ -4585,7 +4701,7 @@ pub fn direct_ui_user_scripts(platform: &ZaloPlatform, trace_workers: bool) -> V
         ),
         (
             "linux-direct-ui".to_string(),
-            LINUX_DIRECT_UI_SCRIPT.to_string(),
+            linux_direct_ui_script(),
         ),
         ("bridge".to_string(), host_script("bridge").unwrap()),
         (
@@ -4610,7 +4726,7 @@ pub fn popup_user_scripts(platform: &ZaloPlatform) -> Vec<(String, String)> {
         ),
         (
             "linux-direct-ui".to_string(),
-            LINUX_DIRECT_UI_SCRIPT.to_string(),
+            linux_direct_ui_script(),
         ),
         ("bridge".to_string(), host_script("bridge").unwrap()),
     ]

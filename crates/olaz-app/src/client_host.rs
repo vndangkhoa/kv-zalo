@@ -1689,7 +1689,226 @@ fn parse_window_edge(edge_str: &str) -> Option<gdk::WindowEdge> {
     }
 }
 
-fn install_win_drag_handler(ucm: &UserContentManager, webview: &WebView) {
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LastButtonPress {
+    pub(crate) button: u32,
+    pub(crate) root_x: i32,
+    pub(crate) root_y: i32,
+    pub(crate) time: u32,
+    pub(crate) captured_at: std::time::Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WinDragCommand {
+    Move {
+        button: i32,
+        screen_x: i32,
+        screen_y: i32,
+    },
+    Resize {
+        edge: gdk::WindowEdge,
+        button: i32,
+        screen_x: i32,
+        screen_y: i32,
+    },
+    ToggleMaximize,
+}
+
+pub(crate) fn decode_jsc_json_value(val: &javascriptcore::Value) -> Option<Value> {
+    if val.is_string() {
+        let raw = val.to_str();
+        return serde_json::from_str::<Value>(raw.as_str()).ok();
+    }
+    let json = val.to_json(0)?;
+    serde_json::from_str::<Value>(json.as_str()).ok()
+}
+
+pub(crate) fn parse_win_drag_command(payload: &Value) -> Option<WinDragCommand> {
+    let action = payload
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("move");
+    let button = payload
+        .get("button")
+        .and_then(Value::as_i64)
+        .unwrap_or(1)
+        .clamp(1, 5) as i32;
+    let screen_x = payload
+        .get("screenX")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        .round() as i32;
+    let screen_y = payload
+        .get("screenY")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        .round() as i32;
+
+    match action {
+        "toggle-maximize" => Some(WinDragCommand::ToggleMaximize),
+        "resize" => payload
+            .get("edge")
+            .and_then(Value::as_str)
+            .and_then(parse_window_edge)
+            .map(|edge| WinDragCommand::Resize {
+                edge,
+                button,
+                screen_x,
+                screen_y,
+            }),
+        "move" => Some(WinDragCommand::Move {
+            button,
+            screen_x,
+            screen_y,
+        }),
+        _ => None,
+    }
+}
+
+pub(crate) fn track_last_button_press<W: IsA<gtk::Widget>>(
+    widget: &W,
+) -> std::rc::Rc<std::cell::Cell<Option<LastButtonPress>>> {
+    let cell = std::rc::Rc::new(std::cell::Cell::new(None));
+    let cell_ref = std::rc::Rc::clone(&cell);
+    widget.connect_button_press_event(move |_, ev| {
+        let (rx, ry) = ev.root();
+        cell_ref.set(Some(LastButtonPress {
+            button: ev.button(),
+            root_x: rx.round() as i32,
+            root_y: ry.round() as i32,
+            time: ev.time(),
+            captured_at: std::time::Instant::now(),
+        }));
+        glib::Propagation::Proceed
+    });
+    cell
+}
+
+pub(crate) fn execute_win_drag_command(
+    win: &gtk::Window,
+    last_press: Option<&std::cell::Cell<Option<LastButtonPress>>>,
+    cmd: WinDragCommand,
+) {
+    let resolve_coords_and_time =
+        |button: i32, fallback_x: i32, fallback_y: i32| -> (i32, i32, u32) {
+            if let Some(cell) = last_press {
+                if let Some(p) = cell.take() {
+                    if p.button == button as u32
+                        && p.captured_at.elapsed() < std::time::Duration::from_secs(10)
+                    {
+                        let time = if p.time != 0 {
+                            p.time
+                        } else {
+                            gtk::current_event_time()
+                        };
+                        return (p.root_x, p.root_y, time);
+                    }
+                }
+            }
+            (fallback_x, fallback_y, gtk::current_event_time())
+        };
+
+    match cmd {
+        WinDragCommand::ToggleMaximize => {
+            if win.is_maximized() {
+                win.unmaximize();
+            } else {
+                win.maximize();
+            }
+        }
+        WinDragCommand::Resize {
+            edge,
+            button,
+            screen_x,
+            screen_y,
+        } => {
+            if win.is_resizable() && !win.is_maximized() {
+                let (rx, ry, time) = resolve_coords_and_time(button, screen_x, screen_y);
+                win.begin_resize_drag(edge, button, rx, ry, time);
+            }
+        }
+        WinDragCommand::Move {
+            button,
+            screen_x,
+            screen_y,
+        } => {
+            let (rx, ry, time) = resolve_coords_and_time(button, screen_x, screen_y);
+            win.begin_move_drag(button, rx, ry, time);
+        }
+    }
+}
+
+pub(crate) fn detect_win_edge_for_coords(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Option<gdk::WindowEdge> {
+    const BORDER: i32 = 5;
+    if width < 120 || height < 120 {
+        return None;
+    }
+    let left = x >= 0 && x < BORDER;
+    let right = x <= width && x > width - BORDER;
+    let top = y >= 0 && y < BORDER;
+    let bottom = y <= height && y > height - BORDER;
+    match (top, bottom, left, right) {
+        (true, _, true, _) => Some(gdk::WindowEdge::NorthWest),
+        (true, _, _, true) => Some(gdk::WindowEdge::NorthEast),
+        (_, true, true, _) => Some(gdk::WindowEdge::SouthWest),
+        (_, true, _, true) => Some(gdk::WindowEdge::SouthEast),
+        (true, _, _, _) => Some(gdk::WindowEdge::North),
+        (_, true, _, _) => Some(gdk::WindowEdge::South),
+        (_, _, true, _) => Some(gdk::WindowEdge::West),
+        (_, _, _, true) => Some(gdk::WindowEdge::East),
+        _ => None,
+    }
+}
+
+pub(crate) fn install_widget_win_drag<W: IsA<gtk::Widget>>(widget: &W) {
+    widget.connect_button_press_event(move |w, ev| {
+        if ev.button() != 1 {
+            return glib::Propagation::Proceed;
+        }
+        let Some(win) = w
+            .toplevel()
+            .and_then(|top| top.downcast::<gtk::Window>().ok())
+        else {
+            return glib::Propagation::Proceed;
+        };
+        if !win.is_decorated() {
+            match ev.event_type() {
+                gdk::EventType::DoubleButtonPress => {
+                    execute_win_drag_command(&win, None, WinDragCommand::ToggleMaximize);
+                    return glib::Propagation::Stop;
+                }
+                gdk::EventType::ButtonPress => {
+                    let (lx, ly) = ev.position();
+                    let (wx, wy) = w
+                        .translate_coordinates(&win, lx.round() as i32, ly.round() as i32)
+                        .unwrap_or((lx.round() as i32, ly.round() as i32));
+                    let (ww, wh) = win.size();
+                    let (rx, ry) = ev.root();
+                    let rx_i = rx.round() as i32;
+                    let ry_i = ry.round() as i32;
+                    if win.is_resizable() && !win.is_maximized() {
+                        if let Some(edge) = detect_win_edge_for_coords(wx, wy, ww, wh) {
+                            win.begin_resize_drag(edge, 1, rx_i, ry_i, ev.time());
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                    win.begin_move_drag(1, rx_i, ry_i, ev.time());
+                    return glib::Propagation::Stop;
+                }
+                _ => {}
+            }
+        }
+        glib::Propagation::Proceed
+    });
+}
+
+pub(crate) fn install_win_drag_handler(ucm: &UserContentManager, webview: &WebView) {
+    let last_press = track_last_button_press(webview);
     let wv_weak = {
         let w = glib::WeakRef::new();
         w.set(Some(webview));
@@ -1708,54 +1927,17 @@ fn install_win_drag_handler(ucm: &UserContentManager, webview: &WebView) {
         let Some(val) = js_res.js_value() else {
             return;
         };
-        let raw = val.to_str();
-        let Ok(payload) = serde_json::from_str::<Value>(raw.as_str()) else {
+        let Some(payload) = decode_jsc_json_value(&val) else {
+            tracing::debug!(
+                raw = %val.to_str(),
+                "ignoring unparseable __olaz_win_drag message"
+            );
             return;
         };
-        let action = payload
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("move");
-        let button = payload
-            .get("button")
-            .and_then(Value::as_i64)
-            .unwrap_or(1)
-            .clamp(1, 5) as i32;
-        let screen_x = payload
-            .get("screenX")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0)
-            .round() as i32;
-        let screen_y = payload
-            .get("screenY")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0)
-            .round() as i32;
-        let time = gtk::current_event_time();
-
-        match action {
-            "toggle-maximize" => {
-                if win.is_maximized() {
-                    win.unmaximize();
-                } else {
-                    win.maximize();
-                }
-            }
-            "resize" => {
-                if !win.is_maximized() {
-                    if let Some(edge) = payload
-                        .get("edge")
-                        .and_then(Value::as_str)
-                        .and_then(parse_window_edge)
-                    {
-                        win.begin_resize_drag(edge, button, screen_x, screen_y, time);
-                    }
-                }
-            }
-            _ => {
-                win.begin_move_drag(button, screen_x, screen_y, time);
-            }
-        }
+        let Some(cmd) = parse_win_drag_command(&payload) else {
+            return;
+        };
+        execute_win_drag_command(&win, Some(last_press.as_ref()), cmd);
     });
 }
 
@@ -2923,5 +3105,106 @@ pub async fn eval_async_js_on_webview(
         Ok(Value::Null)
     } else {
         Ok(val)
+    }
+}
+
+#[cfg(test)]
+mod win_drag_tests {
+    use super::*;
+    use javascriptcore::ContextExt as _;
+    use serde_json::json;
+
+    #[test]
+    fn decode_jsc_json_value_accepts_both_objects_and_json_strings() {
+        let ctx = javascriptcore::Context::new();
+        let obj = ctx
+            .evaluate("({ action: 'move', button: 1, screenX: 120, screenY: 45 })")
+            .expect("evaluate object");
+        let decoded_obj = decode_jsc_json_value(&obj).expect("JS object must decode via to_json");
+        assert_eq!(decoded_obj["action"], json!("move"));
+        assert_eq!(decoded_obj["screenX"], json!(120));
+
+        let str_val = ctx
+            .evaluate(r#"'{"action":"resize","edge":"north-east","button":1}'"#)
+            .expect("evaluate string");
+        let decoded_str = decode_jsc_json_value(&str_val).expect("JSON string must decode");
+        assert_eq!(decoded_str["action"], json!("resize"));
+        assert_eq!(decoded_str["edge"], json!("north-east"));
+
+        let bad_val = ctx
+            .evaluate("'[object Object]'")
+            .expect("evaluate invalid JSON string");
+        assert!(decode_jsc_json_value(&bad_val).is_none());
+    }
+
+    #[test]
+    fn parse_win_drag_command_handles_move_resize_and_toggle_maximize() {
+        assert_eq!(
+            parse_win_drag_command(&json!({
+                "action": "move",
+                "button": 1,
+                "screenX": 120.6,
+                "screenY": 44.2,
+            })),
+            Some(WinDragCommand::Move {
+                button: 1,
+                screen_x: 121,
+                screen_y: 44,
+            })
+        );
+        assert_eq!(
+            parse_win_drag_command(&json!({
+                "button": 99,
+                "screenX": 10,
+                "screenY": 20,
+            })),
+            Some(WinDragCommand::Move {
+                button: 5,
+                screen_x: 10,
+                screen_y: 20,
+            })
+        );
+        assert_eq!(
+            parse_win_drag_command(&json!({
+                "action": "resize",
+                "edge": "south-west",
+                "button": 1,
+                "screenX": 4,
+                "screenY": 700,
+            })),
+            Some(WinDragCommand::Resize {
+                edge: gdk::WindowEdge::SouthWest,
+                button: 1,
+                screen_x: 4,
+                screen_y: 700,
+            })
+        );
+        assert!(parse_win_drag_command(&json!({
+            "action": "resize",
+            "edge": "invalid",
+        }))
+        .is_none());
+        assert_eq!(
+            parse_win_drag_command(&json!({ "action": "toggle-maximize" })),
+            Some(WinDragCommand::ToggleMaximize)
+        );
+    }
+
+    #[test]
+    fn detect_win_edge_for_coords_covers_borders_and_min_size() {
+        assert_eq!(
+            detect_win_edge_for_coords(2, 2, 1200, 800),
+            Some(gdk::WindowEdge::NorthWest)
+        );
+        assert_eq!(
+            detect_win_edge_for_coords(1198, 798, 1200, 800),
+            Some(gdk::WindowEdge::SouthEast)
+        );
+        assert_eq!(
+            detect_win_edge_for_coords(3, 400, 1200, 800),
+            Some(gdk::WindowEdge::West)
+        );
+        assert_eq!(detect_win_edge_for_coords(100, 100, 1200, 800), None);
+        assert_eq!(detect_win_edge_for_coords(2, 2, 80, 80), None);
     }
 }

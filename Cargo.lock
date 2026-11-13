@@ -2391,7 +2391,7 @@ dependencies = [
 
 [[package]]
 name = "olaz-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2424,7 +2424,7 @@ dependencies = [
 
 [[package]]
 name = "olaz-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2472,7 +2472,7 @@ dependencies = [
 
 [[package]]
 name = "olaz-linux"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes",
  "anyhow",
@@ -2513,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "olaz-net"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2551,7 +2551,7 @@ dependencies = [
 
 [[package]]
 name = "olaz-web"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

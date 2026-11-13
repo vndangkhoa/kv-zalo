@@ -81,6 +81,7 @@ cat > "$NOTES_FILE" <<EOF
 - **🛡️ Default Anti-Recall ("Giữ thu hồi") & Multi-Account Sidebar**: Preserves recalled messages with per-bubble \`...\` toggle, and native \`#main-tab\` blue sidebar account switcher + \`+\` Add Account button.
 - **🌐 Zero-Server-Persistence Self-Hosted Web (\`kv-zalo-web\`)**: Hardened \`--read-only\` Docker / systemd relay storing 100% of cookies, vault keys, OPFS files, and chats exclusively in the browser.
 - **🗄️ Native Modules, Proxy & Automation**: Pure-Rust \`db-cross-v4\` (\`ZDB4.0\`), \`zwalker\`, \`file-utilities\`, \`zfile\`, SOCKS5/HTTP \`--proxy\`, loopback REST API (\`--api\`), stdio MCP server (\`--mcp\`), and SHA-256 verified release updater (\`--check-update\` / \`--update\`).
+- **🪟 Ubuntu / Wayland Frameless Window Controls**: Fixes \`__olaz_win_drag\` JSON payload decoding, capture-phase titlebar & \`#main-tab\` dragging, 5px border resize, double-click maximize, setup/vault screen dragging, and multi-account sidebar dragging.
 
 ### 🚀 1-Command Terminal Setup (Auto-detects Omarchy & Ubuntu)
 

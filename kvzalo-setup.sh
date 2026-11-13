@@ -7,9 +7,9 @@
 set -euo pipefail
 
 BASE_URL="https://syno.vndns.net"
-PKG_VER="0.2.0-1"
-ARCH_PKG="kv-zalo-0.2.0-1-x86_64.pkg.tar.zst"
-DEB_PKG="kvzalo_0.2.0-1_amd64.deb"
+PKG_VER="0.2.1-1"
+ARCH_PKG="kv-zalo-0.2.1-1-x86_64.pkg.tar.zst"
+DEB_PKG="kvzalo_0.2.1-1_amd64.deb"
 
 # Colors
 C_BLUE='\033[0;34m'

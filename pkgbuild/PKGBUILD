@@ -1,6 +1,6 @@
 # Maintainer: KV Apps <noreply@khoavo.myds.me>
 pkgname=kv-zalo
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc='KV Zalo — Native Zalo desktop client for Linux (Omarchy & Ubuntu) built in Rust on WebKit2GTK'
 arch=('x86_64' 'aarch64')

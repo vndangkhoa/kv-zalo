@@ -7,11 +7,11 @@
 #
 # Options:
 #   --user              Install portable build into ~/.local (no root required if runtime libs exist)
-#   --version <vX.Y.Z>  Install a specific release tag (default: v0.2.0 / latest)
+#   --version <vX.Y.Z>  Install a specific release tag (default: v0.2.1 / latest)
 #   --launch            Launch KV Zalo immediately after installation
 set -euo pipefail
 
-DEFAULT_TAG="v0.2.0"
+DEFAULT_TAG="v0.2.1"
 RELEASE_TAG="${KVZALO_RELEASE_TAG:-${OLAZ_RELEASE_TAG:-}}"
 USER_MODE=0
 LAUNCH_AFTER=0
@@ -46,7 +46,7 @@ Usage:
 Options:
   --user              Install into ~/.local without root package manager
   --prefix <dir>      Custom user prefix (implies --user, default: ~/.local)
-  --version <tag>     Release tag to install (e.g. v0.2.0)
+  --version <tag>     Release tag to install (e.g. v0.2.1)
   --launch            Start KV Zalo after installation completes
   -h, --help          Show this help message
 EOF
