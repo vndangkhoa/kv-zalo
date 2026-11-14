@@ -1959,8 +1959,23 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
         if s.contains("gen_video_thumb:{enable:!0") {
             hit_video_thumb_flag = true;
         }
-        if s.contains(r#""+ou9":"#) && (s.contains("const A=!0;") || s.contains("const h=!0;")) {
-            hit_sticker_isweb = true;
+        if !path.starts_with("pc-dist/sync-v2-sub-worker.") {
+            if let Some(ou9_start) = s.find(r#""+ou9":"#) {
+                let ou9_end = s[ou9_start..]
+                    .find("_getBackgroundImageUrlInWeb")
+                    .map(|rel| ou9_start + rel)
+                    .unwrap_or_else(|| (ou9_start + 16384).min(s.len()));
+                let ou9_section = &s[ou9_start..ou9_end];
+                assert!(
+                    !ou9_section.contains(".default.isWeb()"),
+                    "Unpatched .default.isWeb() remaining in +ou9 module of {path}"
+                );
+                assert!(
+                    ou9_section.contains("=!0;"),
+                    "Expected patched `=!0;` inside +ou9 module of {path}"
+                );
+                hit_sticker_isweb = true;
+            }
         }
         if s.contains(r#"!0)throw{error_code:"NOT_SUPPORT""#)
             || (s.contains("genVideoThumbFromFile(") && s.contains("if(!!0){const ") && s.contains(".NOT_SUPPORT"))
@@ -2065,23 +2080,53 @@ fn transform_local_url_unwraps_whatwg_url_objects_and_platform_permits_cache_and
 
 #[test]
 fn sticker_module_patch_enables_direct_web_rendering_and_remains_idempotent() {
-    let synthetic_lazy = br#""+ou9":function(t,n,a){"use strict";var s=a("q1tI"),i=a.n(s),o=a("z0WU"),r=a("IpzU");let u=null;const A=o.default.isWeb();A||(u=$znode.crypto);let R;const b=o.default.isWeb();b||(R=a("Dprd").default);}"#;
-    let patched_lazy = patch_asar_bundle("pc-dist/lazy/default-login-main-startup-shared-worker-znotification.1234.js", synthetic_lazy)
-        .expect("lazy sticker patch must match");
-    let patched_lazy_str = std::str::from_utf8(&patched_lazy).unwrap();
-    assert!(patched_lazy_str.contains("const A=!0;"));
-    assert!(patched_lazy_str.contains("const b=!0;"));
-    assert!(!patched_lazy_str.contains("o.default.isWeb()"));
-    assert!(patch_asar_bundle("pc-dist/lazy/default-login-main-startup-shared-worker-znotification.1234.js", &patched_lazy).is_none());
+    let cases = [
+        (
+            "pc-dist/lazy/default-login-main-startup-shared-worker-znotification.1234.js",
+            br#""+ou9":function(t,n,a){"use strict";var s=a("q1tI"),i=a.n(s),o=a("z0WU"),r=a("IpzU");let u=null;const A=o.default.isWeb();A||(u=$znode.crypto);let R;const S=o.default.isWeb();S||(R=a("Dprd").default);}"#.as_slice(),
+            &["const A=!0;", "const S=!0;"][..],
+        ),
+        (
+            "pc-dist/lazy/default-login-main-startup-shared-worker-znotification.5678.js",
+            br#""+ou9":function(t,n,a){"use strict";var s=a("q1tI"),i=a.n(s),o=a("z0WU"),r=a("IpzU");let u=null;const A=o.default.isWeb();A||(u=$znode.crypto);let R;const b=o.default.isWeb();b||(R=a("Dprd").default);}"#.as_slice(),
+            &["const A=!0;", "const b=!0;"][..],
+        ),
+        (
+            "pc-dist/compact-app-pc.1234.js",
+            br#""+ou9":function(t,n,a){"use strict";var i=a("q1tI"),r=a.n(i),s=a("z0WU"),o=a("IpzU");let u=null;const A=s.default.isWeb();A||(u=$znode.crypto);let T;const y=s.default.isWeb();y||(T=a("Dprd").default);}"#.as_slice(),
+            &["const A=!0;", "const y=!0;"][..],
+        ),
+        (
+            "pc-dist/compact-app-pc.5678.js",
+            br#""+ou9":function(t,n,a){"use strict";var i=a("q1tI"),r=a.n(i),s=a("z0WU"),o=a("IpzU");let u=null;const h=s.default.isWeb();h||(u=$znode.crypto);let T;const y=s.default.isWeb();y||(T=a("Dprd").default);}"#.as_slice(),
+            &["const h=!0;", "const y=!0;"][..],
+        ),
+        (
+            "pc-dist/lazy/rehashed-sticker.js",
+            br#""+ou9":function(t,n,a){"use strict";var s=a("q1tI"),i=a.n(s),o=a("z0WU");let u=null;const k=o.default.isWeb();k||(u=$znode.crypto);let R;const m=o.default.isWeb();m||(R=a("Xy12").default);class O extends i.a.Component{constructor(e){super(e)}}}"#.as_slice(),
+            &["const k=!0;", "const m=!0;"][..],
+        ),
+    ];
 
-    let synthetic_compact = br#""+ou9":function(t,n,a){"use strict";var i=a("q1tI"),r=a.n(i),s=a("z0WU"),o=a("IpzU");let u=null;const h=s.default.isWeb();h||(u=$znode.crypto);let T;const y=s.default.isWeb();y||(T=a("Dprd").default);}"#;
-    let patched_compact = patch_asar_bundle("pc-dist/compact-app-pc.1234.js", synthetic_compact)
-        .expect("compact sticker patch must match");
-    let patched_compact_str = std::str::from_utf8(&patched_compact).unwrap();
-    assert!(patched_compact_str.contains("const h=!0;"));
-    assert!(patched_compact_str.contains("const y=!0;"));
-    assert!(!patched_compact_str.contains("s.default.isWeb()"));
-    assert!(patch_asar_bundle("pc-dist/compact-app-pc.1234.js", &patched_compact).is_none());
+    for (path, input, expected_snippets) in cases {
+        let patched = patch_asar_bundle(path, input)
+            .unwrap_or_else(|| panic!("sticker patch must match {path}"));
+        let patched_str = std::str::from_utf8(&patched).unwrap();
+        for snippet in expected_snippets {
+            assert!(
+                patched_str.contains(snippet),
+                "Expected {snippet:?} in patched output for {path}: {patched_str}"
+            );
+        }
+        assert!(
+            !patched_str.contains(".default.isWeb()"),
+            "Expected zero remaining .default.isWeb() in {path}: {patched_str}"
+        );
+        assert!(
+            patch_asar_bundle(path, &patched).is_none(),
+            "Expected sticker patch to be idempotent for {path}"
+        );
+    }
 }
 
 #[test]

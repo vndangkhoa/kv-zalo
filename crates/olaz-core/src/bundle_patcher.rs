@@ -5137,6 +5137,20 @@ static MIGRATE_DB_SF_START_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid migrate_db_sf start regex")
 });
 
+static STICKER_CRYPTO_ISWEB_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"const ([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*\.default\.isWeb\(\);([A-Za-z_$][\w$]*\|\|\([A-Za-z_$][\w$]*=\$znode\.crypto\);)"#,
+    )
+    .expect("valid sticker crypto isWeb regex")
+});
+
+static STICKER_DPRD_ISWEB_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"const ([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*\.default\.isWeb\(\);([A-Za-z_$][\w$]*\|\|\([A-Za-z_$][\w$]*=[A-Za-z_$][\w$]*\((?:"Dprd"\)\.default\);|"[^"]+"\)\.default\);class [A-Za-z_$][\w$]* extends [A-Za-z_$][\w$.]*\.Component\{constructor\())"#,
+    )
+    .expect("valid sticker Dprd isWeb regex")
+});
+
 /// Applies `vndangkhoa/zalo-linux` renderer patches on-the-fly without altering `getClientType() == 23`:
 /// - Login titlebar `platform:"WIN32"` (`fa-Minus` + `fa-Close`)
 /// - Main `#titleBar` Windows controls (`Lock`, `Minus`, `Maximize`/`Minimize`, `Close`) + `"WIN32"` layout class
@@ -5651,25 +5665,16 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 
     // 18. Sticker module `+ou9`: enable direct web sticker rendering (`isWeb = true`).
-    // In Zalo Desktop, `+ou9` checks `isWeb()`. When false, it attempts to download stickers to local disk
-    // via Node.js fs/crypto/Dprd and load via file:/// or zfile://, which fails in browser and shows grey placeholder smileys.
-    // Setting `isWeb = true` in `+ou9` causes Zalo to use direct CDN URLs (`background-image: url(...)`) and animated sprite sheets!
-    if s.contains(r#""+ou9":"#) {
-        if s.contains("const A=o.default.isWeb();") {
-            s = s.replace("const A=o.default.isWeb();", "const A=!0;");
-            changed = true;
-        }
-        if s.contains("const b=o.default.isWeb();") {
-            s = s.replace("const b=o.default.isWeb();", "const b=!0;");
-            changed = true;
-        }
-        if s.contains("const h=s.default.isWeb();") {
-            s = s.replace("const h=s.default.isWeb();", "const h=!0;");
-            changed = true;
-        }
-        if s.contains("const y=s.default.isWeb();") {
-            s = s.replace("const y=s.default.isWeb();", "const y=!0;");
-            changed = true;
+    // `+ou9` reads `isWeb()` twice into independent minified locals: once for the `$znode.crypto` cache-key
+    // guard (`getStickerFilePath`) and once for the `Dprd` disk-cache loader in the sticker React component.
+    // Both must become `!0`; patching only the first makes `getStickerFilePath` return `""` while the component
+    // still attempts desktop disk caching and rejects every load, leaving gray placeholder smileys.
+    if s.contains(r#""+ou9":"#) || s.contains(r#""sticker-resource-cache""#) {
+        for re in [&*STICKER_CRYPTO_ISWEB_RE, &*STICKER_DPRD_ISWEB_RE] {
+            if re.is_match(&s) {
+                s = re.replace_all(&s, "const ${1}=!0;${2}").into_owned();
+                changed = true;
+            }
         }
     }
 

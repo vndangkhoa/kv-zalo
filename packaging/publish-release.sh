@@ -53,10 +53,12 @@ echo "==> Pushing branch & tag ${TAG} to remotes..."
 git push origin main
 git push $( [ "$FORCE_TAG" -eq 1 ] && printf '%s' '--force' ) origin "$TAG"
 
-if git remote get-url forgejo-vndns >/dev/null 2>&1; then
-  git push forgejo-vndns main || true
-  git push $( [ "$FORCE_TAG" -eq 1 ] && printf '%s' '--force' ) forgejo-vndns "$TAG" || true
-fi
+for remote in forgejo forgejo-vndns; do
+  if git remote get-url "$remote" >/dev/null 2>&1; then
+    git push "$remote" main || true
+    git push $( [ "$FORCE_TAG" -eq 1 ] && printf '%s' '--force' ) "$remote" "$TAG" || true
+  fi
+done
 
 git push github main
 if [ "$FORCE_TAG" -eq 1 ]; then
@@ -82,6 +84,7 @@ cat > "$NOTES_FILE" <<EOF
 - **🌐 Zero-Server-Persistence Self-Hosted Web (\`kv-zalo-web\`)**: Hardened \`--read-only\` Docker / systemd relay storing 100% of cookies, vault keys, OPFS files, and chats exclusively in the browser.
 - **🗄️ Native Modules, Proxy & Automation**: Pure-Rust \`db-cross-v4\` (\`ZDB4.0\`), \`zwalker\`, \`file-utilities\`, \`zfile\`, SOCKS5/HTTP \`--proxy\`, loopback REST API (\`--api\`), stdio MCP server (\`--mcp\`), and SHA-256 verified release updater (\`--check-update\` / \`--update\`).
 - **🪟 Ubuntu / Wayland Frameless Window Controls**: Fixes \`__olaz_win_drag\` JSON payload decoding, capture-phase titlebar & \`#main-tab\` dragging, 8px border / 16px corner & 4px GTK outer-rim resize with dynamic resize cursors, user-resizable login/main/multi-account/popup/Call UI bounds, double-click maximize, setup/vault screen dragging, and multi-account sidebar edge resize.
+- **🎨 Sticker Rendering Fix (\`+ou9\`)**: Patches all minified \`isWeb()\` guards in sticker module \`+ou9\` so static and animated stickers render reliably on Ubuntu and Web instead of showing gray placeholders.
 
 ### 🚀 1-Command Terminal Setup (Auto-detects Omarchy & Ubuntu)
 
@@ -239,35 +242,76 @@ if gl_pw:
     gl_proj = "https://gitlab.khoavo.myds.me/api/v4/projects/vndangkhoa%2Fkv-zalo"
     gl_hdrs = {"PRIVATE-TOKEN": gl_pw}
     try:
+        # Clean existing package files for this version so re-uploads overwrite cleanly instead of piling up duplicates.
+        _, pkgs = api_json(
+            f"{gl_proj}/packages?package_name=kv-zalo&package_version={urllib.parse.quote(ver)}",
+            "GET",
+            gl_hdrs,
+        )
+        existing_gl_files = {}
+        for pkg in (pkgs or []):
+            pkg_id = pkg.get("id")
+            if not pkg_id:
+                continue
+            _, pfiles = api_json(f"{gl_proj}/packages/{pkg_id}/package_files", "GET", gl_hdrs)
+            for pf in (pfiles or []):
+                existing_gl_files.setdefault(pf.get("file_name"), []).append((pkg_id, pf.get("id")))
+
         links = []
         for path in assets:
+            for pkg_id, pf_id in existing_gl_files.get(path.name, []):
+                if pf_id:
+                    del_req = urllib.request.Request(
+                        f"{gl_proj}/packages/{pkg_id}/package_files/{pf_id}",
+                        headers={**gl_hdrs, "User-Agent": ua},
+                        method="DELETE",
+                    )
+                    with urllib.request.urlopen(del_req, timeout=30):
+                        pass
+
             pkg_url = f"{gl_proj}/packages/generic/kv-zalo/{urllib.parse.quote(ver)}/{urllib.parse.quote(path.name)}"
             file_bytes = path.read_bytes()
-            up_req = urllib.request.Request(
-                pkg_url,
-                data=file_bytes,
-                headers={**gl_hdrs, "User-Agent": ua, "Content-Type": "application/octet-stream"},
-                method="PUT",
-            )
-            with urllib.request.urlopen(up_req, timeout=180) as r:
-                print(f"  [GitLab] Uploaded {path.name} -> HTTP {r.status}")
-            links.append({"name": path.name, "url": pkg_url, "filepath": f"/{path.name}", "link_type": "package"})
+            try:
+                up_req = urllib.request.Request(
+                    pkg_url,
+                    data=file_bytes,
+                    headers={**gl_hdrs, "User-Agent": ua, "Content-Type": "application/octet-stream"},
+                    method="PUT",
+                )
+                with urllib.request.urlopen(up_req, timeout=180) as r:
+                    print(f"  [GitLab] Uploaded {path.name} -> HTTP {r.status}")
+                links.append({"name": path.name, "url": pkg_url, "filepath": f"/{path.name}", "link_type": "package"})
+            except Exception as up_exc:
+                fj_url = f"https://git.khoavo.myds.me/vndangkhoa/kv-zalo/releases/download/{urllib.parse.quote(tag)}/{urllib.parse.quote(path.name)}"
+                print(f"  [GitLab] Direct upload skipped for {path.name} ({up_exc}); linking Forgejo mirror", file=sys.stderr)
+                links.append({"name": f"{path.name} (Forgejo mirror)", "url": fj_url, "link_type": "package"})
 
-        rel_exists = False
+        rel_data = None
         try:
-            api_json(f"{gl_proj}/releases/{urllib.parse.quote(tag)}", "GET", gl_hdrs)
-            rel_exists = True
+            _, rel_data = api_json(f"{gl_proj}/releases/{urllib.parse.quote(tag)}", "GET", gl_hdrs)
         except urllib.error.HTTPError as e:
             if e.code != 404:
                 raise
 
-        if rel_exists:
+        if rel_data is not None:
             api_json(
                 f"{gl_proj}/releases/{urllib.parse.quote(tag)}",
                 "PUT",
                 gl_hdrs,
                 {"name": title, "description": notes},
             )
+            for old_link in (rel_data.get("assets", {}).get("links") or []):
+                lid = old_link.get("id")
+                if lid:
+                    del_req = urllib.request.Request(
+                        f"{gl_proj}/releases/{urllib.parse.quote(tag)}/assets/links/{lid}",
+                        headers={**gl_hdrs, "User-Agent": ua},
+                        method="DELETE",
+                    )
+                    with urllib.request.urlopen(del_req, timeout=30):
+                        pass
+            for link in links:
+                api_json(f"{gl_proj}/releases/{urllib.parse.quote(tag)}/assets/links", "POST", gl_hdrs, link)
         else:
             api_json(
                 f"{gl_proj}/releases",
