@@ -74,6 +74,7 @@ jobs:
           - **Default Anti-Recall ("Giữ thu hồi") & Multi-Account Sidebar**: Preserves recalled messages with per-bubble \`...\` toggle, and native \`#main-tab\` sidebar account switcher + \`+\` Add Account button.
           - **Power Features**: Multi-account \`--profile\`, SOCKS5/HTTP \`--proxy\`, \`zalo://\` deep links, privacy receipt blocker, scheduler & auto-reply, local HTTP REST API (\`--api\`), stdio \`--mcp\` server, and \`--check-update\` / \`--update\`.
           - **Zero-Persistence Self-Hosted Web (\`kv-zalo-web\`)**: Hardened \`--read-only\` Docker / systemd relay storing 100% of state in the browser.
+          - **🎨 Sticker Rendering Fix (\`+ou9\`)**: Patches all minified \`isWeb()\` guards in sticker module \`+ou9\` so static and animated stickers render reliably on Ubuntu and Web instead of showing gray placeholders.
 
           ### 🚀 1-Command Terminal Install (Omarchy & Ubuntu)
           \`\`\`bash
@@ -93,10 +94,12 @@ jobs:
           EOF
 
           if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/"$TAG"/* --clobber
             gh release edit "$TAG" \
+              --draft=false \
+              --target "$GITHUB_SHA" \
               --title "KV Zalo ${TAG} — 1-Click Setup for Omarchy & Ubuntu" \
               --notes-file "$NOTES_FILE"
-            gh release upload "$TAG" dist/"$TAG"/* --clobber
           else
             gh release create "$TAG" dist/"$TAG"/* \
               --title "KV Zalo ${TAG} — 1-Click Setup for Omarchy & Ubuntu" \
