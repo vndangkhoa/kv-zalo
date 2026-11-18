@@ -1944,7 +1944,7 @@ fn live_installed_asar_patches_all_zalo_linux_targets_and_passes_node_syntax() {
         if s.contains("/*olaz-io-win*/") {
             hit_io_win = true;
         }
-        if s.contains(r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"sync",loading:"eager""#) {
+        if s.contains(r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"async",loading:"eager""#) {
             hit_zimg_eager = true;
         }
         if s.contains("/*olaz-autostart-ui*/") && s.contains("/*olaz-autostart-fx*/") {
@@ -2852,14 +2852,14 @@ globalThis.webkit = {{
 
 #[test]
 fn popup_viewer_zimg_portal_sync_and_photofs_denoising_work_in_node() {
-    // 1. Verify Patch #13 (`Ze` `Z.d.Image`): `decoding:"sync"`, `loading:"eager"`, native DOM `load`
+    // 1. Verify Patch #13 (`Ze` `Z.d.Image`): `decoding:"async"`, `loading:"eager"`, native DOM `load`
     //    listener + cached `complete && naturalWidth > 0` across both mount and `src` updates.
     let synthetic_ze = br#"class Ze extends o.a.Component{constructor(e){super(e),this.imageRef=o.a.createRef(),this._mounted=!1,this.state={loaded:!1},this.interceptOnLoad=e=>{this._mounted&&this.setState({loaded:!0})}}componentDidMount(){this._mounted=!0,this.props.src&&Xe.register(this.props.src)}componentWillUnmount(){this._mounted=!1,this.props.src&&Xe.unregister(this.props.src)}render(){const e={draggable:!1,style:Object.assign({width:"inherit",height:"inherit",cursor:"pointer"},this.props.style,{visibility:this.state.loaded?"visible":"hidden"}),loading:"lazy"};return o.a.createElement("img",Object.assign({ref:this.imageRef},e,{src:this.props.src,onLoad:this.interceptOnLoad,"data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"async",loading:"lazy"}))}}"#;
     let patched_ze = patch_zalo_linux_renderer_bundle(synthetic_ze)
         .expect("Ze patch #13 must match");
     assert!(patch_zalo_linux_renderer_bundle(&patched_ze).is_none());
     let patched_ze_str = std::str::from_utf8(&patched_ze).unwrap();
-    assert!(patched_ze_str.contains(r#"decoding:"sync",loading:"eager""#));
+    assert!(patched_ze_str.contains(r#"decoding:"async",loading:"eager""#));
 
     // 2. Verify `PHOTO_FS` (`READ_ARRAY_BUFFER` + `READ_PARTIAL`) strips Zalo `fileNoise` and
     //    `wrappedWinOpen` installs `zalo-app://local/__olaz/zfile/` DOM URL rewriters onto child `popupWin`.

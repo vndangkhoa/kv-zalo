@@ -5,9 +5,9 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -290,6 +290,8 @@ pub struct MediaLoader {
     cache_limit_bytes: u64,
     byte_flights: InFlightGroup<Bytes>,
     file_flights: InFlightGroup<PathBuf>,
+    writes_since_trim: Arc<AtomicUsize>,
+    trim_running: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for MediaLoader {
@@ -337,6 +339,8 @@ impl MediaLoader {
             .redirect(Policy::none())
             .dns_resolver(Arc::clone(&dns_resolver))
             .user_agent(DEFAULT_USER_AGENT)
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(16)
             .connect_timeout(Duration::from_secs(10))
             .build()
             .context("failed to build MediaLoader reqwest::Client")?;
@@ -351,6 +355,8 @@ impl MediaLoader {
             cache_limit_bytes,
             byte_flights: InFlightGroup::default(),
             file_flights: InFlightGroup::default(),
+            writes_since_trim: Arc::new(AtomicUsize::new(0)),
+            trim_running: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -484,18 +490,34 @@ impl MediaLoader {
                     if !is_non_empty_regular_file(&target_path) {
                         return Err(MediaLoadError::Io(err.to_string()));
                     }
+                } else {
+                    let write_idx = this.writes_since_trim.fetch_add(1, Ordering::Relaxed);
+                    if (this.cache_limit_bytes < 1024 * 1024 || write_idx % 32 == 0)
+                        && this
+                            .trim_running
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        let files_dir = this.files_dir.clone();
+                        let limit = this.cache_limit_bytes;
+                        let keep = target_path.clone();
+                        let trim_running = Arc::clone(&this.trim_running);
+                        tokio::task::spawn_blocking(move || {
+                            struct ResetTrimGuard(Arc<AtomicBool>);
+                            impl Drop for ResetTrimGuard {
+                                fn drop(&mut self) {
+                                    self.0.store(false, Ordering::SeqCst);
+                                }
+                            }
+                            let _guard = ResetTrimGuard(trim_running);
+                            trim_cache_dir(&files_dir, limit, Some(&keep), STALE_PART_AGE);
+                        });
+                    }
                 }
 
                 Ok(target_path)
             })
             .await?;
-
-        let files_dir = self.files_dir.clone();
-        let limit = self.cache_limit_bytes;
-        let keep = out_path.clone();
-        tokio::task::spawn_blocking(move || {
-            trim_cache_dir(&files_dir, limit, Some(&keep), STALE_PART_AGE);
-        });
 
         Ok(out_path)
     }
@@ -545,7 +567,8 @@ impl MediaLoader {
             }
         }
 
-        let mut file = File::create(part_path).map_err(|e| MediaLoadError::Io(e.to_string()))?;
+        let file = File::create(part_path).map_err(|e| MediaLoadError::Io(e.to_string()))?;
+        let mut writer = BufWriter::with_capacity(64 * 1024, file);
         let mut written: u64 = 0;
         let mut stream = resp.bytes_stream();
 
@@ -575,11 +598,13 @@ impl MediaLoader {
             if written > max_bytes {
                 return Err(MediaLoadError::TooLarge);
             }
-            file.write_all(&chunk)
+            writer
+                .write_all(&chunk)
                 .map_err(|e| MediaLoadError::Io(e.to_string()))?;
         }
 
-        file.sync_all()
+        writer
+            .flush()
             .map_err(|e| MediaLoadError::Io(e.to_string()))?;
         Ok(written)
     }
@@ -960,6 +985,9 @@ pub fn open_local_media_range(
         .with_context(|| format!("failed to resolve media path {}", path.display()))?;
 
     let is_confined = allowed_roots.iter().any(|root| {
+        if canonical_target != *root && canonical_target.starts_with(root) {
+            return true;
+        }
         fs::canonicalize(root).ok().is_some_and(|canon_root| {
             if canon_root.is_file() {
                 canonical_target == canon_root
@@ -1225,6 +1253,13 @@ fn is_non_empty_regular_file(path: &Path) -> bool {
 }
 
 fn touch_file_mtime(path: &Path) {
+    if let Ok(meta) = fs::metadata(path) {
+        if let Ok(modified) = meta.modified() {
+            if modified.elapsed().is_ok_and(|elapsed| elapsed.as_secs() < 60) {
+                return;
+            }
+        }
+    }
     if let Ok(file) = OpenOptions::new().write(true).open(path) {
         let _ = file.set_modified(SystemTime::now());
     }

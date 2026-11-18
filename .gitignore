@@ -45,6 +45,9 @@ AuthKey_*.p8
 .bla-hardened/
 .bla-hardened
 
+# Reference binaries/downloads
+ref/
+
 # ── Third-party Zalo (VNG) content ──────────────────────────────────────────
 # Olaz downloads the official Zalo PC runtime from VNG at first launch; none of
 # VNG's files are redistributed here. Regenerate these locally from Zalo PC if

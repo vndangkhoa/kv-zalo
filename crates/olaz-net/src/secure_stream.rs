@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1484,7 +1484,7 @@ fn copy_local_with_noise_transform(
         return Err(DownloadFailure::empty_body());
     }
 
-    let write_to = |fout: &mut File, fin: &mut File| -> std::io::Result<()> {
+    let write_to = |fout: &mut dyn Write, fin: &mut File| -> std::io::Result<()> {
         let read_limit = if src_has_noise && !want_noise {
             logical_len
         } else {
@@ -1516,11 +1516,12 @@ fn copy_local_with_noise_transform(
     let part_path = SecureStream::part_path_for(destination);
     let _ = fs::remove_file(&part_path);
     match File::create(&part_path) {
-        Ok(mut fout) => {
-            if write_to(&mut fout, &mut fin)
-                .and_then(|_| fout.sync_all())
+        Ok(fout_file) => {
+            let mut writer = BufWriter::with_capacity(64 * 1024, fout_file);
+            if write_to(&mut writer, &mut fin)
                 .and_then(|_| {
-                    drop(fout);
+                    writer.flush()?;
+                    drop(writer);
                     fs::rename(&part_path, destination)
                 })
                 .is_err()
@@ -1534,8 +1535,9 @@ fn copy_local_with_noise_transform(
             // Direct-open fallback for XDG document-portal FUSE mounts where sibling `.part` files are denied.
             fin.seek(SeekFrom::Start(0))
                 .map_err(|_| DownloadFailure::unknown())?;
-            let mut fout = File::create(destination).map_err(|_| DownloadFailure::unknown())?;
-            write_to(&mut fout, &mut fin).map_err(|_| DownloadFailure::unknown())
+            let fout_file = File::create(destination).map_err(|_| DownloadFailure::unknown())?;
+            let mut writer = BufWriter::with_capacity(64 * 1024, fout_file);
+            write_to(&mut writer, &mut fin).map_err(|_| DownloadFailure::unknown())
         }
     }
 }
@@ -1557,7 +1559,7 @@ fn apply_noise_in_place(path: &Path) -> std::io::Result<()> {
     }
     f.seek(SeekFrom::End(0))?;
     f.write_all(&ZALO_NOISE_SIGN)?;
-    f.sync_all()
+    f.flush()
 }
 
 fn deduplicate_destination(initial: &Path) -> PathBuf {
@@ -1626,7 +1628,7 @@ fn finalize_fetched_to_dest(
     }
     let _ = fs::create_dir_all(temp_dir);
 
-    let res: std::result::Result<(), DownloadFailure> = match (source, stream_opt) {
+    let noise_handled: bool = match (source, stream_opt) {
         (FetchedSource::Bytes(bytes), Some(stream)) => {
             if bytes.is_empty() {
                 return Err(DownloadFailure::empty_body());
@@ -1641,7 +1643,7 @@ fn finalize_fetched_to_dest(
                 let _ = fs::remove_file(destination);
                 return Err(DownloadFailure::empty_body());
             }
-            Ok(())
+            false
         }
         (FetchedSource::Bytes(bytes), None) => {
             if bytes.is_empty() {
@@ -1650,8 +1652,9 @@ fn finalize_fetched_to_dest(
             if bytes.len() as u64 > MAX_PHOTO_BYTES {
                 return Err(DownloadFailure::too_large());
             }
-            write_atomic_part(destination, &bytes).map_err(|_| DownloadFailure::unknown())?;
-            Ok(())
+            write_atomic_part_with_noise(destination, &bytes, want_noise)
+                .map_err(|_| DownloadFailure::unknown())?;
+            true
         }
         (FetchedSource::File { path, owned }, Some(stream)) => {
             let dec_res = stream.decrypt_file(&path, destination);
@@ -1663,19 +1666,19 @@ fn finalize_fetched_to_dest(
                 let _ = fs::remove_file(destination);
                 return Err(DownloadFailure::empty_body());
             }
-            Ok(())
+            false
         }
         (FetchedSource::File { path, owned }, None) => {
             let copy_res = copy_local_with_noise_transform(&path, destination, want_noise);
             if owned {
                 let _ = fs::remove_file(&path);
             }
-            copy_res
+            copy_res?;
+            true
         }
     };
 
-    res?;
-    if want_noise {
+    if want_noise && !noise_handled {
         apply_noise_in_place(destination).map_err(|_| {
             let _ = fs::remove_file(destination);
             DownloadFailure::unknown()
@@ -1684,15 +1687,36 @@ fn finalize_fetched_to_dest(
     Ok(())
 }
 
-fn write_atomic_part(destination: &Path, data: &[u8]) -> std::io::Result<()> {
+fn write_atomic_part_with_noise(
+    destination: &Path,
+    data: &[u8],
+    want_noise: bool,
+) -> std::io::Result<()> {
+    let write_bytes = |w: &mut dyn Write| -> std::io::Result<()> {
+        let already_noised = data.len() > ZALO_NOISE_SIGN.len() && data.ends_with(&ZALO_NOISE_SIGN);
+        if want_noise && !already_noised {
+            let head_len = data.len().min(ZALO_NOISE_XOR_LEN as usize);
+            let mut head = data[..head_len].to_vec();
+            xor_noise_window(0, &mut head);
+            w.write_all(&head)?;
+            if data.len() > head_len {
+                w.write_all(&data[head_len..])?;
+            }
+            w.write_all(&ZALO_NOISE_SIGN)?;
+        } else {
+            w.write_all(data)?;
+        }
+        w.flush()
+    };
+
     let part_path = SecureStream::part_path_for(destination);
     let _ = fs::remove_file(&part_path);
     match File::create(&part_path) {
-        Ok(mut f) => {
+        Ok(f) => {
             let res = (|| -> std::io::Result<()> {
-                f.write_all(data)?;
-                f.sync_all()?;
-                drop(f);
+                let mut writer = BufWriter::with_capacity(64 * 1024, f);
+                write_bytes(&mut writer)?;
+                drop(writer);
                 fs::rename(&part_path, destination)?;
                 Ok(())
             })();
@@ -1702,11 +1726,16 @@ fn write_atomic_part(destination: &Path, data: &[u8]) -> std::io::Result<()> {
             res
         }
         Err(_) => {
-            let mut f = File::create(destination)?;
-            f.write_all(data)?;
-            f.flush()
+            let f = File::create(destination)?;
+            let mut writer = BufWriter::with_capacity(64 * 1024, f);
+            write_bytes(&mut writer)
         }
     }
+}
+
+#[allow(dead_code)]
+fn write_atomic_part(destination: &Path, data: &[u8]) -> std::io::Result<()> {
+    write_atomic_part_with_noise(destination, data, false)
 }
 
 fn resolve_destination(save_dir: Option<&str>, file_name: Option<&str>) -> Option<PathBuf> {

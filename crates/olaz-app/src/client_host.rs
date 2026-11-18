@@ -698,6 +698,7 @@ impl ZaloBridge {
 pub struct ZaloWebRuntime {
     context: WebContext,
     asar: Arc<RwLock<Option<Arc<AsarArchive>>>>,
+    patched_bundle_cache: Arc<RwLock<HashMap<String, bytes::Bytes>>>,
     bridges: Rc<RefCell<BridgeRegistry>>,
 }
 
@@ -785,22 +786,30 @@ impl ZaloWebRuntime {
         }
 
         let bridges = Rc::new(RefCell::new(BridgeRegistry::default()));
+        let patched_bundle_cache: Arc<RwLock<HashMap<String, bytes::Bytes>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let static_allowed_roots = Arc::new(zfile_canonical_static_roots(platform));
 
         let asar_for_scheme = Arc::clone(&asar_slot);
+        let bundle_cache_for_scheme = Arc::clone(&patched_bundle_cache);
         let bridges_for_scheme = Rc::clone(&bridges);
         let platform_for_zapp = Arc::clone(platform);
+        let roots_for_zapp = Arc::clone(&static_allowed_roots);
         context.register_uri_scheme(ZALO_APP_SCHEME, move |request| {
             handle_zalo_app_scheme(
                 request,
                 &asar_for_scheme,
+                &bundle_cache_for_scheme,
                 &bridges_for_scheme,
                 &platform_for_zapp,
+                &roots_for_zapp,
             );
         });
 
         let platform_for_zfile = Arc::clone(platform);
+        let roots_for_zfile = Arc::clone(&static_allowed_roots);
         context.register_uri_scheme(ZFILE_SCHEME, move |request| {
-            handle_zfile_scheme(request, &platform_for_zfile);
+            handle_zfile_scheme(request, &platform_for_zfile, &roots_for_zfile);
         });
 
         // Save `<a download>` / `blob:` renderer downloads cleanly into `~/Downloads/`.
@@ -825,6 +834,7 @@ impl ZaloWebRuntime {
         Self {
             context,
             asar: asar_slot,
+            patched_bundle_cache,
             bridges,
         }
     }
@@ -834,6 +844,7 @@ impl ZaloWebRuntime {
     }
 
     pub fn set_asar(&self, archive: Arc<AsarArchive>) {
+        self.patched_bundle_cache.write().clear();
         *self.asar.write() = Some(archive);
     }
 
@@ -896,8 +907,8 @@ fn unique_destination_path(dir: &Path, filename: &str) -> PathBuf {
     dir.join(format!("{}-{}", uuid::Uuid::new_v4().simple(), filename))
 }
 
-fn zfile_allowed_roots(platform: &ZaloPlatform) -> Vec<PathBuf> {
-    let mut roots = vec![
+fn zfile_static_roots(platform: &ZaloPlatform) -> Vec<PathBuf> {
+    vec![
         platform.user_data().to_path_buf(),
         platform.cache_dir().to_path_buf(),
         platform.temp_dir().to_path_buf(),
@@ -909,10 +920,31 @@ fn zfile_allowed_roots(platform: &ZaloPlatform) -> Vec<PathBuf> {
         platform.electron_path("documents").join("Zalo Received Files"),
         platform.electron_path("desktop"),
         PathBuf::from(olaz_linux::SCREENSHOT_STAGING_DIR),
-    ];
-    roots.extend(platform.approved_read_paths());
-    roots.extend(platform.approved_write_paths());
+    ]
+}
+
+fn zfile_canonical_static_roots(platform: &ZaloPlatform) -> Vec<PathBuf> {
+    zfile_static_roots(platform)
+        .into_iter()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .collect()
+}
+
+fn zfile_allowed_roots_with_static(
+    platform: &ZaloPlatform,
+    static_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    let read_paths = platform.approved_read_paths();
+    let write_paths = platform.approved_write_paths();
+    let mut roots = Vec::with_capacity(static_roots.len() + read_paths.len() + write_paths.len());
+    roots.extend(static_roots.iter().cloned());
+    roots.extend(read_paths);
+    roots.extend(write_paths);
     roots
+}
+
+fn zfile_allowed_roots(platform: &ZaloPlatform) -> Vec<PathBuf> {
+    zfile_allowed_roots_with_static(platform, &zfile_static_roots(platform))
 }
 
 fn decode_encoded_path_to_abs(encoded_rel: &str) -> Option<PathBuf> {
@@ -943,13 +975,14 @@ fn decode_zfile_uri_to_path(raw_uri: &str) -> Option<PathBuf> {
 fn serve_zfile_path_response(
     request: &URISchemeRequest,
     file_path: &Path,
-    platform: &ZaloPlatform,
+    platform: &Arc<ZaloPlatform>,
+    static_roots: &Arc<Vec<PathBuf>>,
 ) {
     let range_header = request
         .http_headers()
         .and_then(|h| h.one("Range"))
         .map(|g| g.to_string());
-    let allowed = zfile_allowed_roots(platform);
+    let allowed = zfile_allowed_roots_with_static(platform, static_roots);
     match serve_local_media_range(file_path, range_header.as_deref(), &allowed) {
         Ok(media) => finish_scheme_media_range_response(request, media),
         Err(err) => {
@@ -965,7 +998,11 @@ fn serve_zfile_path_response(
     }
 }
 
-fn handle_zfile_scheme(request: &URISchemeRequest, platform: &ZaloPlatform) {
+fn handle_zfile_scheme(
+    request: &URISchemeRequest,
+    platform: &Arc<ZaloPlatform>,
+    static_roots: &Arc<Vec<PathBuf>>,
+) {
     let raw_uri = request.uri().map(|s| s.to_string()).unwrap_or_default();
     let Some(file_path) = decode_zfile_uri_to_path(&raw_uri) else {
         finish_scheme_response(
@@ -977,16 +1014,19 @@ fn handle_zfile_scheme(request: &URISchemeRequest, platform: &ZaloPlatform) {
         );
         return;
     };
-    serve_zfile_path_response(request, &file_path, platform);
+    serve_zfile_path_response(request, &file_path, platform, static_roots);
 }
 
 fn handle_zalo_app_scheme(
     request: &URISchemeRequest,
     asar_slot: &Arc<RwLock<Option<Arc<AsarArchive>>>>,
+    patched_bundle_cache: &Arc<RwLock<HashMap<String, bytes::Bytes>>>,
     bridges: &Rc<RefCell<BridgeRegistry>>,
-    platform: &ZaloPlatform,
+    platform: &Arc<ZaloPlatform>,
+    static_roots: &Arc<Vec<PathBuf>>,
 ) {
     let raw_uri = request.uri().map(|s| s.to_string()).unwrap_or_default();
+    tracing::debug!(%raw_uri, "handle_zalo_app_scheme request");
     let parsed_path = Url::parse(&raw_uri)
         .ok()
         .map(|u| u.path().to_string())
@@ -1026,7 +1066,7 @@ fn handle_zalo_app_scheme(
             );
             return;
         };
-        serve_zfile_path_response(request, &file_path, platform);
+        serve_zfile_path_response(request, &file_path, platform, static_roots);
         return;
     }
 
@@ -1048,42 +1088,53 @@ fn handle_zalo_app_scheme(
         return;
     }
 
-    let Some(asar) = asar_slot.read().clone() else {
-        finish_scheme_response(
-            request,
-            503,
-            "Service Unavailable",
-            "text/plain; charset=utf-8",
-            b"Zalo runtime not loaded yet".to_vec(),
-        );
-        return;
+    let cached_opt = patched_bundle_cache.read().get(rel).cloned();
+    let body_bytes = if let Some(cached) = cached_opt {
+        cached
+    } else {
+        let Some(asar) = asar_slot.read().clone() else {
+            finish_scheme_response(
+                request,
+                503,
+                "Service Unavailable",
+                "text/plain; charset=utf-8",
+                b"Zalo runtime not loaded yet".to_vec(),
+            );
+            return;
+        };
+
+        let asar_lookup_path = format!("pc-dist/{rel}");
+        let Some(raw_bytes) = asar.read_or_unpacked(&asar_lookup_path) else {
+            tracing::debug!(path = %asar_lookup_path, "missing file in app.asar");
+            finish_scheme_response(
+                request,
+                404,
+                "Not Found",
+                "text/plain; charset=utf-8",
+                b"not found".to_vec(),
+            );
+            return;
+        };
+
+        let body_vec = patch_asar_bundle(rel, &raw_bytes).unwrap_or_else(|| raw_bytes.into_owned());
+        let cached = bytes::Bytes::from(body_vec);
+        patched_bundle_cache
+            .write()
+            .insert(rel.to_string(), cached.clone());
+        cached
     };
 
-    let asar_lookup_path = format!("pc-dist/{rel}");
-    let Some(raw_bytes) = asar.read_or_unpacked(&asar_lookup_path) else {
-        tracing::debug!(path = %asar_lookup_path, "missing file in app.asar");
-        finish_scheme_response(
-            request,
-            404,
-            "Not Found",
-            "text/plain; charset=utf-8",
-            b"not found".to_vec(),
-        );
-        return;
-    };
-
-    let body = patch_asar_bundle(rel, &raw_bytes).unwrap_or_else(|| raw_bytes.into_owned());
     let mime = mime_for_path(rel);
     let range_header = request
         .http_headers()
         .and_then(|h| h.one("Range"))
         .map(|g| g.to_string());
     if let Some(ref rng) = range_header {
-        let (status, reason, content_range, sliced) = slice_in_memory_range(&body, rng);
+        let (status, reason, content_range, sliced) = slice_in_memory_range(&body_bytes, rng);
         finish_scheme_range_bytes(request, status, reason, mime, content_range.as_deref(), sliced);
         return;
     }
-    finish_scheme_response(request, 200, "OK", mime, body);
+    finish_scheme_response(request, 200, "OK", mime, body_bytes.to_vec());
 }
 
 fn slice_in_memory_range(
@@ -1662,6 +1713,14 @@ fn finish_scheme_media_range_response(request: &URISchemeRequest, media: MediaRa
     let headers = MessageHeaders::new(MessageHeadersType::Response);
     headers.append("Access-Control-Allow-Origin", "*");
     headers.append("Accept-Ranges", media.accept_ranges);
+    if media.status != 416
+        && !media
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("cache-control"))
+    {
+        headers.append("Cache-Control", "private, max-age=3600");
+    }
     if let Some(ref cr) = media.content_range {
         headers.append("Content-Range", cr);
     }
@@ -2688,10 +2747,11 @@ impl OfficialClientHost {
 
         // Page load lifecycle callbacks
         let host_weak_load = Rc::downgrade(&host);
-        webview.connect_load_changed(move |_, load_event| {
+        webview.connect_load_changed(move |wv, load_event| {
             let Some(h) = host_weak_load.upgrade() else {
                 return;
             };
+            tracing::info!(?load_event, page = ?*h.current_page.borrow(), uri = %wv.uri().unwrap_or_default(), "webview load changed");
             match load_event {
                 LoadEvent::Started => {
                     let cb = h.on_page_event.borrow().clone();

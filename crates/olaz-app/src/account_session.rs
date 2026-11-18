@@ -405,8 +405,13 @@ impl AccountSession {
         .context("failed to initialize NetworkProxy")?
         .with_proxy_url(platform.proxy_url())
         .context("failed to configure upstream proxy on NetworkProxy")?;
-        let media_loader = MediaLoader::new(platform.cache_dir(), dns_resolver)
-            .context("failed to init MediaLoader")?;
+        let media_loader = MediaLoader::with_config(
+            platform.cache_dir(),
+            dns_resolver,
+            16,
+            olaz_net::media_loader::DEFAULT_FILES_CACHE_LIMIT,
+        )
+        .context("failed to init MediaLoader")?;
 
         let web_runtime = ZaloWebRuntime::new(&platform, shared_asar, tokio_handle);
         let main_process = ZaloMainProcess::new(

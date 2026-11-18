@@ -303,7 +303,7 @@ ENVIRONMENT:
 
 fn init_tracing(stderr_writer: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("olaz=info,olaz_app=info,olaz_core=info,olaz_net=info,olaz_linux=info,warn")
+        EnvFilter::new("kv_zalo=info,olaz=info,olaz_app=info,olaz_core=info,olaz_net=info,olaz_linux=info,warn")
     });
     if stderr_writer {
         let _ = tracing_subscriber::fmt()
@@ -541,8 +541,13 @@ fn main() -> Result<()> {
     .context("failed to initialize NetworkProxy")?
     .with_proxy_url(platform.proxy_url())
     .context("failed to configure upstream proxy on NetworkProxy")?;
-    let media_loader =
-        MediaLoader::new(platform.cache_dir(), dns_resolver).context("failed to init MediaLoader")?;
+    let media_loader = MediaLoader::with_config(
+        platform.cache_dir(),
+        dns_resolver,
+        16,
+        olaz_net::media_loader::DEFAULT_FILES_CACHE_LIMIT,
+    )
+    .context("failed to init MediaLoader")?;
 
     let web_runtime = ZaloWebRuntime::new(&platform, None, &tokio_handle);
     let main_process = ZaloMainProcess::new(

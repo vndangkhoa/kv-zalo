@@ -440,7 +440,24 @@ pub fn bridge_spec_script(platform: &ZaloPlatform) -> String {
         "arm64"
     };
 
-    // $zenv constants
+    let paths_map = json!({
+        "userData": platform.electron_path("userData").to_string_lossy(),
+        "appData": platform.electron_path("appData").to_string_lossy(),
+        "temp": platform.electron_path("temp").to_string_lossy(),
+        "home": platform.electron_path("home").to_string_lossy(),
+        "downloads": platform.electron_path("downloads").to_string_lossy(),
+        "documents": platform.electron_path("documents").to_string_lossy(),
+        "desktop": platform.electron_path("desktop").to_string_lossy(),
+        "pictures": platform.electron_path("pictures").to_string_lossy(),
+        "videos": platform.electron_path("videos").to_string_lossy(),
+        "music": platform.electron_path("music").to_string_lossy(),
+        "logs": platform.electron_path("logs").to_string_lossy(),
+        "exe": platform.electron_path("exe").to_string_lossy(),
+        "app": platform.electron_path("app").to_string_lossy(),
+    });
+    let app_path_val = json!(platform.user_data().to_string_lossy());
+
+    // $zenv constants & cached Electron paths
     for (path, val) in [
         ("$zenv.isPreloaded", json!(true)),
         ("$zenv.isRenderer", json!(true)),
@@ -448,6 +465,8 @@ pub fn bridge_spec_script(platform: &ZaloPlatform) -> String {
         ("$zenv.process_arch", json!(process_arch)),
         ("$zenv.arch", json!(process_arch)),
         ("$znode.os.__info", collect_os_info(platform, process_arch)),
+        ("$zelectron.__paths", paths_map),
+        ("$zelectron.__appPath", app_path_val),
         (
             "$znode.fs.constants",
             json!({ "F_OK": 0, "R_OK": 4, "W_OK": 2, "X_OK": 1 }),
@@ -885,6 +904,173 @@ const LINUX_LOCAL_ADDONS_EXT: &str = r#"(() => {
       }),
       cancelCopy: () => window.__zaloBridge.callAsync('$znode.nativelibs.zfileAddon.cancelCopy', []),
     });
+
+    // 3. In-process RFC 1321 MD5 (`$znode.crypto.hash`) and pre-resolved `$zelectron.getPath*`
+    //    so photo path hashing and path lookups avoid hundreds of blocking sync XHRs.
+    const olazMd5Hex = (() => {
+      const md5Cache = new Map();
+      const MD5_CACHE_MAX = 2048;
+      const utf8Enc = typeof TextEncoder === 'function' ? new TextEncoder() : null;
+      const K = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+        0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+        0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+        0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+        0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+        0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+        0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+        0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+      ];
+      const S = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+      ];
+      const toHexLe = (n) => {
+        let s = '';
+        for (let j = 0; j < 4; j++) {
+          const b = (n >>> (j * 8)) & 0xff;
+          s += (b < 16 ? '0' : '') + b.toString(16);
+        }
+        return s;
+      };
+      const encodeUtf8 = (str) => {
+        if (utf8Enc) return utf8Enc.encode(str);
+        const bin = unescape(encodeURIComponent(str));
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        return arr;
+      };
+      return (str) => {
+        const hit = md5Cache.get(str);
+        if (hit !== undefined) return hit;
+        const bytes = encodeUtf8(str);
+        const len = bytes.length;
+        const paddedLen = (((len + 8) >>> 6) + 1) * 64;
+        const buf = new Uint8Array(paddedLen);
+        buf.set(bytes, 0);
+        buf[len] = 0x80;
+        const bitLenLo = (len * 8) >>> 0;
+        const bitLenHi = Math.floor(len / 0x20000000) >>> 0;
+        buf[paddedLen - 8] = bitLenLo & 0xff;
+        buf[paddedLen - 7] = (bitLenLo >>> 8) & 0xff;
+        buf[paddedLen - 6] = (bitLenLo >>> 16) & 0xff;
+        buf[paddedLen - 5] = (bitLenLo >>> 24) & 0xff;
+        buf[paddedLen - 4] = bitLenHi & 0xff;
+        buf[paddedLen - 3] = (bitLenHi >>> 8) & 0xff;
+        buf[paddedLen - 2] = (bitLenHi >>> 16) & 0xff;
+        buf[paddedLen - 1] = (bitLenHi >>> 24) & 0xff;
+        let a0 = 0x67452301 | 0;
+        let b0 = 0xefcdab89 | 0;
+        let c0 = 0x98badcfe | 0;
+        let d0 = 0x10325476 | 0;
+        const M = new Uint32Array(16);
+        for (let off = 0; off < paddedLen; off += 64) {
+          for (let i = 0; i < 16; i++) {
+            const idx = off + i * 4;
+            M[i] = buf[idx] | (buf[idx + 1] << 8) | (buf[idx + 2] << 16) | (buf[idx + 3] << 24);
+          }
+          let A = a0, B = b0, C = c0, D = d0;
+          for (let i = 0; i < 64; i++) {
+            let F, g;
+            if (i < 16) {
+              F = (B & C) | ((~B) & D);
+              g = i;
+            } else if (i < 32) {
+              F = (D & B) | ((~D) & C);
+              g = (5 * i + 1) % 16;
+            } else if (i < 48) {
+              F = B ^ C ^ D;
+              g = (3 * i + 5) % 16;
+            } else {
+              F = C ^ (B | (~D));
+              g = (7 * i) % 16;
+            }
+            const sum = (A + F + K[i] + M[g]) | 0;
+            const rot = ((sum << S[i]) | (sum >>> (32 - S[i]))) | 0;
+            A = D;
+            D = C;
+            C = B;
+            B = (B + rot) | 0;
+          }
+          a0 = (a0 + A) | 0;
+          b0 = (b0 + B) | 0;
+          c0 = (c0 + C) | 0;
+          d0 = (d0 + D) | 0;
+        }
+        const out = toHexLe(a0) + toHexLe(b0) + toHexLe(c0) + toHexLe(d0);
+        if (str.length <= 512) {
+          if (md5Cache.size >= MD5_CACHE_MAX) {
+            const oldest = md5Cache.keys().next();
+            if (!oldest.done) md5Cache.delete(oldest.value);
+          }
+          md5Cache.set(str, out);
+        }
+        return out;
+      };
+    })();
+    local['$znode.crypto.hash'] = (data, algo, inputEnc, outputEnc) => {
+      const alg = algo === undefined || algo === null ? 'md5' : String(algo).toLowerCase();
+      const inEnc = inputEnc === undefined || inputEnc === null ? 'utf8' : String(inputEnc).toLowerCase();
+      const outEnc = outputEnc === undefined || outputEnc === null ? 'hex' : String(outputEnc).toLowerCase();
+      if (
+        typeof data === 'string'
+        && alg === 'md5'
+        && (inEnc === 'utf8' || inEnc === 'utf-8')
+        && outEnc === 'hex'
+      ) {
+        return olazMd5Hex(data);
+      }
+      return callBridgeSync('$znode.crypto.hash', [data, algo, inputEnc, outputEnc]);
+    };
+
+    const bridgeValues = (window.__zaloBridgeSpec && window.__zaloBridgeSpec.values) || {};
+    const fastPaths = bridgeValues['$zelectron.__paths'];
+    const fastAppPath = bridgeValues['$zelectron.__appPath'];
+    if (fastPaths && typeof fastPaths === 'object') {
+      const lookupElectronPath = (name) => {
+        const key = String(name || 'userData');
+        if (Object.prototype.hasOwnProperty.call(fastPaths, key)) return fastPaths[key];
+        return undefined;
+      };
+      local['$zelectron.getPathSync'] = (name) => {
+        const p = lookupElectronPath(name);
+        return p !== undefined ? p : ipcSendSync('_electron_get-path-sync', name);
+      };
+      local['$zelectron.getPath'] = (name) => {
+        const p = lookupElectronPath(name);
+        return Promise.resolve(p !== undefined ? p : ipcSendSync('_electron_get-path-sync', name));
+      };
+    }
+    if (typeof fastAppPath === 'string' && fastAppPath) {
+      local['$zelectron.getAppPathSync'] = () => fastAppPath;
+      local['$zelectron.getAppPath'] = () => Promise.resolve(fastAppPath);
+    }
+    const storePathCache = new Map();
+    local['$zelectron.storePath'] = (name) => {
+      const raw = String(name || 'config');
+      if (storePathCache.has(raw)) return storePathCache.get(raw);
+      let out;
+      if (fastPaths && typeof fastPaths.userData === 'string' && fastPaths.userData) {
+        let safeName = raw.replace(/[/\\\0]/g, '_');
+        while (safeName.includes('..')) safeName = safeName.replace('..', '_');
+        if (!safeName) safeName = 'config';
+        out = (fastPaths.userData.replace(/\/+$/, '') || '') + '/' + safeName + '.json';
+      } else {
+        out = callBridgeSync('$zelectron.storePath', [name]);
+      }
+      if (storePathCache.size < 256) storePathCache.set(raw, out);
+      return out;
+    };
   };
   window.__olazInstallLinuxAddons = install;
   install();
@@ -1363,10 +1549,16 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
   const RECALLED_IDS_MAX = 20000;
   const MEDIA_CACHE_MAX_ENTRIES = 150;
   const MEDIA_CACHE_MAX_BYTES = 15 * 1024 * 1024;
+  const MEDIA_SEEN_MAX_ENTRIES = 10000;
+  const MAX_CONCURRENT_AR_FETCHES = 2;
   if (!(window.__olazMsgShadow instanceof Map)) window.__olazMsgShadow = new Map();
   if (!(window.__olazRecalledIds instanceof Map)) window.__olazRecalledIds = new Map();
   const antiRecallMediaMem = new Map();
   const antiRecallMediaPending = new Set();
+  const antiRecallMediaSeen = new Set();
+  const arFetchQueue = [];
+  let arActiveFetches = 0;
+  let idbMediaPutCount = 0;
   let antiRecallMediaDbPromise = null;
   let antiRecallRafPending = false;
   let antiRecallObserver = null;
@@ -1474,23 +1666,31 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     }
     const db = await openAntiRecallMediaDb();
     if (!db) return;
+    const shouldPruneIdb = (++idbMediaPutCount % 25) === 0;
     await new Promise((resolve) => {
       try {
         const tx = db.transaction('media', 'readwrite');
         const store = tx.objectStore('media');
         store.put({ url, msgId: String(msgId || ''), blob, size: Number(blob.size) || 0, ts: Date.now() });
-        if (typeof store.getAll === 'function') {
-          const allReq = store.getAll();
-          allReq.onsuccess = () => {
+        if (shouldPruneIdb && typeof store.count === 'function' && typeof store.index === 'function') {
+          const countReq = store.count();
+          countReq.onsuccess = () => {
             try {
-              const items = Array.isArray(allReq.result) ? allReq.result : [];
-              if (items.length > MEDIA_CACHE_MAX_ENTRIES) {
-                items.sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0));
-                const excess = items.length - MEDIA_CACHE_MAX_ENTRIES;
-                for (let i = 0; i < excess; i++) {
-                  if (items[i] && items[i].url) store.delete(items[i].url);
-                }
-              }
+              const total = Number(countReq.result) || 0;
+              let excess = total - MEDIA_CACHE_MAX_ENTRIES;
+              if (excess <= 0) return;
+              const tsIdx = store.index('ts');
+              if (typeof tsIdx.openKeyCursor !== 'function') return;
+              const curReq = tsIdx.openKeyCursor();
+              curReq.onsuccess = (ev) => {
+                try {
+                  const cursor = ev && ev.target ? ev.target.result : curReq.result;
+                  if (!cursor || excess <= 0) return;
+                  store.delete(cursor.primaryKey);
+                  excess--;
+                  if (excess > 0) cursor.continue();
+                } catch {}
+              };
             } catch {}
           };
         }
@@ -1536,9 +1736,12 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     const urls = [];
     const collect = (obj) => {
       if (!obj || typeof obj !== 'object') return;
-      for (const field of ['thumbUrl', 'normalUrl', 'hdUrl', 'href']) {
+      for (const field of ['thumbUrl', 'normalUrl']) {
         const v = obj[field];
-        if (typeof v === 'string' && /^https?:\/\//i.test(v)) urls.push(v);
+        if (typeof v === 'string' && /^https?:\/\//i.test(v)) {
+          urls.push(v);
+          break;
+        }
       }
     };
     collect(m);
@@ -1547,29 +1750,46 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     return urls;
   };
 
+  const pumpArFetchQueue = () => {
+    while (arActiveFetches < MAX_CONCURRENT_AR_FETCHES && arFetchQueue.length > 0) {
+      const item = arFetchQueue.shift();
+      if (!item) continue;
+      arActiveFetches++;
+      (async () => {
+        try {
+          const res = await nativeFetchBase(item.url);
+          if (!res || !res.ok || typeof res.blob !== 'function') return;
+          const cl = res.headers && typeof res.headers.get === 'function' ? Number(res.headers.get('content-length') || 0) : 0;
+          if (cl > MEDIA_CACHE_MAX_BYTES) return;
+          const blob = await res.blob();
+          if (blob && blob.size > 0 && blob.size < MEDIA_CACHE_MAX_BYTES) {
+            await storeMediaBlobLru(item.url, item.msgId, blob);
+          }
+        } catch {} finally {
+          antiRecallMediaPending.delete(item.url);
+          arActiveFetches--;
+          pumpArFetchQueue();
+        }
+      })();
+    }
+  };
+
   const maybeCacheAntiRecallMedia = (m) => {
     if (!window.__olazPrivacy || !window.__olazPrivacy.antiRecall || !nativeFetchBase) return;
     const urls = extractMsgMediaUrls(m);
     if (!urls.length) return;
     const msgId = String((m && (m.msgId || m.cliMsgId)) || '');
     for (const u of urls) {
-      if (antiRecallMediaMem.has(u) || antiRecallMediaPending.has(u)) continue;
+      if (antiRecallMediaSeen.has(u) || antiRecallMediaMem.has(u) || antiRecallMediaPending.has(u)) continue;
+      if (antiRecallMediaSeen.size >= MEDIA_SEEN_MAX_ENTRIES) {
+        const first = antiRecallMediaSeen.values().next();
+        if (!first.done) antiRecallMediaSeen.delete(first.value);
+      }
+      antiRecallMediaSeen.add(u);
       antiRecallMediaPending.add(u);
-      (async () => {
-        try {
-          const res = await nativeFetchBase(u);
-          if (!res || !res.ok || typeof res.blob !== 'function') return;
-          const cl = res.headers && typeof res.headers.get === 'function' ? Number(res.headers.get('content-length') || 0) : 0;
-          if (cl > MEDIA_CACHE_MAX_BYTES) return;
-          const blob = await res.blob();
-          if (blob && blob.size > 0 && blob.size < MEDIA_CACHE_MAX_BYTES) {
-            await storeMediaBlobLru(u, msgId, blob);
-          }
-        } catch {} finally {
-          antiRecallMediaPending.delete(u);
-        }
-      })();
+      arFetchQueue.push({ url: u, msgId });
     }
+    pumpArFetchQueue();
   };
   window.__olazAntiRecallMedia = {
     cacheMessage: maybeCacheAntiRecallMedia,
@@ -1593,6 +1813,17 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     }
     if (isRecalledMsgShape(m)) return;
     const prevSnap = lookupShadowForMsg(m);
+    if (
+      prevSnap
+      && prevSnap.msgType === m.msgType
+      && prevSnap.message === m.message
+      && prevSnap.content === m.content
+      && prevSnap.thumb === m.thumb
+      && prevSnap.localPath === m.localPath
+      && !(m.quote && (Number(m.quote.cliMsgType) === 20 || Number(m.quote.cliMsgType) === -27))
+    ) {
+      return;
+    }
     let snapQuote = (m.quote && typeof m.quote === 'object') ? Object.assign({}, m.quote) : m.quote;
     if (snapQuote && (Number(snapQuote.cliMsgType) === 20 || Number(snapQuote.cliMsgType) === -27)
         && prevSnap && prevSnap.quote
@@ -2208,13 +2439,17 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     return window.__olazCallRecording;
   };
 
+  let cachedFiberKey = '';
   const findFiberMessageOnNode = (node) => {
     if (!node || typeof node !== 'object') return null;
-    let fiber = null;
-    for (const k of Object.keys(node)) {
-      if (k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')) {
-        fiber = node[k];
-        break;
+    let fiber = (cachedFiberKey && node[cachedFiberKey]) || null;
+    if (!fiber) {
+      for (const k of Object.keys(node)) {
+        if (k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')) {
+          cachedFiberKey = k;
+          fiber = node[k];
+          break;
+        }
       }
     }
     let hops = 0;
@@ -2268,24 +2503,36 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
       }
       return;
     }
+    if (!window.__olazRecalledIds || window.__olazRecalledIds.size === 0) return;
     ensureAntiRecallStyles();
     const rows = document.querySelectorAll('.chat-message[id^="bb_msg_id_"]');
     for (const row of Array.from(rows)) {
       if (!row) continue;
       const rawId = String(row.id || '').startsWith('bb_msg_id_') ? String(row.id).slice(10) : '';
-      const fiberMsg = findFiberMessageOnNode(row);
-      const recalledByFiber = Boolean(fiberMsg && fiberMsg.__olazRecalled);
-      const recalledById = Boolean(rawId && window.__olazRecalledIds.has(rawId))
-        || Boolean(fiberMsg && fiberMsg.msgId && window.__olazRecalledIds.has(String(fiberMsg.msgId)))
-        || Boolean(fiberMsg && fiberMsg.cliMsgId && window.__olazRecalledIds.has(String(fiberMsg.cliMsgId)));
-      if (!recalledByFiber && !recalledById) continue;
-
-      try { row.classList.add('olaz-is-recalled'); } catch {}
+      let recalledById = Boolean(rawId && window.__olazRecalledIds.has(rawId));
       const card = (typeof row.querySelector === 'function' && row.querySelector('.card')) || row;
       const isUndoCard = Boolean(
         (card.classList && typeof card.classList.contains === 'function' && card.classList.contains('card--undo'))
         || (typeof row.querySelector === 'function' && row.querySelector('.card--undo'))
       );
+      let fiberMsg = null;
+      if (!recalledById) {
+        if (!rawId || isUndoCard) {
+          fiberMsg = findFiberMessageOnNode(row);
+        } else {
+          continue;
+        }
+      } else if (isUndoCard && !window.__olazMsgShadow.has(rawId)) {
+        fiberMsg = findFiberMessageOnNode(row);
+      }
+      const recalledByFiber = Boolean(fiberMsg && fiberMsg.__olazRecalled);
+      if (!recalledById && fiberMsg) {
+        recalledById = Boolean(fiberMsg.msgId && window.__olazRecalledIds.has(String(fiberMsg.msgId)))
+          || Boolean(fiberMsg.cliMsgId && window.__olazRecalledIds.has(String(fiberMsg.cliMsgId)));
+      }
+      if (!recalledByFiber && !recalledById) continue;
+
+      try { row.classList.add('olaz-is-recalled'); } catch {}
       if (isUndoCard) {
         const snap = (rawId && window.__olazMsgShadow.get(rawId)) || lookupShadowForMsg(fiberMsg);
         const preservedText = (fiberMsg && !isRecalledMsgShape(fiberMsg) && extractPlainTextFromSnap(fiberMsg.message || fiberMsg.content))
@@ -2341,6 +2588,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
           if (!list) continue;
           for (const n of Array.from(list)) {
             if (!n || n.nodeType !== 1 || isOlazInjectedNode(n)) continue;
+            if (String(n.tagName || '').toUpperCase() === 'IMG') continue;
             relevant = true;
             break;
           }
@@ -2511,12 +2759,18 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     if (!store || typeof store.dispatch !== 'function' || store.dispatch.__olazAr) return store;
     const origDispatch = store.dispatch.bind(store);
     const wrappedDispatch = function (action) {
-      safe(() => scanStoreConversationsForAntiRecall(store.getState(), false), false);
+      const actType = action && typeof action.type === 'string' ? action.type : '';
+      const scanSync = !action || typeof action.type !== 'string' || /UNDO|RECALL|DELETE|REMOVE|MSG|MESSAGE/i.test(actType);
+      if (scanSync) {
+        safe(() => scanStoreConversationsForAntiRecall(store.getState(), false), false);
+      }
       const res = origDispatch.apply(this, arguments);
-      safe(() => scanStoreConversationsForAntiRecall(
-        store.getState(),
-        Boolean(window.__olazPrivacy && window.__olazPrivacy.antiRecall),
-      ), false);
+      if (scanSync) {
+        safe(() => scanStoreConversationsForAntiRecall(
+          store.getState(),
+          Boolean(window.__olazPrivacy && window.__olazPrivacy.antiRecall),
+        ), false);
+      }
       return res;
     };
     wrappedDispatch.__olazAr = true;
@@ -2657,7 +2911,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
       const fp = raw.startsWith('file:') ? decodeURIComponent(raw.replace(/^file:\/\/\/?/, '/')) : raw;
       (async () => {
         try {
-          const ab = await callAsync('$zFileManager.getFileArrayBuffer', [fp]);
+          const ab = await window.$zFileManager.getFileArrayBuffer(fp);
           const u8 = toU8(ab);
           if (!u8.length) return;
           // PNG magic: 89 50 4E 47
@@ -2860,7 +3114,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     const byteEnd = Math.min(fileSize, endChunkId * cs);
     const expectedLen = Math.max(0, byteEnd - byteStart);
     const sliceAb = expectedLen > 0
-      ? await callAsync('$zFileManager.readFileSlice', [srcPath, byteStart, expectedLen, !!checkNoise])
+      ? await window.$zFileManager.readFileSlice(srcPath, byteStart, expectedLen, !!checkNoise)
       : new ArrayBuffer(0);
     let rawU8 = toU8(sliceAb);
     if (rawU8.byteLength < expectedLen) {
@@ -3285,6 +3539,51 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
     return u;
   };
 
+  // Zero-base64 binary `fetch('zalo-app://local/__olaz/zfile/...')` fast path for local photos.
+  const canUseZfileFetch = Boolean(
+    nativeFetchBase
+    && typeof window !== 'undefined'
+    && window.location
+    && window.location.protocol === 'zalo-app:'
+    && typeof navigator !== 'undefined'
+    && /AppleWebKit/i.test(String(navigator.userAgent || ''))
+  );
+  const readLocalZfileArrayBuffer = async (filePath, start, len) => {
+    if (!canUseZfileFetch) return null;
+    const p = String(filePath || '');
+    if (!p.startsWith('/')) return null;
+    const encoded = p.replace(/^\/+/, '').split('/').filter(Boolean).map(encodeURIComponent).join('/');
+    const url = ZAPP_ZFILE_PREFIX + encoded;
+    const opts = {};
+    if (typeof start === 'number' && typeof len === 'number' && len > 0) {
+      opts.headers = { Range: 'bytes=' + start + '-' + (start + len - 1) };
+    }
+    const resp = await nativeFetchBase(url, opts);
+    if (!resp || (!resp.ok && resp.status !== 206)) {
+      throw new Error('zfile fetch status ' + (resp ? resp.status : 'none'));
+    }
+    return await resp.arrayBuffer();
+  };
+  local['$zFileManager.getFileArrayBuffer'] = async (filePath) => {
+    try {
+      const ab = await readLocalZfileArrayBuffer(filePath);
+      if (ab) return ab;
+    } catch {}
+    return await callAsync('$zFileManager.getFileArrayBuffer', [filePath]);
+  };
+  local['$zFileManager.readFileSlice'] = async (filePath, start, len, checkNoise) => {
+    if (checkNoise !== false) {
+      try {
+        const s = Math.max(0, Number(start) || 0);
+        const l = Math.max(0, Number(len) || 0);
+        if (l === 0) return new ArrayBuffer(0);
+        const ab = await readLocalZfileArrayBuffer(filePath, s, l);
+        if (ab) return ab;
+      } catch {}
+    }
+    return await callAsync('$zFileManager.readFileSlice', [filePath, start, len, checkNoise]);
+  };
+
   // 5b. Video thumbnail generation (`$znode.nativelibs.mp4thumb` + `$zFeatures.genThumb`)
   const genThumbFromVideoDom = (filePath, maxWidth = 480, maxHeight = 480) => {
     if (!filePath) return Promise.resolve('');
@@ -3621,7 +3920,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
             return '/' + locInfo.encodedPath;
           }
         })();
-        bytesPromise = callAsync('$zFileManager.getFileArrayBuffer', [localPath]).then((ab) => (window.__olazDenoiseU8 || ((x) => x))(toU8(ab)));
+        bytesPromise = local['$zFileManager.getFileArrayBuffer'](localPath).then((ab) => (window.__olazDenoiseU8 || ((x) => x))(toU8(ab)));
       } else if (nativeFetchForDl) {
         bytesPromise = nativeFetchForDl(href).then((r) => {
           if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -3701,14 +4000,15 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
         return await callAsync('$znode.fsPromise.stat', [String(t.path)]);
       case 'READ_PARTIAL': {
         const start = Math.max(0, Number(t.start) || 0);
-        const len = Math.max(0, (Number(t.end) || 0) - start);
-        if (!(len > 0)) return new ArrayBuffer(0);
-        const ab = await callAsync('$zFileManager.readFileSlice', [String(t.path), start, len, true]);
+        const rawLen = Math.max(0, (Number(t.end) || 0) - start);
+        if (!(rawLen > 0)) return new ArrayBuffer(0);
+        const len = (canUseZfileFetch && start === 0 && rawLen > 65536) ? 65536 : rawLen;
+        const ab = await local['$zFileManager.readFileSlice'](String(t.path), start, len, true);
         return toExactArrayBuffer(toU8(ab));
       }
       case 'READ_ARRAY_BUFFER':
       case 'READ_BLOB': {
-        const ab = await callAsync('$zFileManager.getFileArrayBuffer', [String(t.path)]);
+        const ab = await local['$zFileManager.getFileArrayBuffer'](String(t.path));
         return toExactArrayBuffer(denoiseZaloU8(ab));
       }
       case 'WRITE_BUFFER':
@@ -3750,7 +4050,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
   };
   const executeResizeTask = async (payload) => {
     const p = payload || {};
-    const ab = await callAsync('$zFileManager.getFileArrayBuffer', [String(p.src)]);
+    const ab = await local['$zFileManager.getFileArrayBuffer'](String(p.src));
     const srcU8 = denoiseZaloU8(ab);
     const mime = p.outputFormat === 'image/png' || p.outputFormat === 'png' ? 'image/png' : 'image/jpeg';
     const blob = new Blob([srcU8]);
@@ -3864,7 +4164,7 @@ pub const LINUX_DIRECT_UI_SCRIPT: &str = r#"(() => {
         : (p.localPath !== undefined ? p.localPath
           : (p.path !== undefined ? p.path : p.src)));
     if (typeof src === 'string' && src) {
-      const ab = await callAsync('$zFileManager.getFileArrayBuffer', [src]);
+      const ab = await local['$zFileManager.getFileArrayBuffer'](src);
       return denoiseZaloU8(ab);
     }
     return denoiseZaloU8(src);
@@ -5526,14 +5826,14 @@ pub fn patch_zalo_linux_renderer_bundle(bytes: &[u8]) -> Option<Vec<u8>> {
         }
     }
 
-    // 13. Use `loading:"eager"` + `decoding:"sync"` on `Z.d.Image` (`Ze`) and wire native DOM
+    // 13. Use `loading:"eager"` + `decoding:"async"` on `Z.d.Image` (`Ze`) and wire native DOM
     //     `load` + cached `_el.complete && _el.naturalWidth > 0` detection across both initial
     //     mount and `src` updates so `ReactDOM.createPortal` into `popup-viewer.html` never
     //     stays stuck at `visibility:"hidden"`.
     const ZIMG_LAZY_1_FIND: &str = r#"visibility:this.state.loaded?"visible":"hidden"}),loading:"lazy"}"#;
     const ZIMG_LAZY_1_REPL: &str = r#"visibility:this.state.loaded?"visible":"hidden"}),loading:"eager"}"#;
     const ZIMG_LAZY_2_FIND: &str = r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"async",loading:"lazy""#;
-    const ZIMG_LAZY_2_REPL: &str = r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"sync",loading:"eager""#;
+    const ZIMG_LAZY_2_REPL: &str = r#""data-z-element-type":"image","data-zdrag-region":"zdraggable-region",decoding:"async",loading:"eager""#;
     if s.contains(ZIMG_LAZY_1_FIND) {
         s = s.replace(ZIMG_LAZY_1_FIND, ZIMG_LAZY_1_REPL);
         changed = true;
